@@ -3,7 +3,7 @@
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -63,33 +63,39 @@ async fn event_loop(
 
         if event::poll(tick)? {
             if let CtEvent::Key(key) = event::read()? {
-                match handle_key(app, key) {
-                    UiAction::Quit => {
-                        let _ = cmd_tx.send(Command::Quit).await;
-                        return Ok(());
-                    }
-                    UiAction::Submit(text) => {
-                        let mut spec = agent_core::task::TaskSpec::new(text.clone(), String::new());
-                        spec.title = text.chars().take(24).collect();
-                        // 工作区由编排层填入；这里发送带 prompt 的任务
-                        let _ = cmd_tx.send(Command::SubmitTask(spec)).await;
-                    }
-                    UiAction::Cancel => {
-                        if let Some(c) = app.cancel_command() {
-                            let _ = cmd_tx.send(c).await;
+                // Windows 的 crossterm 会对每次输入同时上报 Press 与 Release；
+                // 中文 IME 尤其明显（每个字符两条事件）。只处理 Press，
+                // 否则字符会被插入两次（“你好” → “你你好好”）。
+                if should_handle_key(&key) {
+                    match handle_key(app, key) {
+                        UiAction::Quit => {
+                            let _ = cmd_tx.send(Command::Quit).await;
+                            return Ok(());
                         }
-                    }
-                    UiAction::Approve { remember } => {
-                        if let Some(c) = app.take_approval(true, remember) {
-                            let _ = cmd_tx.send(c).await;
+                        UiAction::Submit(text) => {
+                            let mut spec =
+                                agent_core::task::TaskSpec::new(text.clone(), String::new());
+                            spec.title = text.chars().take(24).collect();
+                            // 工作区由编排层填入；这里发送带 prompt 的任务
+                            let _ = cmd_tx.send(Command::SubmitTask(spec)).await;
                         }
-                    }
-                    UiAction::Reject => {
-                        if let Some(c) = app.take_approval(false, false) {
-                            let _ = cmd_tx.send(c).await;
+                        UiAction::Cancel => {
+                            if let Some(c) = app.cancel_command() {
+                                let _ = cmd_tx.send(c).await;
+                            }
                         }
+                        UiAction::Approve { remember } => {
+                            if let Some(c) = app.take_approval(true, remember) {
+                                let _ = cmd_tx.send(c).await;
+                            }
+                        }
+                        UiAction::Reject => {
+                            if let Some(c) = app.take_approval(false, false) {
+                                let _ = cmd_tx.send(c).await;
+                            }
+                        }
+                        UiAction::None => {}
                     }
-                    UiAction::None => {}
                 }
             }
         }
@@ -98,6 +104,15 @@ async fn event_loop(
             return Ok(());
         }
     }
+}
+
+/// 是否应处理该按键事件。
+///
+/// crossterm 在 Windows 上会对每次输入同时上报 `Press` 与 `Release`（中文 IME
+/// 尤其明显——每个字符两条事件）。只处理 `Press`，否则字符会被插入两次：
+/// “你好” 变成 “你你好好”。
+fn should_handle_key(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
 }
 
 /// 按键 -> 动作。
@@ -315,5 +330,68 @@ fn truncate_json(v: &serde_json::Value, max: usize) -> String {
         s
     } else {
         format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_with_kind(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind,
+            state: event::KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn press_is_handled() {
+        let k = key_with_kind(KeyCode::Char('你'), KeyEventKind::Press);
+        assert!(should_handle_key(&k));
+    }
+
+    #[test]
+    fn release_is_ignored() {
+        // 回归测试：Windows crossterm 同时上报 Press + Release。
+        // 不过滤会导致中文 IME 每字符插入两次。
+        let k = key_with_kind(KeyCode::Char('你'), KeyEventKind::Release);
+        assert!(!should_handle_key(&k));
+    }
+
+    #[test]
+    fn repeat_is_ignored() {
+        let k = key_with_kind(KeyCode::Char('a'), KeyEventKind::Repeat);
+        assert!(!should_handle_key(&k));
+    }
+
+    #[test]
+    fn ime_press_release_pair_inserts_once() {
+        // 模拟一次 IME 输入的完整事件流：Press + Release。
+        let mut app = App::default();
+        for kind in [KeyEventKind::Press, KeyEventKind::Release] {
+            let k = key_with_kind(KeyCode::Char('好'), kind);
+            if should_handle_key(&k) {
+                if let KeyCode::Char(c) = k.code {
+                    app.on_char(c);
+                }
+            }
+        }
+        assert_eq!(app.input.buffer, "好", "Press+Release 只应插入一个字符");
+    }
+
+    #[test]
+    fn ascii_still_works_after_filter() {
+        let mut app = App::default();
+        for c in "hello".chars() {
+            let k = key_with_kind(KeyCode::Char(c), KeyEventKind::Press);
+            if should_handle_key(&k) {
+                if let KeyCode::Char(ch) = k.code {
+                    app.on_char(ch);
+                }
+            }
+        }
+        assert_eq!(app.input.buffer, "hello");
     }
 }
