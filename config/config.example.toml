@@ -1,12 +1,13 @@
 # 个人 Agent —— 配置文件模板
 #
-# 默认存放位置（macOS / Linux）：~/.config/agent/config.toml
-#                       Windows：%APPDATA%\dev\personal\agent\config.toml
+# 默认路径：<项目根>/config/config.toml（相对当前工作目录）
+# 可用环境变量 AGENT_CONFIG 覆盖为任意路径。
 #
-# 也可通过环境变量 AGENT_CONFIG 覆盖为任意路径。
+# 本文件是模板（config.example.toml），请复制为 config.toml 后填写；
+# 也可直接运行 agent —— 检测到 config/config.toml 缺失或无效时
+# 会自动进入配置向导生成它。
 #
 # 一键覆盖：用 `cargo xtask gen-cfg` 重新写一份模板。
-# 配置错误启动会进入 wizard（仅 stdin 是 TTY 时）。
 #
 # ============================================================
 #  ⚠️  安全原则

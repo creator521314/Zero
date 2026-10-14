@@ -56,8 +56,8 @@ fork bomb、`curl | sh`、写 `/etc`、`~/.ssh` 等。
 
 ## 配置
 
-配置文件位于 `~/.config/agent/config.toml`（Windows: `%APPDATA%\dev\personal\agent\config.toml`，
-可通过环境变量 `AGENT_CONFIG` 覆盖）。
+配置文件默认位于**项目根下的 `config/config.toml`**（相对当前工作目录）。
+可用环境变量 `AGENT_CONFIG` 覆盖为任意路径。
 
 ### 首次运行 = 自动配置向导
 
@@ -65,7 +65,7 @@ Agent 检测到以下情况时会**自动进入配置向导**（仅 stdin 是 TT
 
 | 情况 | 行为 |
 |---|---|
-| 配置文件不存在 | 进入向导，引导选择 provider / 环境变量名 |
+| `config/config.toml` 不存在 | 进入向导，引导选择 provider / 环境变量名 |
 | 配置文件 TOML 语法错误 | 进入向导，提示是否覆盖 |
 | 配置语义无效（如 `router.default` 指向不存在的 provider） | 进入向导，提示是否覆盖 |
 | 非交互环境（CI / 管道 / SSH 后台） | 写模板并退出，提示编辑后重启 |
@@ -75,12 +75,13 @@ Agent 检测到以下情况时会**自动进入配置向导**（仅 stdin 是 TT
 ### 手动生成模板
 
 ```bash
-cargo xtask gen-cfg     # 把注释版模板写到配置路径
+cargo xtask gen-cfg     # 把注释版模板写到 config/config.toml
 ```
 
 模板源文件在仓库 `config/config.example.toml`（被 `include_str!` 嵌入二进制）。
+`config/config.toml` 已被 `.gitignore` 忽略，不会提交个人配置。
 
-`~/.config/agent/config.toml`（首次运行自动生成）：
+`config/config.toml`（首次运行自动生成 / 向导引导填写）：
 
 ```toml
 [providers.deepseek]

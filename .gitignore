@@ -11,3 +11,6 @@
 
 # IDE 本地配置
 /.vscode/
+
+# 本地配置（模板 config/config.example.toml 仍纳入版本）
+/config/config.toml

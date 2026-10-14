@@ -4,19 +4,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// 项目标识（用于 `directories::ProjectDirs`），三段拼成最终路径。
-pub const PROJECT_QUALIFIER: &str = "dev";
-pub const PROJECT_ORG: &str = "personal";
-pub const PROJECT_APP: &str = "agent";
 /// 配置文件名。
 pub const CONFIG_FILE: &str = "config.toml";
+/// 默认配置文件（相对当前工作目录，即项目根下的 `config/config.toml`）。
+///
+/// 一期为单机单人使用，配置跟着项目走；`AGENT_CONFIG` 环境变量可覆盖为任意路径。
+pub const DEFAULT_CONFIG_REL: &str = "config/config.toml";
 
 /// 嵌入的注释版 TOML 模板（首次启动写入磁盘的就是它）。
 pub const EXAMPLE_TOML: &str = include_str!("../../../config/config.example.toml");
 
-/// 顶层配置文件：`~/.config/agent/config.toml`（Windows: `%APPDATA%\dev\personal\agent\config.toml`）。
+/// 顶层配置文件，默认 `<项目根>/config/config.toml`。
 ///
-/// 也可通过 `AGENT_CONFIG` 环境变量覆盖为任意路径。
+/// 路径优先级：
+/// 1. `AGENT_CONFIG` 环境变量（显式覆盖，测试 / 多环境用）；
+/// 2. 当前工作目录下的 `config/config.toml`（默认）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvidersFile {
     #[serde(default)]
@@ -279,7 +281,7 @@ impl Default for AgentConfig {
 impl ProvidersFile {
     /// 决定配置文件路径。
     ///
-    /// 优先级：`AGENT_CONFIG` 环境变量 > `directories::ProjectDirs` 标准目录 > 当前目录回退。
+    /// 优先级：`AGENT_CONFIG` 环境变量 > 项目下 `config/config.toml`（默认）。
     pub fn config_path() -> PathBuf {
         if let Ok(p) = std::env::var("AGENT_CONFIG") {
             let pb = PathBuf::from(p);
@@ -287,13 +289,7 @@ impl ProvidersFile {
                 return pb;
             }
         }
-        if let Some(dirs) =
-            directories::ProjectDirs::from(PROJECT_QUALIFIER, PROJECT_ORG, PROJECT_APP)
-        {
-            dirs.config_dir().join(CONFIG_FILE)
-        } else {
-            PathBuf::from("./agent-config.toml")
-        }
+        PathBuf::from(DEFAULT_CONFIG_REL)
     }
 
     /// 从路径加载（不存在则返回默认配置）。
@@ -425,8 +421,11 @@ mod tests {
     }
 
     #[test]
-    fn config_path_respects_env_override() {
+    fn config_path_defaults_to_project_config() {
+        // 默认（AGENT_CONFIG 未设时）应为项目下 config/config.toml。
+        // 注意：不在测试里设 AGENT_CONFIG，避免并行测试互相污染。
         let p = ProvidersFile::config_path();
+        assert_eq!(p, PathBuf::from(DEFAULT_CONFIG_REL));
         assert!(p.ends_with(CONFIG_FILE));
     }
 
