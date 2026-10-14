@@ -33,14 +33,21 @@ pub async fn run_tui(
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // 隐藏终端原生光标：输入框使用软光标（反显块）渲染，
+    // 否则会与软光标重叠成"两个光标"，且原生光标在 alternate
+    // screen 下多数终端不闪烁。
+    execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = event_loop(&mut terminal, &mut app, &mut ev_rx, &cmd_tx).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -60,6 +67,9 @@ async fn event_loop(
         while let Ok(ev) = ev_rx.try_recv() {
             app.apply_event(ev);
         }
+
+        // 驱动软光标闪烁（与终端原生光标行为无关，跨平台一致）。
+        app.on_tick();
 
         if event::poll(tick)? {
             if let CtEvent::Key(key) = event::read()? {
@@ -128,7 +138,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
     }
 
     match (key.code, key.modifiers) {
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => UiAction::Quit,
+        // Ctrl+C：用 contains 而非精确匹配——Windows 上 Ctrl 事件可能
+        // 附带 NumLock/CapsLock 等标志，精确相等会漏判。
+        (code, m) if code == KeyCode::Char('c') && m.contains(KeyModifiers::CONTROL) => {
+            UiAction::Quit
+        }
         (KeyCode::Esc, _) => UiAction::Cancel,
         (KeyCode::Enter, _) => {
             // 提交
@@ -139,6 +153,39 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
         }
         (KeyCode::Backspace, _) => {
             app.on_backspace();
+            UiAction::None
+        }
+        (KeyCode::Delete, _) => {
+            app.input.delete();
+            app.wake_cursor();
+            UiAction::None
+        }
+        (KeyCode::Left, _) => {
+            app.input.move_left();
+            app.wake_cursor();
+            UiAction::None
+        }
+        (KeyCode::Right, _) => {
+            app.input.move_right();
+            app.wake_cursor();
+            UiAction::None
+        }
+        // Home / Ctrl+A（readline 风格）
+        (code, m)
+            if code == KeyCode::Home
+                || (code == KeyCode::Char('a') && m.contains(KeyModifiers::CONTROL)) =>
+        {
+            app.input.move_home();
+            app.wake_cursor();
+            UiAction::None
+        }
+        // End / Ctrl+E
+        (code, m)
+            if code == KeyCode::End
+                || (code == KeyCode::Char('e') && m.contains(KeyModifiers::CONTROL)) =>
+        {
+            app.input.move_end();
+            app.wake_cursor();
             UiAction::None
         }
         (KeyCode::PageUp, _) => {
@@ -290,12 +337,30 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .title(" 输入任务 (Enter 发送 / Esc 中断 / Ctrl+C 退出) ")
         .border_style(Style::default().fg(Color::Cyan));
-    let p = Paragraph::new(app.input.buffer.clone()).block(block);
+
+    // 软光标：把 buffer 按光标切成 前 / 光标处 / 后 三段，光标处用反显。
+    // 不依赖 f.set_cursor_position()——alternate screen 下 Windows Terminal
+    // 的原生光标常不闪烁，软光标在任何终端都有一致的闪烁行为。
+    let buf = &app.input.buffer;
+    let cursor_idx = app.input.cursor_char_index();
+    let before: String = buf.chars().take(cursor_idx).collect();
+    let mut rest = buf.chars().skip(cursor_idx);
+    let at_char = rest.next().unwrap_or(' ');
+    let after: String = rest.collect();
+
+    let mut spans = vec![Span::raw(before)];
+    if app.cursor_visible {
+        spans.push(Span::styled(
+            at_char.to_string(),
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
+    } else {
+        spans.push(Span::raw(at_char.to_string()));
+    }
+    spans.push(Span::raw(after));
+
+    let p = Paragraph::new(RtLine::from(spans)).block(block);
     f.render_widget(p, area);
-    // 光标
-    let cursor_x = area.x + 1 + app.input.buffer.chars().count() as u16;
-    let cursor_y = area.y + 1;
-    f.set_cursor_position((cursor_x.min(area.right().saturating_sub(2)), cursor_y));
 }
 
 fn draw_approval(f: &mut Frame, _app: &App, p: &crate::app::PendingApproval, area: Rect) {

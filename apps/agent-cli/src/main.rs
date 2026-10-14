@@ -286,11 +286,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = App {
-        tier: cfg.agent.default_tier.clone(),
-        provider: router.available().join(","),
-        ..Default::default()
-    };
+    let app = App::with_identity(cfg.agent.default_tier.clone(), router.available().join(","));
 
     run_tui(app, ev_rx, cmd_tx).await?;
     Ok(())
