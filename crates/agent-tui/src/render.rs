@@ -3,7 +3,10 @@
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -16,6 +19,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthStr;
 
 use agent_core::event::{Command, Event};
 
@@ -36,7 +40,13 @@ pub async fn run_tui(
     // 隐藏终端原生光标：输入框使用软光标（反显块）渲染，
     // 否则会与软光标重叠成"两个光标"，且原生光标在 alternate
     // screen 下多数终端不闪烁。
-    execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
+    // 启用鼠标捕获：对话区 / 输入区都支持滚轮滚动。
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::cursor::Hide,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -46,11 +56,25 @@ pub async fn run_tui(
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        crossterm::cursor::Show
+        crossterm::cursor::Show,
+        DisableMouseCapture
     )?;
     terminal.show_cursor()?;
 
     result
+}
+
+/// 三行布局：状态栏(1) / 对话流(弹性) / 输入区(3)。
+fn layout_chunks(area: Rect) -> [Rect; 3] {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // 状态栏
+            Constraint::Min(3),    // 对话流
+            Constraint::Length(3), // 输入区
+        ])
+        .split(area);
+    [chunks[0], chunks[1], chunks[2]]
 }
 
 async fn event_loop(
@@ -61,6 +85,9 @@ async fn event_loop(
 ) -> anyhow::Result<()> {
     let tick = Duration::from_millis(120);
     loop {
+        // 当前终端尺寸（鼠标事件需要靠它判断指针落在哪个区域）
+        let size = terminal.size()?;
+        let area = Rect::new(0, 0, size.width, size.height);
         terminal.draw(|f| draw(f, app))?;
 
         // 非阻塞地抽干事件队列
@@ -72,11 +99,14 @@ async fn event_loop(
         app.on_tick();
 
         if event::poll(tick)? {
-            if let CtEvent::Key(key) = event::read()? {
-                // Windows 的 crossterm 会对每次输入同时上报 Press 与 Release；
-                // 中文 IME 尤其明显（每个字符两条事件）。只处理 Press，
-                // 否则字符会被插入两次（“你好” → “你你好好”）。
-                if should_handle_key(&key) {
+            match event::read()? {
+                CtEvent::Key(key) => {
+                    // Windows 的 crossterm 会对每次输入同时上报 Press 与 Release；
+                    // 中文 IME 尤其明显（每个字符两条事件）。只处理 Press，
+                    // 否则字符会被插入两次（“你好” → “你你好好”）。
+                    if !should_handle_key(&key) {
+                        continue;
+                    }
                     match handle_key(app, key) {
                         UiAction::Quit => {
                             let _ = cmd_tx.send(Command::Quit).await;
@@ -107,6 +137,9 @@ async fn event_loop(
                         UiAction::None => {}
                     }
                 }
+                // 鼠标滚轮：按指针所在区域分流——对话区上下滚，输入区左右滚。
+                CtEvent::Mouse(m) => handle_mouse(app, m, area),
+                _ => {}
             }
         }
 
@@ -123,6 +156,40 @@ async fn event_loop(
 /// “你好” 变成 “你你好好”。
 fn should_handle_key(key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
+}
+
+/// 鼠标滚轮事件：按指针所在区域分流。
+///
+/// - 对话区：上下滚动历史输出；
+/// - 输入区：左右移动光标（输入框是单行，超长时靠横向滚动查看）。
+fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
+    let chunks = layout_chunks(area);
+    let in_input = m.row >= chunks[2].y;
+    const WHEEL_STEP: u16 = 3;
+
+    match m.kind {
+        MouseEventKind::ScrollUp => {
+            if in_input {
+                for _ in 0..WHEEL_STEP {
+                    app.input.move_left();
+                }
+            } else {
+                app.scroll_up(WHEEL_STEP);
+            }
+            app.wake_cursor();
+        }
+        MouseEventKind::ScrollDown => {
+            if in_input {
+                for _ in 0..WHEEL_STEP {
+                    app.input.move_right();
+                }
+            } else {
+                app.scroll_down(WHEEL_STEP);
+            }
+            app.wake_cursor();
+        }
+        _ => {}
+    }
 }
 
 /// 按键 -> 动作。
@@ -206,14 +273,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
 
 fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // 状态栏
-            Constraint::Min(3),    // 对话流
-            Constraint::Length(3), // 输入区
-        ])
-        .split(area);
+    let chunks = layout_chunks(area);
 
     draw_status(f, app, chunks[0]);
     draw_conversation(f, app, chunks[1]);
@@ -316,7 +376,15 @@ fn draw_conversation(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let total = lines.len() as u16;
+    // 注意：Paragraph 启用了 Wrap，长行会被软换行成多行。这里必须按
+    // **wrap 后的实际行数**计算滚动范围——直接用 lines.len() 会严重低估，
+    // 导致内容一多就滚不到底（之前正是如此）。
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let total: u16 = lines
+        .iter()
+        .map(|l| wrapped_line_count(l, inner_w))
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16;
     let height = area.height.saturating_sub(2);
     let max_scroll = total.saturating_sub(height);
     let scroll = max_scroll.saturating_sub(app.scroll_from_bottom);
@@ -348,7 +416,12 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let at_char = rest.next().unwrap_or(' ');
     let after: String = rest.collect();
 
-    let mut spans = vec![Span::raw(before)];
+    // 输入框是单行且不 wrap：内容超过框宽时靠**横向滚动**保证光标可见，
+    // 否则超长输入直接被裁掉、光标也跑出视野（之前正是如此）。
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let cursor_col = UnicodeWidthStr::width(before.as_str());
+
+    let mut spans = vec![Span::raw(before.as_str())];
     if app.cursor_visible {
         spans.push(Span::styled(
             at_char.to_string(),
@@ -357,10 +430,30 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     } else {
         spans.push(Span::raw(at_char.to_string()));
     }
-    spans.push(Span::raw(after));
+    spans.push(Span::raw(after.as_str()));
+    // 光标 + 光标块占 cursor_col+1 列；放不下就往右滚，让光标贴右沿。
+    // inner_w 为 0（极端窄终端）时 saturating_sub 自然得到 0。
+    let hscroll = (cursor_col + 1).saturating_sub(inner_w) as u16;
 
-    let p = Paragraph::new(RtLine::from(spans)).block(block);
+    let p = Paragraph::new(RtLine::from(spans))
+        .block(block)
+        .scroll((0, hscroll));
     f.render_widget(p, area);
+}
+
+/// 一行文本在给定宽度下 wrap 后占用的显示行数（至少 1 行）。
+fn wrapped_line_count(line: &RtLine, inner_w: usize) -> usize {
+    if inner_w == 0 {
+        return 1;
+    }
+    let w = UnicodeWidthStr::width(line_as_str(line).as_str());
+    // 空行也算 1 行；否则按宽度向上取整
+    1 + w.saturating_sub(1) / inner_w
+}
+
+/// 取出 RtLine 的纯文本（仅用于测宽，样式无关）。
+fn line_as_str(line: &RtLine) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
 fn draw_approval(f: &mut Frame, _app: &App, p: &crate::app::PendingApproval, area: Rect) {
@@ -458,5 +551,135 @@ mod tests {
             }
         }
         assert_eq!(app.input.buffer, "hello");
+    }
+
+    // ---- wrap 行数计算（对话区滚动范围） ----
+
+    #[test]
+    fn wrapped_line_count_short_line_is_one() {
+        let l = RtLine::from("hello");
+        assert_eq!(wrapped_line_count(&l, 80), 1);
+    }
+
+    #[test]
+    fn wrapped_line_count_empty_line_is_one() {
+        let l = RtLine::from("");
+        assert_eq!(wrapped_line_count(&l, 80), 1);
+    }
+
+    #[test]
+    fn wrapped_line_count_counts_cjk_by_display_width() {
+        // 中文占 2 列：10 个中文字 = 20 列，在宽 8 的区域应占 3 行
+        let l = RtLine::from("你好世界测试ABCDE".to_string()); // 8 CJK + 5 ASCII = 21 列
+        assert_eq!(wrapped_line_count(&l, 8), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_exact_multiple() {
+        // 8 列宽、8 列文本 → 恰好 1 行（不是 2 行）
+        let l = RtLine::from("12345678");
+        assert_eq!(wrapped_line_count(&l, 8), 1);
+    }
+
+    #[test]
+    fn wrapped_line_count_one_over_wraps() {
+        let l = RtLine::from("123456789"); // 9 列
+        assert_eq!(wrapped_line_count(&l, 8), 2);
+    }
+
+    #[test]
+    fn wrapped_line_count_zero_width_is_one() {
+        let l = RtLine::from("anything");
+        assert_eq!(wrapped_line_count(&l, 0), 1);
+    }
+
+    // ---- 鼠标滚轮区域分流 ----
+
+    fn rect(w: u16, h: u16) -> Rect {
+        Rect::new(0, 0, w, h)
+    }
+
+    #[test]
+    fn mouse_scroll_in_conversation_scrolls_history() {
+        let mut app = App::default();
+        let area = rect(80, 30); // 输入区从 row 27 开始
+        let m = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            row: 10, // 对话区中部
+            column: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, m, area);
+        assert_eq!(app.scroll_from_bottom, 3, "对话区滚轮应滚动历史");
+    }
+
+    #[test]
+    fn mouse_scroll_in_input_moves_cursor() {
+        let mut app = App::default();
+        for c in "你好世界".chars() {
+            app.on_char(c);
+        }
+        let area = rect(80, 30);
+        let m = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            row: 28, // 输入区（27..30）
+            column: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, m, area);
+        assert_eq!(
+            app.input.cursor_char_index(),
+            4 - 3,
+            "输入区滚轮应左移光标 3 个字符"
+        );
+    }
+
+    #[test]
+    fn mouse_scroll_down_in_input_moves_cursor_right() {
+        let mut app = App::default();
+        for c in "你好世界".chars() {
+            app.on_char(c);
+        }
+        app.input.move_home();
+        let area = rect(80, 30);
+        let m = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            row: 28,
+            column: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, m, area);
+        assert_eq!(app.input.cursor_char_index(), 3);
+    }
+
+    #[test]
+    fn mouse_scroll_down_in_conversation_returns_to_follow() {
+        let mut app = App::default();
+        app.scroll_up(10);
+        assert!(!app.follow);
+        let area = rect(80, 30);
+        let m = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            row: 5,
+            column: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, m, area);
+        // scroll_down(3) 不足以回到 0，但方向正确
+        assert_eq!(app.scroll_from_bottom, 7);
+    }
+
+    #[test]
+    fn mouse_other_kinds_ignored() {
+        let mut app = App::default();
+        let before = app.scroll_from_bottom;
+        let m = MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            row: 5,
+            column: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, m, rect(80, 30));
+        assert_eq!(app.scroll_from_bottom, before);
     }
 }
