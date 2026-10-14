@@ -35,6 +35,11 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = wizard::ensure_loaded()?;
     let cfg_path = ProvidersFile::config_path();
+
+    // 非致命警告（如已知厂商 base_url 缺路径段）
+    for w in cfg.warnings() {
+        tracing::warn!("{w}");
+    }
     let client = agent_net::build_client(&Default::default())?;
     let router = Arc::new(ProviderRouter::from_config(&cfg, client.clone()));
     if router.available().is_empty() {

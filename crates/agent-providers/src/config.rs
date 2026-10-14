@@ -346,6 +346,37 @@ impl ProvidersFile {
         Ok(toml::from_str(&s)?)
     }
 
+    /// 非致命配置警告（不阻塞启动，仅提示常见踩坑）。
+    ///
+    /// 最典型的一类：已知厂商的 `base_url` 缺少 API 路径段（如 DeepSeek
+    /// 写成 `https://api.deepseek.com` 而漏掉 `/v1`）。这种错误下厂商仍会
+    /// 先做认证，返回的却是「api key invalid」——极易误判为 key 问题。
+    pub fn warnings(&self) -> Vec<String> {
+        /// (域名关键字, 必需的路径段)
+        const KNOWN: &[(&str, &str)] = &[
+            ("api.deepseek.com", "/v1"),
+            ("dashscope.aliyuncs.com", "/compatible-mode/v1"),
+            ("api.openai.com", "/v1"),
+            ("api.anthropic.com", "/v1"),
+            ("open.bigmodel.cn", "/api/paas/v4"),
+            ("api.moonshot.cn", "/v1"),
+        ];
+        let mut out = Vec::new();
+        for (name, p) in &self.providers {
+            for (host, required) in KNOWN {
+                if p.base_url.contains(host) && !p.base_url.contains(required) {
+                    out.push(format!(
+                        "provider `{name}`: base_url `{}` 可能缺少 `{required}` 路径段\
+                         （{host} 的 API 路径）；厂商对此仍会先认证，报错会是\
+                         「api key invalid」从而误导排查",
+                        p.base_url
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// 校验配置语义合法性（不检查文件 IO）。
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.providers.is_empty() {
@@ -582,5 +613,38 @@ mod tests {
         let pc = provider_with(None, None);
         assert!(!pc.needs_auth());
         assert!(pc.resolve_api_key().is_none());
+    }
+
+    // ---- base_url 常见踩坑警告 ----
+
+    #[test]
+    fn warns_when_deepseek_base_url_missing_v1() {
+        let mut cfg = ProvidersFile::default();
+        cfg.providers.get_mut("deepseek").unwrap().base_url = "https://api.deepseek.com".into();
+        let w = cfg.warnings();
+        assert_eq!(w.len(), 1, "应恰好一条警告，实际: {w:?}");
+        assert!(w[0].contains("deepseek"));
+        assert!(w[0].contains("/v1"));
+    }
+
+    #[test]
+    fn no_warning_when_base_url_correct() {
+        let cfg = ProvidersFile::default();
+        assert!(cfg.warnings().is_empty(), "默认配置不应有警告");
+    }
+
+    #[test]
+    fn no_warning_for_unknown_vendor() {
+        let mut cfg = ProvidersFile::default();
+        cfg.providers.get_mut("deepseek").unwrap().base_url = "https://my-proxy.example.com".into();
+        assert!(cfg.warnings().is_empty(), "未知域名不应误报");
+    }
+
+    #[test]
+    fn warns_for_multiple_vendors() {
+        let mut cfg = ProvidersFile::default();
+        cfg.providers.get_mut("deepseek").unwrap().base_url = "https://api.deepseek.com".into();
+        cfg.providers.get_mut("qwen").unwrap().base_url = "https://dashscope.aliyuncs.com".into();
+        assert_eq!(cfg.warnings().len(), 2);
     }
 }

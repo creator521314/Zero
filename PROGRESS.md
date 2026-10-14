@@ -42,7 +42,9 @@
 - [x] 二进制产出：`target/debug/agent`（TUI）、`target/debug/agent-server`（headless）
 - [x] 启动路径验证：首次运行生成配置模板；无 key 时给出明确提示并警告禁用 provider
 - [x] 配置向导：缺配置 / 配置无效 → 自动进入 wizard（dialoguer）；非 TTY 写模板退出
-- [ ] 端到端真实对话：需设置 `DEEPSEEK_API_KEY`（沙箱内无凭据，留待本地验证）
+- [x] 端到端真实对话：2026-10-14 本地验证通过（DeepSeek 真实端点，
+      `agent-server "hi"` 获得正常回复；配置见 config/config.toml，
+      支持 api_key_env 环境变量优先 + api_key 明文兜底）
 
 ### 规模
 

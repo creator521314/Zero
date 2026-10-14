@@ -116,6 +116,12 @@ async fn main() -> anyhow::Result<()> {
     // 启动期配置加载：缺/坏 → 自动进入 wizard（仅 stdin 是 TTY 时）。
     let cfg = wizard::ensure_loaded()?;
 
+    // 非致命警告（如已知厂商 base_url 缺路径段）——TUI 下写日志文件。
+    for w in cfg.warnings() {
+        tracing::warn!("{w}");
+        eprintln!("[警告] {w}");
+    }
+
     let client = agent_net::build_client(&Default::default())?;
     let router = Arc::new(ProviderRouter::from_config(&cfg, client.clone()));
 
