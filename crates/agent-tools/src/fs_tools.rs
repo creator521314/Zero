@@ -33,19 +33,26 @@ impl Tool for FileRead {
         Risk::Low
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("missing 'path'".into()))?;
         let full = resolve_in_workspace(&ctx.workspace, path)?;
 
-        let content = tokio::fs::read_to_string(&full).await.map_err(|e| {
-            ToolError::Failed(format!("read {}: {e}", full.display()))
-        })?;
+        let content = tokio::fs::read_to_string(&full)
+            .await
+            .map_err(|e| ToolError::Failed(format!("read {}: {e}", full.display())))?;
 
         let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
@@ -87,10 +94,18 @@ impl Tool for FileWrite {
         Risk::Medium
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let path = args.get("path").and_then(|v| v.as_str())
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("missing 'path'".into()))?;
-        let content = args.get("content").and_then(|v| v.as_str())
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("missing 'content'".into()))?;
         let full = resolve_in_workspace(&ctx.workspace, path)?;
 
@@ -100,10 +115,14 @@ impl Tool for FileWrite {
         tokio::fs::write(&full, content).await?;
 
         let bytes = content.len() as u64;
-        Ok(ToolOutput::ok(format!("wrote {bytes} bytes to {path}")).with_artifacts(vec![Artifact {
-            path: full.display().to_string(),
-            bytes,
-        }]))
+        Ok(
+            ToolOutput::ok(format!("wrote {bytes} bytes to {path}")).with_artifacts(vec![
+                Artifact {
+                    path: full.display().to_string(),
+                    bytes,
+                },
+            ]),
+        )
     }
 }
 
@@ -133,12 +152,22 @@ impl Tool for FileEdit {
         Risk::Medium
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let path = args.get("path").and_then(|v| v.as_str())
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("missing 'path'".into()))?;
-        let old = args.get("old_str").and_then(|v| v.as_str())
+        let old = args
+            .get("old_str")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("missing 'old_str'".into()))?;
-        let new = args.get("new_str").and_then(|v| v.as_str())
+        let new = args
+            .get("new_str")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("missing 'new_str'".into()))?;
         let full = resolve_in_workspace(&ctx.workspace, path)?;
 
@@ -154,10 +183,12 @@ impl Tool for FileEdit {
         }
         let updated = content.replacen(old, new, 1);
         tokio::fs::write(&full, &updated).await?;
-        Ok(ToolOutput::ok(format!("edited {path}")).with_artifacts(vec![Artifact {
-            path: full.display().to_string(),
-            bytes: updated.len() as u64,
-        }]))
+        Ok(
+            ToolOutput::ok(format!("edited {path}")).with_artifacts(vec![Artifact {
+                path: full.display().to_string(),
+                bytes: updated.len() as u64,
+            }]),
+        )
     }
 }
 
@@ -183,7 +214,11 @@ impl Tool for ListDir {
         Risk::Low
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let full = resolve_in_workspace(&ctx.workspace, path)?;
         let mut rd = tokio::fs::read_dir(&full).await?;

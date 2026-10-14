@@ -4,8 +4,10 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -174,9 +176,12 @@ fn draw_conversation(f: &mut Frame, app: &App, area: Rect) {
     for l in &app.lines {
         match l {
             Line::User(s) => {
-                lines.push(RtLine::from(vec![
-                    Span::styled("▌ 你: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                ]));
+                lines.push(RtLine::from(vec![Span::styled(
+                    "▌ 你: ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )]));
                 for tl in s.lines() {
                     lines.push(RtLine::from(tl.to_string()));
                 }
@@ -184,7 +189,9 @@ fn draw_conversation(f: &mut Frame, app: &App, area: Rect) {
             Line::Assistant(s) => {
                 lines.push(RtLine::from(Span::styled(
                     "◇ Agent:",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 )));
                 for tl in s.lines() {
                     lines.push(RtLine::from(tl.to_string()));
@@ -220,7 +227,10 @@ fn draw_conversation(f: &mut Frame, app: &App, area: Rect) {
                 };
                 lines.push(RtLine::from(vec![
                     Span::styled(format!("  {mark} [工具] "), Style::default().fg(color)),
-                    Span::styled(name.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        name.clone(),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw(" "),
                     Span::styled(summary.clone(), Style::default().fg(Color::Gray)),
                 ]));
@@ -295,9 +305,7 @@ fn draw_approval(f: &mut Frame, _app: &App, p: &crate::app::PendingApproval, are
         .borders(Borders::ALL)
         .title(" 需要确认 ")
         .border_style(Style::default().fg(Color::Yellow));
-    let para = Paragraph::new(text)
-        .block(block)
-        .wrap(Wrap { trim: true });
+    let para = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
     f.render_widget(para, popup);
 }
 

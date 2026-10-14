@@ -116,7 +116,8 @@ impl App {
             Event::TaskStarted { id, title } => {
                 self.active_task = Some(id);
                 self.status = format!("执行中: {title}");
-                self.lines.push(Line::System(format!("▶ 任务开始: {title}")));
+                self.lines
+                    .push(Line::System(format!("▶ 任务开始: {title}")));
                 self.scroll_to_bottom();
             }
             Event::TextDelta { text, .. } => {
@@ -145,8 +146,11 @@ impl App {
                 self.auto_scroll();
             }
             Event::ToolCallEnd { ok, ms, .. } => {
-                if let Some(Line::Tool { done, ok: o, .. }) =
-                    self.lines.iter_mut().rev().find(|l| matches!(l, Line::Tool { done, .. } if !*done))
+                if let Some(Line::Tool { done, ok: o, .. }) = self
+                    .lines
+                    .iter_mut()
+                    .rev()
+                    .find(|l| matches!(l, Line::Tool { done, .. } if !*done))
                 {
                     *done = true;
                     *o = ok;
@@ -154,7 +158,9 @@ impl App {
                 self.status = format!("工具完成 ({ms}ms)");
                 self.auto_scroll();
             }
-            Event::AwaitingApproval { approval_id, req, .. } => {
+            Event::AwaitingApproval {
+                approval_id, req, ..
+            } => {
                 self.status = "等待确认…".into();
                 self.pending = Some(PendingApproval {
                     id: approval_id,
@@ -183,7 +189,8 @@ impl App {
                 self.auto_scroll();
             }
             Event::Error { err, .. } => {
-                self.lines.push(Line::Error(format!("{}: {}", err.kind, err.message)));
+                self.lines
+                    .push(Line::Error(format!("{}: {}", err.kind, err.message)));
                 self.auto_scroll();
             }
         }

@@ -19,10 +19,8 @@ fn main() -> anyhow::Result<()> {
         "test" => run(&["test", "--all"])?,
         "fmt" => run(&["fmt", "--all"])?,
         "gen-cfg" => {
-            let dirs = directories::ProjectDirs::from("dev", "personal", "agent")
-                .ok_or_else(|| anyhow::anyhow!("cannot resolve config dir"))?;
-            let path = dirs.config_dir().join("config.toml");
-            agent_providers::config::ProvidersFile::write_default(&path)?;
+            let path = agent_providers::ProvidersFile::config_path();
+            agent_providers::ProvidersFile::write_template(&path)?;
             println!("wrote {}", path.display());
         }
         other => {

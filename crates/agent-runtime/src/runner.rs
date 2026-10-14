@@ -115,8 +115,7 @@ impl AgentRuntime {
 
         let mut stream = self.deps.provider.chat_stream(req).await?;
         let mut text = String::new();
-        let mut tool_acc: ToolAccum =
-            std::collections::BTreeMap::new();
+        let mut tool_acc: ToolAccum = std::collections::BTreeMap::new();
         let mut finish = agent_core::provider::FinishReason::Stop;
         let mut usage = Usage::default();
 
@@ -149,9 +148,7 @@ impl AgentRuntime {
                     name,
                     args_delta,
                 } => {
-                    let e = tool_acc
-                        .entry(index)
-                        .or_insert((None, None, String::new()));
+                    let e = tool_acc.entry(index).or_insert((None, None, String::new()));
                     if id.is_some() {
                         e.0 = id;
                     }
@@ -212,10 +209,7 @@ impl AgentRunner for AgentRuntime {
             title: task.title.clone(),
         });
 
-        let mut cm = ContextManager::new(
-            self.deps.context_cfg.clone(),
-            Self::system_prompt(&task),
-        );
+        let mut cm = ContextManager::new(self.deps.context_cfg.clone(), Self::system_prompt(&task));
         cm.push(Message::user(&task.prompt));
 
         let cancel = ctl.cancel.clone();
@@ -285,10 +279,7 @@ impl AgentRunner for AgentRuntime {
                         artifacts: artifacts.clone(),
                     },
                 });
-                return Ok(Outcome::Success {
-                    summary,
-                    artifacts,
-                });
+                return Ok(Outcome::Success { summary, artifacts });
             }
 
             // 记录 assistant 的工具调用消息
@@ -327,18 +318,15 @@ impl AgentRunner for AgentRuntime {
                 // ---- 权限裁决 ----
                 let mut decision = self.deps.perm.check(call, &task).await;
                 if repeat_count >= 3 && matches!(decision, Decision::Allow) {
-                    decision = Decision::Deny(
-                        "相同操作已重复 3 次，请更换策略或结束任务".to_string(),
-                    );
+                    decision =
+                        Decision::Deny("相同操作已重复 3 次，请更换策略或结束任务".to_string());
                 }
 
                 match decision {
                     Decision::Deny(reason) => {
                         tool_messages.push(Message {
                             role: Role::Tool,
-                            content: vec![ContentPart::text(format!(
-                                "[denied] {reason}"
-                            ))],
+                            content: vec![ContentPart::text(format!("[denied] {reason}"))],
                             tool_calls: vec![],
                             tool_call_id: Some(call_id.clone()),
                             reasoning: None,
@@ -471,10 +459,7 @@ impl AgentRunner for AgentRuntime {
                             artifacts: artifacts.clone(),
                         },
                     });
-                    return Ok(Outcome::Success {
-                        summary,
-                        artifacts,
-                    });
+                    return Ok(Outcome::Success { summary, artifacts });
                 }
             }
 
@@ -544,11 +529,7 @@ impl AgentRuntime {
             .await
             .map_err(AgentError::Tool)?;
 
-        let arts: Vec<String> = out
-            .side_effects
-            .iter()
-            .map(|a| a.path.clone())
-            .collect();
+        let arts: Vec<String> = out.side_effects.iter().map(|a| a.path.clone()).collect();
 
         // 大输出外置
         let content = if cm.should_externalize(out.content.len()) {

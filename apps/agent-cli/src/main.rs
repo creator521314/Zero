@@ -14,8 +14,9 @@ use agent_core::task::{RunControl, TaskSpec};
 use agent_core::AgentRunner;
 use agent_perm::rules::StaticRules;
 use agent_perm::{AiReviewer, PermConfig, PermissionEngineImpl, Review};
-use agent_providers::config::ProvidersFile;
+use agent_providers::wizard;
 use agent_providers::ProviderRouter;
+use agent_providers::ProvidersFile;
 use agent_store::JsonlStore;
 use agent_tui::{run_tui, App};
 use async_trait::async_trait;
@@ -80,7 +81,10 @@ impl AiReviewer for LlmReviewer {
                 .and_then(|r| r.as_str())
                 .unwrap_or("")
                 .to_string(),
-            confidence: json.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.5),
+            confidence: json
+                .get("confidence")
+                .and_then(|c| c.as_f64())
+                .unwrap_or(0.5),
         })
     }
 }
@@ -95,7 +99,7 @@ fn parse_tier(s: &str) -> PermissionTier {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cfg_path = config_path();
+    let cfg_path = ProvidersFile::config_path();
 
     // 日志写文件，避免污染 TUI
     if let Some(dir) = cfg_path.parent() {
@@ -103,30 +107,23 @@ async fn main() -> anyhow::Result<()> {
         let file_appender = tracing_appender::rolling::never(dir.join("logs"), "agent.log");
         tracing_subscriber::fmt()
             .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info".into()),
             )
             .with_writer(file_appender)
             .init();
     }
 
-    // 首次运行生成配置模板
-    let cfg = if cfg_path.exists() {
-        ProvidersFile::load_or_default(&cfg_path)?
-    } else {
-        ProvidersFile::write_default(&cfg_path)?;
-        eprintln!(
-            "已生成默认配置: {}\n请设置 API key 环境变量（如 DEEPSEEK_API_KEY）后重新运行。",
-            cfg_path.display()
-        );
-        ProvidersFile::default()
-    };
+    // 启动期配置加载：缺/坏 → 自动进入 wizard（仅 stdin 是 TTY 时）。
+    let cfg = wizard::ensure_loaded()?;
 
     let client = agent_net::build_client(&Default::default())?;
     let router = Arc::new(ProviderRouter::from_config(&cfg, client.clone()));
 
     if router.available().is_empty() {
         anyhow::bail!(
-            "没有可用的 LLM provider。请设置环境变量，例如:\n  export DEEPSEEK_API_KEY=sk-xxx\n配置文件: {}",
+            "没有可用的 LLM provider。请设置环境变量，例如:\n  setx DEEPSEEK_API_KEY \"sk-xxx\"\n\
+             配置文件: {}\n(可用 `cargo xtask gen-cfg` 重新生成模板)",
             cfg_path.display()
         );
     }
@@ -147,10 +144,11 @@ async fn main() -> anyhow::Result<()> {
     // 权限引擎：静态规则 + AI 审视（复用默认 provider，低价档）
     let reviewer_provider = router.resolve(None, None).await?;
     let perm = Arc::new(
-        PermissionEngineImpl::new(StaticRules::new(), PermConfig::default())
-            .with_reviewer(Box::new(LlmReviewer {
+        PermissionEngineImpl::new(StaticRules::new(), PermConfig::default()).with_reviewer(
+            Box::new(LlmReviewer {
                 provider: reviewer_provider,
-            })),
+            }),
+        ),
     ) as Arc<dyn PermissionEngine>;
 
     // 存储
@@ -176,7 +174,9 @@ async fn main() -> anyhow::Result<()> {
             while let Ok(ev) = sub.recv().await {
                 let _ = ev_tx.send(ev.clone()).await;
                 let (tid, durable) = match &ev {
-                    Event::TaskStarted { id, .. } | Event::TaskFinished { id, .. } | Event::Error { id, .. } => {
+                    Event::TaskStarted { id, .. }
+                    | Event::TaskFinished { id, .. }
+                    | Event::Error { id, .. } => {
                         (id.clone(), agent_core::store::Durability::Persistent)
                     }
                     Event::TextDelta { id, .. }
@@ -237,18 +237,19 @@ async fn main() -> anyhow::Result<()> {
                         // current 供 Cancel 命令触发取消
                         current = Some(ctl.cancel.clone());
 
-                        let runtime = agent_runtime::AgentRuntime::new(agent_runtime::RuntimeDeps {
-                            provider: provider.clone(),
-                            provider_name: provider.name().to_string(),
-                            tools: lookup2.clone(),
-                            tool_defs: tool_defs2.clone(),
-                            perm: perm2.clone(),
-                            store: store.clone(),
-                            approvals: approvals2.clone(),
-                            context_cfg: Default::default(),
-                            batch_approve: None,
-                            per_task_budget: router.per_task_limit(),
-                        });
+                        let runtime =
+                            agent_runtime::AgentRuntime::new(agent_runtime::RuntimeDeps {
+                                provider: provider.clone(),
+                                provider_name: provider.name().to_string(),
+                                tools: lookup2.clone(),
+                                tool_defs: tool_defs2.clone(),
+                                perm: perm2.clone(),
+                                store: store.clone(),
+                                approvals: approvals2.clone(),
+                                context_cfg: Default::default(),
+                                batch_approve: None,
+                                per_task_budget: router.per_task_limit(),
+                            });
 
                         if let Err(e) = runtime.run(spec, bus.clone(), ctl).await {
                             tracing::error!(error = %e, "task run failed");
@@ -258,12 +259,21 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Command::Approve(id) => {
                         let _ = ap_tx
-                            .send((id, agent_runtime::runner::ApprovalReply::Approve { remember: false }))
+                            .send((
+                                id,
+                                agent_runtime::runner::ApprovalReply::Approve { remember: false },
+                            ))
                             .await;
                     }
-                    Command::Reject { approval_id, reason } => {
+                    Command::Reject {
+                        approval_id,
+                        reason,
+                    } => {
                         let _ = ap_tx
-                            .send((approval_id, agent_runtime::runner::ApprovalReply::Reject { reason }))
+                            .send((
+                                approval_id,
+                                agent_runtime::runner::ApprovalReply::Reject { reason },
+                            ))
                             .await;
                     }
                     Command::Cancel(_) => {
@@ -285,12 +295,4 @@ async fn main() -> anyhow::Result<()> {
 
     run_tui(app, ev_rx, cmd_tx).await?;
     Ok(())
-}
-
-fn config_path() -> PathBuf {
-    if let Some(dirs) = directories::ProjectDirs::from("dev", "personal", "agent") {
-        dirs.config_dir().join("config.toml")
-    } else {
-        PathBuf::from("./agent-config.toml")
-    }
 }

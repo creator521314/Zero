@@ -38,7 +38,11 @@ impl ProviderRouter {
             }
             providers.insert(
                 name.clone(),
-                Arc::new(OpenAiCompatProvider::new(name.clone(), pc.clone(), client.clone())),
+                Arc::new(OpenAiCompatProvider::new(
+                    name.clone(),
+                    pc.clone(),
+                    client.clone(),
+                )),
             );
         }
 
@@ -58,7 +62,11 @@ impl ProviderRouter {
     }
 
     /// 解析某任务类型的候选 provider 顺序。
-    pub fn candidates(&self, route_hint: Option<&str>, model_override: Option<&str>) -> Vec<String> {
+    pub fn candidates(
+        &self,
+        route_hint: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Vec<String> {
         // 显式指定 model/provider 时优先
         if let Some(m) = model_override {
             if self.providers.contains_key(m) {
@@ -112,10 +120,7 @@ impl ProviderRouter {
 
     /// 记录一次调用的成本。
     pub async fn record_cost(&self, provider: &str, usage: &agent_core::provider::Usage) {
-        let price = self
-            .providers
-            .get(provider)
-            .and_then(|p| p.price(""));
+        let price = self.providers.get(provider).and_then(|p| p.price(""));
         if let Some(price) = price {
             let cost = (usage.input_tokens as f64 / 1000.0) * price.input_per_1k
                 + (usage.output_tokens as f64 / 1000.0) * price.output_per_1k;
@@ -141,7 +146,9 @@ impl ProviderRouter {
         let cands = self.candidates(route_hint, model_override);
         let mut last_err = None;
         for name in cands {
-            let Some(p) = self.providers.get(&name) else { continue };
+            let Some(p) = self.providers.get(&name) else {
+                continue;
+            };
             match p.chat(req.clone()).await {
                 Ok(resp) => {
                     self.record_cost(&name, &resp.usage).await;

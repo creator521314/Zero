@@ -133,7 +133,12 @@ impl PermissionEngine for PermissionEngineImpl {
         };
 
         match reviewer
-            .review(task, call, self.rules.static_risk(call), self.cfg.ai_timeout)
+            .review(
+                task,
+                call,
+                self.rules.static_risk(call),
+                self.cfg.ai_timeout,
+            )
             .await
         {
             Ok(r) if r.allow && r.risk != Risk::High => Decision::Allow,
@@ -168,7 +173,12 @@ mod tests {
     #[tokio::test]
     async fn l1_allows_safe_op() {
         let eng = PermissionEngineImpl::new(StaticRules::default(), PermConfig::default());
-        let d = eng.check(&call("file_read", serde_json::json!({"path":"a.txt"})), &task(PermissionTier::L1)).await;
+        let d = eng
+            .check(
+                &call("file_read", serde_json::json!({"path":"a.txt"})),
+                &task(PermissionTier::L1),
+            )
+            .await;
         assert!(matches!(d, Decision::Allow));
     }
 
@@ -177,15 +187,26 @@ mod tests {
         let eng = PermissionEngineImpl::new(StaticRules::default(), PermConfig::default());
         // 即使 L1 全自动，rm -rf / 也必须拦截
         let d = eng
-            .check(&call("shell_exec", serde_json::json!({"cmd":"rm -rf /"})), &task(PermissionTier::L1))
+            .check(
+                &call("shell_exec", serde_json::json!({"cmd":"rm -rf /"})),
+                &task(PermissionTier::L1),
+            )
             .await;
-        assert!(matches!(d, Decision::Deny(_) | Decision::AskUser), "高危命令不应被 L1 放行");
+        assert!(
+            matches!(d, Decision::Deny(_) | Decision::AskUser),
+            "高危命令不应被 L1 放行"
+        );
     }
 
     #[tokio::test]
     async fn l2_without_reviewer_asks() {
         let eng = PermissionEngineImpl::new(StaticRules::default(), PermConfig::default());
-        let d = eng.check(&call("shell_exec", serde_json::json!({"cmd":"ls"})), &task(PermissionTier::L2)).await;
+        let d = eng
+            .check(
+                &call("shell_exec", serde_json::json!({"cmd":"ls"})),
+                &task(PermissionTier::L2),
+            )
+            .await;
         assert!(matches!(d, Decision::AskUser), "无审视器时必须降级为询问");
     }
 
@@ -193,11 +214,15 @@ mod tests {
     async fn l3_asks_everything() {
         let eng = PermissionEngineImpl::new(StaticRules::default(), PermConfig::default());
         let t = task(PermissionTier::L3);
-        let d = eng.check(&call("list_dir", serde_json::json!({"path":"."})), &t).await;
+        let d = eng
+            .check(&call("list_dir", serde_json::json!({"path":"."})), &t)
+            .await;
         assert!(matches!(d, Decision::AskUser));
         // 批量批准后放行
         eng.approve_for_task(t.id.0.as_str(), "list_dir").await;
-        let d = eng.check(&call("list_dir", serde_json::json!({"path":"."})), &t).await;
+        let d = eng
+            .check(&call("list_dir", serde_json::json!({"path":"."})), &t)
+            .await;
         assert!(matches!(d, Decision::Allow));
     }
 }

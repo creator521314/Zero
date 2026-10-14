@@ -26,8 +26,14 @@ pub enum Role {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
-    Text { text: String },
-    Image { url: Option<String>, b64: Option<String>, media_type: String },
+    Text {
+        text: String,
+    },
+    Image {
+        url: Option<String>,
+        b64: Option<String>,
+        media_type: String,
+    },
     // Audio / File 后续扩展
 }
 

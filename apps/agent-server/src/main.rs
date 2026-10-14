@@ -13,8 +13,9 @@ use agent_core::task::{RunControl, TaskSpec};
 use agent_core::AgentRunner;
 use agent_perm::rules::StaticRules;
 use agent_perm::{PermConfig, PermissionEngineImpl};
-use agent_providers::config::ProvidersFile;
+use agent_providers::wizard;
 use agent_providers::ProviderRouter;
+use agent_providers::ProvidersFile;
 use agent_store::JsonlStore;
 use tokio::sync::{mpsc, Mutex};
 
@@ -33,7 +34,8 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     }
 
-    let cfg = ProvidersFile::load_or_default(&config_path())?;
+    let cfg = wizard::ensure_loaded()?;
+    let cfg_path = ProvidersFile::config_path();
     let client = agent_net::build_client(&Default::default())?;
     let router = Arc::new(ProviderRouter::from_config(&cfg, client.clone()));
     if router.available().is_empty() {
@@ -42,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
              请设置至少一个 API key 环境变量（如 DEEPSEEK_API_KEY），\n\
              或启动本地 Ollama（http://localhost:11434）作为兜底。\n\
              配置文件位于: {}",
-            config_path().display()
+            cfg_path.display()
         );
     }
     tracing::info!(providers = ?router.available(), "available providers");
@@ -132,13 +134,5 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("任务失败: {e}");
             std::process::exit(1);
         }
-    }
-}
-
-fn config_path() -> PathBuf {
-    if let Some(dirs) = directories::ProjectDirs::from("dev", "personal", "agent") {
-        dirs.config_dir().join("config.toml")
-    } else {
-        PathBuf::from("./agent-config.toml")
     }
 }

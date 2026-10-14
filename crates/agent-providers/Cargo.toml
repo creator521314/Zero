@@ -18,4 +18,6 @@ eventsource-stream.workspace = true
 toml.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+dialoguer.workspace = true
+directories.workspace = true
 async-stream = "0.3"

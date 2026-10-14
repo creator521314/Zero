@@ -41,7 +41,11 @@ impl Tool for WebFetch {
         Risk::Medium
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         let url = args
             .get("url")
             .and_then(|v| v.as_str())
@@ -170,7 +174,11 @@ impl Tool for WebSearch {
         Risk::Low
     }
 
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         let query = args
             .get("query")
             .and_then(|v| v.as_str())

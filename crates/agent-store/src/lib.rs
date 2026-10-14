@@ -140,10 +140,7 @@ impl Store for JsonlStore {
                 }
             }
         }
-        self.cache
-            .lock()
-            .await
-            .insert(sid.clone(), events.clone());
+        self.cache.lock().await.insert(sid.clone(), events.clone());
         Ok(Session {
             id: sid.clone(),
             events,
@@ -165,7 +162,7 @@ impl Store for JsonlStore {
                 }
             }
         }
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         out.truncate(limit);
         Ok(out)
     }

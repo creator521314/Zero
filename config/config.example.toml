@@ -1,0 +1,108 @@
+# 个人 Agent —— 配置文件模板
+#
+# 默认存放位置（macOS / Linux）：~/.config/agent/config.toml
+#                       Windows：%APPDATA%\dev\personal\agent\config.toml
+#
+# 也可通过环境变量 AGENT_CONFIG 覆盖为任意路径。
+#
+# 一键覆盖：用 `cargo xtask gen-cfg` 重新写一份模板。
+# 配置错误启动会进入 wizard（仅 stdin 是 TTY 时）。
+#
+# ============================================================
+#  ⚠️  安全原则
+# ============================================================
+# - **不要把 API key 直接写进文件**——配置只记录「环境变量名」
+#   （api_key_env 字段）。这样 git 误提交、备份泄漏也不会泄露 key。
+# - 启动时 Agent 会从对应环境变量读取 key；如果环境变量不存在，
+#   该 provider 会被自动跳过（warning）。
+#
+# Windows (PowerShell):
+#     setx DEEPSEEK_API_KEY "sk-xxxx"
+# Linux / macOS:
+#     export DEEPSEEK_API_KEY=sk-xxxx    # 加进 ~/.bashrc / ~/.zshrc
+#
+# ============================================================
+#  📦  providers —— 所有可用的 LLM 端点
+# ============================================================
+# 每个 provider 必须有唯一的 key（hashmap key），后面 router 引用这个 key。
+
+[providers.deepseek]
+kind            = "openai_compat"            # 适配器类型（当前仅 openai_compat）
+base_url        = "https://api.deepseek.com/v1"
+api_key_env     = "DEEPSEEK_API_KEY"         # ← key 从这个环境变量取
+model           = "deepseek-chat"
+tools           = true                       # 是否支持 tool/function calling
+reasoning       = true                       # 是否发回思考链（reasoning_effort）
+vision          = false
+max_context     = 128000
+input_per_1k    = 0.0014                     # USD / 1K input tokens（预算估算用）
+output_per_1k   = 0.0028                     # USD / 1K output tokens
+
+[providers.qwen]
+kind            = "openai_compat"
+base_url        = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key_env     = "DASHSCOPE_API_KEY"
+model           = "qwen-max"
+tools           = true
+reasoning       = false
+vision          = false
+max_context     = 128000
+input_per_1k    = 0.0016
+output_per_1k   = 0.0064
+
+# Ollama 本地（无需 key）—— 注意 TOML 无 null 字面量，
+# 「无需 key」的表达方式是省略 api_key_env 这一行。
+[providers.ollama]
+kind            = "openai_compat"
+base_url        = "http://localhost:11434/v1"
+# api_key_env   = "SOME_ENV"                 # 本地 Ollama 可整行省略（默认 None）
+model           = "qwen2.5-coder"
+tools           = true
+reasoning       = false
+vision          = false
+max_context     = 32000
+input_per_1k    = 0.0
+output_per_1k   = 0.0
+
+# ============================================================
+#  🔀  router —— 任务 → provider 的路由
+# ============================================================
+# `default` 用于没匹配到 by_task 时；`by_task` 按任务类型给有序候选，
+# 第一个失败（超时/401/解析错）顺延。
+
+[router]
+default = "deepseek"        # 全局默认 provider 名（必须在 providers 里存在）
+
+[router.by_task]
+code      = ["deepseek", "qwen"]       # 写代码任务的有序候选
+news      = ["qwen", "deepseek"]       # 新闻收集任务
+# sensitive = ["ollama"]              # 隐私数据强制走本地（示例，按需开启）
+
+# ============================================================
+#  💰  budget —— 成本熔断
+# ============================================================
+# 单任务或月度超过限额会中止并提示。
+
+[budget]
+monthly_limit_usd  = 20.0
+per_task_limit_usd = 0.5
+
+# ============================================================
+#  🔍  search —— 网络搜索
+# ============================================================
+# web_search 工具的 SearXNG 端点（自建）。未配置时 web_search 会失败并给出明确提示。
+
+# 「不启用搜索」的表达方式：省略 searxng_endpoint 这一行。
+[search]
+# searxng_endpoint = "http://localhost:8080/search"   # 示例
+
+# ============================================================
+#  ⚙️  agent —— 工作区与执行参数
+# ============================================================
+# 改这些字段后无需重启 wizard，直接编辑本文件即可。
+
+[agent]
+root                       = "~/agent"   # 工作区根目录
+default_tier               = "L2"        # L1 全自动 / L2 AI 审视 / L3 逐步确认
+max_iterations             = 25          # 单任务最大迭代轮（防死循环）
+transient_retention_days   = 7           # 临时信息保留天数（P4）

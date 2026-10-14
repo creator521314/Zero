@@ -19,6 +19,9 @@ pub enum AgentError {
     IterationLimit(usize),
     #[error("budget exceeded: {0}")]
     BudgetExceeded(String),
+    /// 配置错误（启动期：反序列化失败、字段缺失、provider 不存在等）。
+    #[error("config error: {0}")]
+    Config(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -49,6 +52,7 @@ impl From<&AgentError> for ErrorInfo {
             AgentError::Cancelled => "cancelled",
             AgentError::IterationLimit(_) => "iteration_limit",
             AgentError::BudgetExceeded(_) => "budget_exceeded",
+            AgentError::Config(_) => "config",
             AgentError::Internal(_) => "internal",
         };
         ErrorInfo::new(kind, e.to_string())

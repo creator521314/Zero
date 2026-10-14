@@ -78,7 +78,8 @@ impl StaticRules {
             shell: shell_patterns().0.clone(),
             shell_labels: shell_patterns().1.clone(),
             protected_paths: vec![
-                "/etc", "/boot", "/usr", "/bin", "/sbin", "/var", "/dev", "/proc", "/sys", "/System",
+                "/etc", "/boot", "/usr", "/bin", "/sbin", "/var", "/dev", "/proc", "/sys",
+                "/System",
             ],
             tool_risk,
         }
@@ -101,7 +102,12 @@ impl StaticRules {
                 if let Some(&i) = hits.first() {
                     return RuleMatch::Hit {
                         risk: Risk::High,
-                        rule: self.shell_labels.get(i).copied().unwrap_or("高危命令").to_string(),
+                        rule: self
+                            .shell_labels
+                            .get(i)
+                            .copied()
+                            .unwrap_or("高危命令")
+                            .to_string(),
                     };
                 }
             }
@@ -185,9 +191,15 @@ mod tests {
     #[test]
     fn detects_protected_path_write() {
         let r = StaticRules::new();
-        let m = r.match_call(&call("file_write", serde_json::json!({"path":"/etc/passwd","content":""})));
+        let m = r.match_call(&call(
+            "file_write",
+            serde_json::json!({"path":"/etc/passwd","content":""}),
+        ));
         assert!(matches!(m, RuleMatch::Hit { .. }));
-        let m2 = r.match_call(&call("file_write", serde_json::json!({"path":"~/.ssh/authorized_keys","content":""})));
+        let m2 = r.match_call(&call(
+            "file_write",
+            serde_json::json!({"path":"~/.ssh/authorized_keys","content":""}),
+        ));
         assert!(matches!(m2, RuleMatch::Hit { .. }));
     }
 }

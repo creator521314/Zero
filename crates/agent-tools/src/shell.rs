@@ -37,7 +37,11 @@ impl Tool for ShellExec {
         Risk::High
     }
 
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         let cmd = args
             .get("cmd")
             .and_then(|v| v.as_str())
@@ -72,12 +76,11 @@ impl Tool for ShellExec {
             Ok::<_, std::io::Error>((out.status, stdout, stderr))
         };
 
-        let result: Result<Result<(std::process::ExitStatus, String, String), std::io::Error>, _> =
-            tokio::select! {
-                biased;
-                _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
-                r = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut) => r,
-            };
+        let result: Result<Result<(std::process::ExitStatus, String, String), std::io::Error>, _> = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+            r = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut) => r,
+        };
 
         match result {
             Err(_) => Err(ToolError::Timeout),

@@ -42,7 +42,10 @@ impl OpenAiCompatProvider {
     }
 
     fn endpoint(&self) -> String {
-        format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'))
+        format!(
+            "{}/chat/completions",
+            self.cfg.base_url.trim_end_matches('/')
+        )
     }
 
     fn build_body(&self, req: &ChatRequest) -> Value {
@@ -83,7 +86,10 @@ impl OpenAiCompatProvider {
         if let Some(key) = &self.api_key {
             rb = rb.bearer_auth(key);
         }
-        let resp = rb.send().await.map_err(|e| LlmError::Network(e.to_string()))?;
+        let resp = rb
+            .send()
+            .await
+            .map_err(|e| LlmError::Network(e.to_string()))?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -188,9 +194,7 @@ impl LlmProvider for OpenAiCompatProvider {
             .and_then(|a| a.first())
             .ok_or_else(|| LlmError::StreamBroken("no choices".into()))?;
 
-        let message = from_openai_message(
-            choice.get("message").cloned().unwrap_or(Value::Null),
-        );
+        let message = from_openai_message(choice.get("message").cloned().unwrap_or(Value::Null));
         let finish_reason = map_finish(choice.get("finish_reason").and_then(|f| f.as_str()));
         let usage = parse_usage(v.get("usage"));
 
@@ -338,12 +342,16 @@ fn from_openai_message(v: Value) -> Message {
         for tc in tcs {
             let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or_default();
             let f = tc.get("function");
-            let name = f.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or_default();
+            let name = f
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or_default();
             let args_raw = f
                 .and_then(|f| f.get("arguments"))
                 .and_then(|a| a.as_str())
                 .unwrap_or("{}");
-            let arguments = serde_json::from_str(args_raw).unwrap_or(Value::Object(Default::default()));
+            let arguments =
+                serde_json::from_str(args_raw).unwrap_or(Value::Object(Default::default()));
             msg.tool_calls.push(ToolCall {
                 id: ToolCallId(id.to_string()),
                 name: name.to_string(),
@@ -370,7 +378,10 @@ fn parse_usage(v: Option<&Value>) -> Usage {
     };
     Usage {
         input_tokens: u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-        output_tokens: u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        output_tokens: u
+            .get("completion_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
         reasoning_tokens: u
             .get("completion_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))

@@ -11,7 +11,7 @@
 # 1. 设置 API key（以 DeepSeek 为例）
 export DEEPSEEK_API_KEY=sk-xxxx
 
-# 2. 运行（首次会自动生成 ~/.config/agent/config.toml）
+# 2. 运行（首次会自动进入配置向导；也可 cargo xtask gen-cfg 先生成模板）
 cargo run -p agent-cli
 
 # 或 headless 模式
@@ -56,6 +56,30 @@ fork bomb、`curl | sh`、写 `/etc`、`~/.ssh` 等。
 
 ## 配置
 
+配置文件位于 `~/.config/agent/config.toml`（Windows: `%APPDATA%\dev\personal\agent\config.toml`，
+可通过环境变量 `AGENT_CONFIG` 覆盖）。
+
+### 首次运行 = 自动配置向导
+
+Agent 检测到以下情况时会**自动进入配置向导**（仅 stdin 是 TTY 时）：
+
+| 情况 | 行为 |
+|---|---|
+| 配置文件不存在 | 进入向导，引导选择 provider / 环境变量名 |
+| 配置文件 TOML 语法错误 | 进入向导，提示是否覆盖 |
+| 配置语义无效（如 `router.default` 指向不存在的 provider） | 进入向导，提示是否覆盖 |
+| 非交互环境（CI / 管道 / SSH 后台） | 写模板并退出，提示编辑后重启 |
+
+向导只记录「环境变量名」，**API key 不写入文件**。
+
+### 手动生成模板
+
+```bash
+cargo xtask gen-cfg     # 把注释版模板写到配置路径
+```
+
+模板源文件在仓库 `config/config.example.toml`（被 `include_str!` 嵌入二进制）。
+
 `~/.config/agent/config.toml`（首次运行自动生成）：
 
 ```toml
@@ -73,6 +97,8 @@ code = ["deepseek", "qwen"]
 monthly_limit_usd = 20.0
 per_task_limit_usd = 0.5
 ```
+
+> 注意：TOML **没有 `null` 字面量**。「无需 API key」的表达方式是省略 `api_key_env` 这一行。
 
 - **已适配**：DeepSeek / 通义（兼容模式）/ OpenAI / Ollama（本地）—— 均走同一个 `openai_compat` 适配器。
 - **本地模型**：配置 `base_url = "http://localhost:11434/v1"` 即接入 Ollama（无需 key）。

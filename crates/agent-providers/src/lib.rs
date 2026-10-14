@@ -6,7 +6,9 @@
 pub mod config;
 pub mod openai_compat;
 pub mod router;
+pub mod wizard;
 
-pub use config::{Budget, ProviderConfig, ProvidersFile, RouterConfig};
+pub use config::{Budget, ConfigError, ProviderConfig, ProvidersFile, RouterConfig};
 pub use openai_compat::OpenAiCompatProvider;
 pub use router::ProviderRouter;
+pub use wizard::{ensure_loaded, run_first_time, run_invalid};
