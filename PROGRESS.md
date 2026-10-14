@@ -38,14 +38,15 @@
 
 - [x] `cargo build` 通过（全部 crate，**0 warning**）
 - [x] `cargo clippy --all-targets` 通过（**0 warning**）
-- [x] `cargo test` 通过（**20 passed / 0 failed**）
+- [x] `cargo test` 通过（**32 passed / 0 failed**）
 - [x] 二进制产出：`target/debug/agent`（TUI）、`target/debug/agent-server`（headless）
 - [x] 启动路径验证：首次运行生成配置模板；无 key 时给出明确提示并警告禁用 provider
+- [x] 配置向导：缺配置 / 配置无效 → 自动进入 wizard（dialoguer）；非 TTY 写模板退出
 - [ ] 端到端真实对话：需设置 `DEEPSEEK_API_KEY`（沙箱内无凭据，留待本地验证）
 
 ### 规模
 
-- Rust 源文件 35 个，约 **5000 行**
+- Rust 源文件 36 个，约 **5200 行**
 - 9 个库 crate + 2 个二进制 + xtask
 
 ## 已知限制（一期）
