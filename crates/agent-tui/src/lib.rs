@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod render;
+pub mod theme;
 
 pub use app::{App, UiAction};
 pub use render::run_tui;
