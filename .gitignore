@@ -5,3 +5,6 @@
 # 合并操作临时产物
 /tmp/
 /agent-workspace.bundle
+
+# 运行时数据（防止 agent.root 未展开时误入版本库）
+/~/

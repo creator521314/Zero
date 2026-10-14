@@ -2,7 +2,6 @@
 //!
 //! 装配职责：读配置 → 建 provider 路由 → 建工具集 → 建权限引擎 → 拉起 TUI + Agent 循环。
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let root = PathBuf::from(&cfg.agent.root);
+    let root = cfg.agent.resolved_root();
     tokio::fs::create_dir_all(root.join("workspace")).await.ok();
 
     // 工具集

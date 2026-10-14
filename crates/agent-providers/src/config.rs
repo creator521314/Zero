@@ -212,10 +212,7 @@ pub struct AgentConfig {
 }
 
 fn default_root() -> String {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".into());
-    format!("{home}/agent")
+    "~/agent".into()
 }
 fn default_tier() -> String {
     "L2".into()
@@ -225,6 +222,47 @@ fn default_max_iter() -> usize {
 }
 fn default_retention() -> u64 {
     7
+}
+
+impl AgentConfig {
+    /// 解析工作区根目录：展开 `~` 前缀为真实 home 目录。
+    ///
+    /// 模板默认值是 `~/agent`（用户常直接沿用）。若不展开，会在**当前工作
+    /// 目录**下创建字面名为 `~` 的目录（Windows 上表现为项目里出现 `~/agent/`）。
+    pub fn resolved_root(&self) -> PathBuf {
+        expand_home(&self.root)
+    }
+}
+
+/// 展开路径中的 `~` 前缀（`~` 或 `~/...`）。
+///
+/// 找不到 home 目录时原样返回，让后续 IO 报错给出明确信息。
+pub fn expand_home(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Some(h) = home_dir() {
+            return h;
+        }
+    } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Some(h) = home_dir() {
+            return h.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// 取 home 目录：Windows 用 `USERPROFILE`，其余用 `HOME`，最后回退 `directories`。
+pub fn home_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("USERPROFILE") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    if let Ok(p) = std::env::var("HOME") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf())
 }
 
 impl Default for AgentConfig {
@@ -396,5 +434,48 @@ mod tests {
     fn template_parses_and_validates() {
         let parsed: ProvidersFile = toml::from_str(EXAMPLE_TOML).expect("template should parse");
         parsed.validate().expect("template should validate");
+    }
+
+    #[test]
+    fn expand_home_handles_tilde_prefix() {
+        let home = home_dir().expect("home dir should resolve");
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("~/agent"), home.join("agent"));
+        assert_eq!(expand_home("~\\agent"), home.join("agent"));
+    }
+
+    #[test]
+    fn expand_home_leaves_absolute_untouched() {
+        let abs = if cfg!(windows) {
+            "D:\\data\\agent"
+        } else {
+            "/data/agent"
+        };
+        assert_eq!(expand_home(abs), PathBuf::from(abs));
+    }
+
+    #[test]
+    fn expand_home_leaves_relative_untouched() {
+        assert_eq!(expand_home("./agent"), PathBuf::from("./agent"));
+        assert_eq!(expand_home("agent"), PathBuf::from("agent"));
+    }
+
+    #[test]
+    fn resolved_root_expands_tilde() {
+        let cfg = AgentConfig {
+            root: "~/agent".into(),
+            ..Default::default()
+        };
+        let resolved = cfg.resolved_root();
+        let home = home_dir().expect("home dir should resolve");
+        assert_eq!(resolved, home.join("agent"));
+        // 关键回归：不得残留字面 `~` 段（否则会在 CWD 下创建 `~/agent/`）。
+        assert!(!resolved.components().any(|c| c.as_os_str() == "~"));
+    }
+
+    #[test]
+    fn default_root_is_tilde_form() {
+        // 模板与 default 一致：都是 `~/agent`，由 resolved_root() 展开。
+        assert_eq!(AgentConfig::default().root, "~/agent");
     }
 }

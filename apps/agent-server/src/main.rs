@@ -3,7 +3,6 @@
 //! 一期定位为「普通终端」：与 CLI 共用同一套核心，仅去掉 TUI，改为读取任务并输出结果。
 //! 二期将演化为数据中心 + 设备注册中心（见技术方案 4.2）。
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_core::event::{event_bus, Event};
@@ -49,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(providers = ?router.available(), "available providers");
 
-    let root = PathBuf::from(&cfg.agent.root);
+    let root = cfg.agent.resolved_root();
     let registry = Arc::new(agent_tools::default_tools(
         client.clone(),
         cfg.search.searxng_endpoint.clone(),
