@@ -1,0 +1,78 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/agent-cli",
+    "apps/agent-server",
+    "crates/agent-core",
+    "crates/agent-runtime",
+    "crates/agent-tools",
+    "crates/agent-perm",
+    "crates/agent-providers",
+    "crates/agent-tui",
+    "crates/agent-store",
+    "crates/agent-net",
+    "crates/agent-sync",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["personal-agent"]
+
+[workspace.dependencies]
+agent-core = { path = "crates/agent-core" }
+agent-runtime = { path = "crates/agent-runtime" }
+agent-tools = { path = "crates/agent-tools" }
+agent-perm = { path = "crates/agent-perm" }
+agent-providers = { path = "crates/agent-providers" }
+agent-tui = { path = "crates/agent-tui" }
+agent-store = { path = "crates/agent-store" }
+agent-net = { path = "crates/agent-net" }
+agent-sync = { path = "crates/agent-sync" }
+
+# async
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util", "process", "fs", "io-std"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"
+
+# http / sse
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+
+# tui
+ratatui = "0.29"
+crossterm = "0.28"
+unicode-width = "0.2"
+tui-textarea = { version = "0.7", features = ["crossterm"] }
+
+# markdown
+pulldown-cmark = "0.12"
+syntect = "5"
+
+# storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# utils
+dashmap = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+backoff = { version = "0.4", features = ["tokio"] }
+secrecy = "0.8"
+tiktoken-rs = "0.6"
+directories = "5"

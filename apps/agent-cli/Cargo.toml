@@ -1,0 +1,30 @@
+[package]
+name = "agent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-core.workspace = true
+agent-runtime.workspace = true
+agent-tools.workspace = true
+agent-perm.workspace = true
+agent-providers.workspace = true
+agent-tui.workspace = true
+agent-store.workspace = true
+agent-net.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+directories.workspace = true
+toml.workspace = true
