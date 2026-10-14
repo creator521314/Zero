@@ -60,6 +60,7 @@ impl Default for ProvidersFile {
                 kind: "openai_compat".into(),
                 base_url: "https://api.deepseek.com/v1".into(),
                 api_key_env: Some("DEEPSEEK_API_KEY".into()),
+                api_key: None, // 默认不写明文 key；由环境变量提供
                 model: "deepseek-chat".into(),
                 tools: true,
                 reasoning: true,
@@ -75,6 +76,7 @@ impl Default for ProvidersFile {
                 kind: "openai_compat".into(),
                 base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
                 api_key_env: Some("DASHSCOPE_API_KEY".into()),
+                api_key: None,
                 model: "qwen-max".into(),
                 tools: true,
                 reasoning: false,
@@ -90,6 +92,7 @@ impl Default for ProvidersFile {
                 kind: "openai_compat".into(),
                 base_url: "http://localhost:11434/v1".into(),
                 api_key_env: None, // 无需鉴权
+                api_key: None,
                 model: "qwen2.5-coder".into(),
                 tools: true,
                 reasoning: false,
@@ -124,9 +127,15 @@ pub struct ProviderConfig {
     /// 适配器类型：目前支持 "openai_compat"。
     pub kind: String,
     pub base_url: String,
-    /// 从哪个环境变量取 key；None 表示无需鉴权（如本地 Ollama）。
+    /// 从哪个环境变量取 key（**优先级高于** `api_key`）；None 表示无需鉴权（如本地 Ollama）。
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// 明文 API key，环境变量未设置时作为兜底。
+    ///
+    /// `config/config.toml` 已被 `.gitignore` 排除，因此允许明文写入；
+    /// 两个字段都为空才视为「无需鉴权」（本地端点）。
+    #[serde(default)]
+    pub api_key: Option<String>,
     pub model: String,
     #[serde(default = "default_true")]
     pub tools: bool,
@@ -140,6 +149,35 @@ pub struct ProviderConfig {
     pub input_per_1k: f64,
     #[serde(default)]
     pub output_per_1k: f64,
+}
+
+impl ProviderConfig {
+    /// 该 provider 是否需要鉴权（两个 key 字段任一被声明即需要）。
+    pub fn needs_auth(&self) -> bool {
+        self.api_key_env.is_some() || self.api_key.is_some()
+    }
+
+    /// 解析实际使用的 API key。
+    ///
+    /// 优先级：`api_key_env` 指向的环境变量 > 配置文件里的 `api_key` 明文。
+    /// 环境变量存在但为空白串时视为未设置（继续走 fallback）。
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Some(env) = &self.api_key_env {
+            if let Ok(v) = std::env::var(env) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        if let Some(k) = &self.api_key {
+            let k = k.trim();
+            if !k.is_empty() {
+                return Some(k.to_string());
+            }
+        }
+        None
+    }
 }
 
 fn default_true() -> bool {
@@ -476,5 +514,73 @@ mod tests {
     fn default_root_is_tilde_form() {
         // 模板与 default 一致：都是 `~/agent`，由 resolved_root() 展开。
         assert_eq!(AgentConfig::default().root, "~/agent");
+    }
+
+    // ---- api_key 解析（环境变量优先，明文兜底） ----
+
+    fn provider_with(env: Option<&str>, inline: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            kind: "openai_compat".into(),
+            base_url: "https://x/v1".into(),
+            api_key_env: env.map(Into::into),
+            api_key: inline.map(Into::into),
+            model: "m".into(),
+            tools: true,
+            reasoning: false,
+            vision: false,
+            max_context: 1000,
+            input_per_1k: 0.0,
+            output_per_1k: 0.0,
+        }
+    }
+
+    #[test]
+    fn needs_auth_true_when_either_field_set() {
+        assert!(provider_with(Some("E"), None).needs_auth());
+        assert!(provider_with(None, Some("k")).needs_auth());
+        assert!(provider_with(Some("E"), Some("k")).needs_auth());
+        // 本地 Ollama：两者皆无
+        assert!(!provider_with(None, None).needs_auth());
+    }
+
+    #[test]
+    fn inline_key_used_when_env_absent() {
+        // 用唯一 env 名避免并行测试互相污染（确保它一定不存在）。
+        let pc = provider_with(Some("AGENT_TEST_ABSENT_ENV_XYZ"), Some("sk-inline-123"));
+        assert_eq!(pc.resolve_api_key().as_deref(), Some("sk-inline-123"));
+    }
+
+    #[test]
+    fn env_key_wins_over_inline() {
+        let env_name = "AGENT_TEST_PRIORITY_ENV";
+        std::env::set_var(env_name, "sk-from-env");
+        let pc = provider_with(Some(env_name), Some("sk-inline-should-lose"));
+        assert_eq!(pc.resolve_api_key().as_deref(), Some("sk-from-env"));
+        std::env::remove_var(env_name);
+    }
+
+    #[test]
+    fn blank_env_falls_back_to_inline() {
+        let env_name = "AGENT_TEST_BLANK_ENV";
+        std::env::set_var(env_name, "   ");
+        let pc = provider_with(Some(env_name), Some("sk-inline-456"));
+        assert_eq!(pc.resolve_api_key().as_deref(), Some("sk-inline-456"));
+        std::env::remove_var(env_name);
+    }
+
+    #[test]
+    fn no_key_anywhere_returns_none() {
+        let pc = provider_with(Some("AGENT_TEST_ABSENT_ENV_ABC"), None);
+        assert!(pc.resolve_api_key().is_none());
+        // 空串明文也视为无 key
+        let pc2 = provider_with(None, Some("  "));
+        assert!(pc2.resolve_api_key().is_none());
+    }
+
+    #[test]
+    fn no_auth_provider_resolves_none() {
+        let pc = provider_with(None, None);
+        assert!(!pc.needs_auth());
+        assert!(pc.resolve_api_key().is_none());
     }
 }

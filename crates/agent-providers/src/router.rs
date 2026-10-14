@@ -21,7 +21,7 @@ pub struct ProviderRouter {
 }
 
 impl ProviderRouter {
-    /// 从配置构建（未配置 key 的 provider 会被跳过并告警，不阻塞启动）。
+    /// 从配置构建（解析不到 key 的 provider 会被跳过并告警，不阻塞启动）。
     pub fn from_config(cfg: &ProvidersFile, client: reqwest::Client) -> Self {
         let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
         for (name, pc) in &cfg.providers {
@@ -29,12 +29,16 @@ impl ProviderRouter {
                 tracing::warn!(provider = %name, kind = %pc.kind, "unsupported provider kind, skipped");
                 continue;
             }
-            // 有 api_key_env 但环境变量未设置的云端 provider：跳过并提示
-            if let Some(env) = &pc.api_key_env {
-                if std::env::var(env).is_err() {
-                    tracing::warn!(provider = %name, env = %env, "api key env not set, provider disabled");
-                    continue;
-                }
+            // 声明了鉴权但两个来源都拿不到 key：跳过并提示。
+            // 优先级：api_key_env 指向的环境变量 > 配置里的 api_key 明文。
+            if pc.needs_auth() && pc.resolve_api_key().is_none() {
+                tracing::warn!(
+                    provider = %name,
+                    env = ?pc.api_key_env,
+                    has_inline_key = pc.api_key.is_some(),
+                    "api key unavailable (env not set and no inline api_key), provider disabled"
+                );
+                continue;
             }
             providers.insert(
                 name.clone(),

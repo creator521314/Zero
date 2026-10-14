@@ -29,10 +29,8 @@ pub struct OpenAiCompatProvider {
 
 impl OpenAiCompatProvider {
     pub fn new(name: impl Into<String>, cfg: ProviderConfig, client: reqwest::Client) -> Self {
-        let api_key = cfg
-            .api_key_env
-            .as_ref()
-            .and_then(|env| std::env::var(env).ok());
+        // key 解析：环境变量优先，配置文件明文兜底（见 ProviderConfig::resolve_api_key）。
+        let api_key = cfg.resolve_api_key();
         Self {
             name: name.into(),
             cfg,

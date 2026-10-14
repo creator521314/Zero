@@ -72,6 +72,21 @@ Agent 检测到以下情况时会**自动进入配置向导**（仅 stdin 是 TT
 
 向导只记录「环境变量名」，**API key 不写入文件**。
 
+### API key 的两种写法
+
+```toml
+[providers.deepseek]
+api_key_env = "DEEPSEEK_API_KEY"   # 优先：从环境变量取
+api_key      = "sk-真实key"         # 兜底：环境变量未设时用这个
+```
+
+解析顺序：**环境变量有值 → 用环境变量；否则 → 用配置文件里的明文 `api_key`**。
+环境变量存在但为空白串时视为未设置，继续走明文兜底。
+
+`config/config.toml` 已被 `.gitignore` 排除，不会提交，因此允许明文写入；
+但共享/备份这台机器时仍需注意——文件里就是真实 key。两个字段都省略才视为
+「无需鉴权」（本地 Ollama 场景）。
+
 ### 手动生成模板
 
 ```bash

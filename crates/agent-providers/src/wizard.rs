@@ -55,6 +55,9 @@ impl Preset {
                 kind: "openai_compat".into(),
                 base_url: "https://api.deepseek.com/v1".into(),
                 api_key_env: Some("DEEPSEEK_API_KEY".into()),
+                // 向导默认只记环境变量名（不写明文 key）；用户可事后在
+                // config/config.toml 里补 api_key = "sk-..." 作为兜底。
+                api_key: None,
                 model: "deepseek-chat".into(),
                 tools: true,
                 reasoning: true,
@@ -67,6 +70,7 @@ impl Preset {
                 kind: "openai_compat".into(),
                 base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
                 api_key_env: Some("DASHSCOPE_API_KEY".into()),
+                api_key: None,
                 model: "qwen-max".into(),
                 tools: true,
                 reasoning: false,
@@ -79,6 +83,7 @@ impl Preset {
                 kind: "openai_compat".into(),
                 base_url: "http://localhost:11434/v1".into(),
                 api_key_env: None,
+                api_key: None,
                 model: "qwen2.5-coder".into(),
                 tools: true,
                 reasoning: false,
@@ -91,6 +96,7 @@ impl Preset {
                 kind: "openai_compat".into(),
                 base_url: String::new(),
                 api_key_env: Some("CUSTOM_API_KEY".into()),
+                api_key: None,
                 model: "gpt-4o-mini".into(),
                 tools: true,
                 reasoning: false,
