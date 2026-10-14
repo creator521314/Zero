@@ -1,0 +1,23 @@
+[package]
+name = "agent-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-server"
+path = "src/main.rs"
+
+[dependencies]
+agent-core.workspace = true
+agent-runtime.workspace = true
+agent-tools.workspace = true
+agent-perm.workspace = true
+agent-providers.workspace = true
+agent-store.workspace = true
+agent-net.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+directories.workspace = true
