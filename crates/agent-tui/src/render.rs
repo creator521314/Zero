@@ -203,12 +203,24 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
 
 /// 按键 -> 动作。
 fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
-    // 弹层优先
+    // 弹层优先：审批期间其它按键一律吞掉，避免误输入。
     if app.pending.is_some() {
-        return match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => UiAction::Approve { remember: false },
-            KeyCode::Char('a') => UiAction::Approve { remember: true },
-            KeyCode::Char('n') | KeyCode::Esc => UiAction::Reject,
+        // Ctrl+C 始终可退出，否则弹层期间用户会被卡住，只能强杀进程。
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return UiAction::Quit;
+        }
+        // 大小写归一化：用户看到提示上的大写字母会按 Shift+Y，CapsLock 同理，
+        // crossterm 上报的都是大写字符；只认小写会「按了没反应」。
+        let lower = match &key.code {
+            KeyCode::Char(c) => Some(c.to_ascii_lowercase()),
+            _ => None,
+        };
+        let is_enter = key.code == KeyCode::Enter;
+        let is_esc = key.code == KeyCode::Esc;
+        return match (lower, is_enter, is_esc) {
+            (Some('y'), _, _) | (_, true, _) => UiAction::Approve { remember: false },
+            (Some('a'), _, _) => UiAction::Approve { remember: true },
+            (Some('n'), _, _) | (_, _, true) => UiAction::Reject,
             _ => UiAction::None,
         };
     }
@@ -660,13 +672,15 @@ fn draw_approval(f: &mut Frame, _app: &App, p: &crate::app::PendingApproval, are
         body.push(RtLine::from(""));
     }
     body.push(RtLine::from(vec![
-        Span::styled(" [Y] ", key),
+        Span::styled(" [y] ", key),
         Span::styled(" 批准   ", label),
-        Span::styled(" [A] ", key),
-        Span::styled(" 记住并批准   ", label),
-        Span::styled(" [N] ", key),
+        Span::styled(" [n] ", key),
         Span::styled(" 拒绝", label),
     ]));
+    body.push(RtLine::from(Span::styled(
+        " 也可按 Enter 批准、Esc 拒绝",
+        Style::default().fg(ink::FG_MUTED),
+    )));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1115,8 +1129,14 @@ mod tests {
         assert!(s.contains("⏎"), "空输入应显示 Enter pill:\n{out}");
     }
 
-    #[test]
-    fn render_approval_modal_overlays() {
+    // ---- 审批弹层按键 ----
+
+    fn key(code: KeyCode) -> KeyEvent {
+        key_with_kind(code, KeyEventKind::Press)
+    }
+
+    /// 构造一个「正在等待高危审批」的 App。
+    fn approval_app() -> App {
         let mut app = App::default();
         app.pending = Some(crate::app::PendingApproval {
             id: agent_core::ids::ApprovalId::new(),
@@ -1130,6 +1150,78 @@ mod tests {
                 matched_rule: None,
             },
         });
+        app
+    }
+
+    #[test]
+    fn approval_lowercase_y_approves() {
+        let mut app = approval_app();
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Char('y'))),
+            UiAction::Approve { remember: false }
+        ));
+    }
+
+    #[test]
+    fn approval_uppercase_y_approves() {
+        // 回归：弹层提示按键，用户按 Shift+Y 时 crossterm 上报 Char('Y')，
+        // 只认小写会出现「按了没反应」。
+        let mut app = approval_app();
+        assert!(
+            matches!(
+                handle_key(&mut app, key(KeyCode::Char('Y'))),
+                UiAction::Approve { remember: false }
+            ),
+            "Shift+Y 也应批准"
+        );
+    }
+
+    #[test]
+    fn approval_uppercase_n_rejects() {
+        let mut app = approval_app();
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Char('N'))),
+            UiAction::Reject
+        ));
+    }
+
+    #[test]
+    fn approval_enter_approves_and_esc_rejects() {
+        let mut app = approval_app();
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Enter)),
+            UiAction::Approve { .. }
+        ));
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Esc)),
+            UiAction::Reject
+        ));
+    }
+
+    #[test]
+    fn approval_ctrl_c_still_quits() {
+        // 回归：弹层期间若不处理 Ctrl+C，用户会被卡住，只能强杀进程。
+        let mut app = approval_app();
+        let ctrl_c = KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: event::KeyEventState::NONE,
+        };
+        assert!(matches!(handle_key(&mut app, ctrl_c), UiAction::Quit));
+    }
+
+    #[test]
+    fn approval_swallows_other_keys() {
+        // 审批期间普通字符不应落进输入框。
+        let mut app = approval_app();
+        let _ = handle_key(&mut app, key(KeyCode::Char('x')));
+        assert!(app.input.buffer.is_empty(), "弹层期间不应写入输入框");
+    }
+
+    #[test]
+    fn render_approval_modal_overlays() {
+        let app = approval_app();
         let out = render_to_string(&app, 100, 40);
         let s = squash(&out);
         assert!(s.contains("权限确认"), "应显示弹层标题:\n{out}");
