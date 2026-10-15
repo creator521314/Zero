@@ -7,7 +7,7 @@
 | 设计参考 | `D:\git_rc\iCode-main`（Python + Textual 实现，Dracula 系主题） |
 | 适用范围 | `crates/agent-tui`（ratatui + crossterm） |
 | 关联里程碑 | M2（P0/P1 落地）、M4（P2 落地） |
-| 文档状态 | P0 已实施（2026-10-14），P1 / P2 待评审 |
+| 文档状态 | P0 已实施（2026-10-14），P1 部分实施（工具四态，2026-10-15），P2 待评审 |
 
 ---
 
@@ -225,25 +225,31 @@ iCode 大量使用 Textual 的 alpha 混合语法（如 `background: $foreground
 单行内按固定列对齐，最大化可扫读性：
 
 ```
-[状态符] [工具名 12列]  [参数摘要 ...flex...]  [耗时/结果 右对齐]
-   ⏺      read_file       src/config.rs                12ms
+[状态符] [工具名 12列]  [参数摘要]  [耗时/原因]
+   ⏺      read_file     src/config.rs
+   ✔      edit_file     src/config.rs  42ms
+   ✖      shell_exec    cargo test     12ms  命令退出码 1
 ```
 
 - 工具名左对齐，宽度 `12`（超长截断为 `…`）；
-- 参数摘要取 `Line::Tool.summary`，超宽则中间省略；
-- 右侧列固定宽度 `12`，右对齐（耗时或错误短语）。
+- 参数摘要取 `Line::Tool.summary`；
+- 耗时与原因**紧随摘要之后**，不做右对齐——终端宽度不定，右对齐需先测宽再补
+  空格，收益不抵复杂度；原因压成单行并截断到 60 显示列。
 
 ### 5.3 与现有结构的关系
 
-现有 `Line::Tool { name, summary, done, ok }` 已可表达四态：
+P1 已落地为显式四态：`Line::Tool { name, summary, status: ToolStatus }`。
 
-| `done` | `ok` | 推导状态 |
-|---|---|---|
-| `false` | — | 运行中 |
-| `true` | `true` | 成功 |
-| `true` | `false` | 失败 |
+| `ToolStatus` | 符号 | 配色 | 右侧附加 |
+|---|---|---|---|
+| `Running` | `⏺` | 橙（`warning`） | — |
+| `Ok { ms }` | `✔` | 绿（`success`） | `{ms}ms` |
+| `Failed { reason, ms }` | `✖` | 红（`error`） | `{ms}ms` + 原因 |
+| `Rejected { reason }` | `⊘` | 灰（`fg_muted`） | 原因（**无耗时**） |
 
-「被拒」态需在 P1 扩展为 `Line::Tool { status: ToolStatus }`（`Running` / `Ok(ms)` / `Failed(reason)` / `Rejected`），届时补耗时与原因字段。
+被拒即未执行，不显示耗时——展示 `0ms` 会误导。原因取自
+`Event::ToolCallEnd.detail`（对应 `ToolOutcome::{Failed, Denied, Rejected}`），
+`Denied` 与 `Rejected` 在 UI 上归为同一态：都是「未被许可、压根没执行」。
 
 ---
 
@@ -382,7 +388,7 @@ crates/agent-tui/src/
 | 阶段 | 内容 | 改动范围 | 风险 | 状态 |
 |---|---|---|---|---|
 | **P0** | `theme.rs` 主题化；6 类消息样式；工具三态配色；输入框圆角 + pill；header + footer；滚动条；审批弹层升级 | `render.rs`、新增 `theme.rs` | 低（纯渲染层） | ✅ 2026-10-14 |
-| **P1** | 工具卡片耗时/错误原因（扩展 `Line::Tool`）；Toast；`Ctrl+R` 历史；`/` 命令与补全；`Ctrl+H` 隐藏 footer | `render.rs`、`app.rs` | 中（需扩 `App` 状态） | 待实施 |
+| **P1** | 工具卡片耗时/错误原因（扩展 `Line::Tool`）；Toast；`Ctrl+R` 历史；`/` 命令与补全；`Ctrl+H` 隐藏 footer | `render.rs`、`app.rs`、`agent-core`（事件扩字段） | 中（需扩 `App` 状态） | 🔶 部分完成：工具四态 2026-10-15，其余待实施 |
 | **P2** | 侧边栏（会话 / TODO 树）；`@` 文件补全；Markdown 渲染；diff 视图；主题换肤 | 新增 `widgets/` 模块 | 高（M4） | 待实施 |
 
 ### P0 验收标准
@@ -396,6 +402,22 @@ crates/agent-tui/src/
 > 验收方式：`crates/agent-tui/src/render.rs` 内新增 `TestBackend` 渲染快照测试，
 > 断言 header 品牌/徽章、六类消息符号、工具名固定列对齐、空输入占位、审批弹层；
 > 另可用 `cargo test -p agent-tui preview_visual_layout -- --ignored --nocapture` 目视校验。
+
+### P1 验收标准（工具四态部分，已完成）
+
+- [x] 工具名右侧显示耗时，成功与失败均可见
+- [x] 失败与拒绝显示原因；多行原因压成单行并截断到 60 显示列
+- [x] 被拒态不显示耗时（未执行，`0ms` 会误导）
+- [x] `Event::ToolCallEnd` 旧 jsonl 日志（缺 `outcome`/`detail`）仍可反序列化，按 `Ok` / `None` 兜底
+- [x] `agent-cli` 等既有消费方无需改动（仅 `id` 解构）
+- [x] `cargo clippy --workspace --all-targets` 零警告；`cargo test --workspace` **115 passed / 0 failed**
+
+> 验收方式：`app.rs` 断言四态流转（含迟到事件不得覆盖已终结行）、
+> `render.rs` 断言符号 / 耗时 / 原因 / 截断 / 单行化。
+
+### P1 剩余项
+
+Toast 通知、`Ctrl+R` 输入历史、`/` 命令与补全、`Ctrl+H` 隐藏 footer。
 
 ---
 

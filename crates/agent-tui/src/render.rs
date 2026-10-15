@@ -23,7 +23,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use agent_core::event::{Command, Event};
 
-use crate::app::{App, Line, UiAction};
+use crate::app::{App, Line, ToolStatus, UiAction};
 use crate::theme::{glyph, ink, surface, tier_badge_color, tier_label, BG};
 
 /// 启动 TUI 主循环。
@@ -95,9 +95,20 @@ async fn event_loop(
         let area = Rect::new(0, 0, size.width, size.height);
         terminal.draw(|f| draw(f, app))?;
 
-        // 非阻塞地抽干事件队列
-        while let Ok(ev) = ev_rx.try_recv() {
-            app.apply_event(ev);
+        // 非阻塞地抽干事件队列。
+        //
+        // `Disconnected` 必须显式处理：编排层一旦退出（panic / 提前 return），
+        // 事件流关闭，此后 `try_recv` 只返回 `Empty`，界面与「模型正在思考」
+        // 完全无法区分——用户只能干等。这里落一条错误行点明后端已死。
+        loop {
+            match ev_rx.try_recv() {
+                Ok(ev) => app.apply_event(ev),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    app.backend_disconnected();
+                    break;
+                }
+            }
         }
 
         // 驱动软光标闪烁（与终端原生光标行为无关，跨平台一致）。
@@ -122,21 +133,29 @@ async fn event_loop(
                                 agent_core::task::TaskSpec::new(text.clone(), String::new());
                             spec.title = text.chars().take(24).collect();
                             // 工作区由编排层填入；这里发送带 prompt 的任务
-                            let _ = cmd_tx.send(Command::SubmitTask(spec)).await;
+                            if cmd_tx.send(Command::SubmitTask(spec)).await.is_err() {
+                                app.backend_disconnected();
+                            }
                         }
                         UiAction::Cancel => {
                             if let Some(c) = app.cancel_command() {
-                                let _ = cmd_tx.send(c).await;
+                                if cmd_tx.send(c).await.is_err() {
+                                    app.backend_disconnected();
+                                }
                             }
                         }
                         UiAction::Approve { remember } => {
                             if let Some(c) = app.take_approval(true, remember) {
-                                let _ = cmd_tx.send(c).await;
+                                if cmd_tx.send(c).await.is_err() {
+                                    app.backend_disconnected();
+                                }
                             }
                         }
                         UiAction::Reject => {
                             if let Some(c) = app.take_approval(false, false) {
-                                let _ = cmd_tx.send(c).await;
+                                if cmd_tx.send(c).await.is_err() {
+                                    app.backend_disconnected();
+                                }
                             }
                         }
                         UiAction::None => {}
@@ -404,21 +423,20 @@ fn build_conversation_lines(items: &[Line], inner_w: usize) -> Vec<RtLine<'stati
                     )));
                 }
             }
-            // 工具调用：状态符号 + 工具名固定列 + 参数摘要，按状态换色。
+            // 工具调用：状态符号 + 工具名固定列 + 参数摘要，按四态换色；
+            // 成功附耗时，失败 / 拒绝附原因。
             Line::Tool {
                 name,
                 summary,
-                done,
-                ok,
+                status,
             } => {
-                let (mark, color) = if !*done {
-                    (glyph::RUNNING, ink::WARNING)
-                } else if *ok {
-                    (glyph::OK, ink::SUCCESS)
-                } else {
-                    (glyph::FAIL, ink::ERROR)
+                let (mark, color) = match status {
+                    ToolStatus::Running => (glyph::RUNNING, ink::WARNING),
+                    ToolStatus::Ok { .. } => (glyph::OK, ink::SUCCESS),
+                    ToolStatus::Failed { .. } => (glyph::FAIL, ink::ERROR),
+                    ToolStatus::Rejected { .. } => (glyph::REJECTED, ink::FG_MUTED),
                 };
-                lines.push(RtLine::from(vec![
+                let mut spans = vec![
                     Span::styled(format!("  {mark} "), Style::default().fg(color)),
                     Span::styled(
                         pad_display(name, TOOL_NAME_COL),
@@ -426,7 +444,30 @@ fn build_conversation_lines(items: &[Line], inner_w: usize) -> Vec<RtLine<'stati
                     ),
                     Span::raw(" "),
                     Span::styled(summary.clone(), Style::default().fg(ink::FG_MUTED)),
-                ]));
+                ];
+                match status {
+                    ToolStatus::Running => {}
+                    ToolStatus::Ok { ms } => spans.push(Span::styled(
+                        format!("  {ms}ms"),
+                        Style::default().fg(ink::FG_MUTED),
+                    )),
+                    ToolStatus::Failed { reason, ms } => {
+                        spans.push(Span::styled(
+                            format!("  {ms}ms"),
+                            Style::default().fg(ink::FG_MUTED),
+                        ));
+                        spans.push(Span::styled(
+                            format!("  {}", truncate_display(&one_line(reason), REASON_COL)),
+                            Style::default().fg(ink::ERROR),
+                        ));
+                    }
+                    // 被拒即未执行，没有耗时可言，只给原因（灰显，引导看审批记录）。
+                    ToolStatus::Rejected { reason } => spans.push(Span::styled(
+                        format!("  {}", truncate_display(&one_line(reason), REASON_COL)),
+                        Style::default().fg(ink::FG_MUTED),
+                    )),
+                }
+                lines.push(RtLine::from(spans));
             }
             // 系统提示：灰显，首行带 · 标记。
             Line::System(s) => {
@@ -572,13 +613,24 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 /// 工具名在列表中的固定显示列宽（超出截断，不足补空格）。
 const TOOL_NAME_COL: usize = 12;
 
+/// 工具失败/拒绝原因的最大显示列宽（超出截断，避免一行原因挤满整个对话区）。
+const REASON_COL: usize = 60;
+
 /// 按**显示宽度**填充或截断到固定列宽，使多行工具名左对齐。
 fn pad_display(s: &str, col: usize) -> String {
     let w = UnicodeWidthStr::width(s);
     if w <= col {
         return format!("{s}{}", " ".repeat(col - w));
     }
-    // 超宽：保留 col-1 列内容 + 省略号
+    truncate_display(s, col)
+}
+
+/// 按**显示宽度**截断到指定列宽（超出以 `…` 收尾）；未超宽时原样返回。
+fn truncate_display(s: &str, col: usize) -> String {
+    if UnicodeWidthStr::width(s) <= col {
+        return s.to_string();
+    }
+    // 保留 col-1 列内容 + 省略号
     let mut out = String::new();
     let mut used = 0usize;
     for c in s.chars() {
@@ -591,6 +643,11 @@ fn pad_display(s: &str, col: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// 把多行文本压成单行：工具报错常带换行与缩进，直接铺进摘要行会撑破布局。
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// 软光标单元格：可见时反显（终端无关的闪烁，替代原生光标）。
@@ -1035,20 +1092,27 @@ mod tests {
             Line::Tool {
                 name: "read_file".into(),
                 summary: "src/a.rs".into(),
-                done: false,
-                ok: true,
+                status: ToolStatus::Running,
             },
             Line::Tool {
                 name: "edit_file".into(),
                 summary: "src/a.rs".into(),
-                done: true,
-                ok: true,
+                status: ToolStatus::Ok { ms: 42 },
             },
             Line::Tool {
-                name: "shell".into(),
+                name: "shell_exec".into(),
                 summary: "rm -rf /".into(),
-                done: true,
-                ok: false,
+                status: ToolStatus::Failed {
+                    reason: "命令退出码 1".into(),
+                    ms: 12,
+                },
+            },
+            Line::Tool {
+                name: "web_fetch".into(),
+                summary: "http://10.0.0.1".into(),
+                status: ToolStatus::Rejected {
+                    reason: "命中内网访问规则".into(),
+                },
             },
             Line::System("任务已完成".into()),
             Line::Error("连接失败".into()),
@@ -1080,10 +1144,142 @@ mod tests {
             ("⋯", "思考链标记"),
             ("⏺", "工具运行中"),
             ("✔", "工具成功"),
+            ("✖", "工具失败"),
+            ("⊘", "工具被拒"),
             ("·", "系统提示"),
         ] {
             assert!(s.contains(g), "缺少{what} {g}:\n{out}");
         }
+    }
+
+    // ---- 工具四态：耗时与原因（P1） ----
+
+    /// 取构建结果中第一行包含 `needle` 的整行文本。
+    fn tool_line(items: &[Line], needle: &str) -> String {
+        build_conversation_lines(items, 96)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|t| t.contains(needle))
+            .unwrap_or_else(|| panic!("未找到含 {needle} 的工具行"))
+    }
+
+    #[test]
+    fn render_running_tool_has_neither_ms_nor_reason() {
+        let items = vec![Line::Tool {
+            name: "read_file".into(),
+            summary: "src/a.rs".into(),
+            status: ToolStatus::Running,
+        }];
+        let line = tool_line(&items, "read_file");
+        assert!(line.contains('⏺'), "运行中应显示 ⏺: {line}");
+        assert!(!line.contains("ms"), "运行中不应显示耗时: {line}");
+    }
+
+    #[test]
+    fn render_ok_tool_shows_elapsed_ms() {
+        let items = vec![Line::Tool {
+            name: "edit_file".into(),
+            summary: "src/a.rs".into(),
+            status: ToolStatus::Ok { ms: 42 },
+        }];
+        let line = tool_line(&items, "edit_file");
+        assert!(line.contains('✔'), "成功应显示 ✔: {line}");
+        assert!(line.contains("42ms"), "成功应显示耗时: {line}");
+    }
+
+    #[test]
+    fn render_failed_tool_shows_elapsed_ms_and_reason() {
+        let items = vec![Line::Tool {
+            name: "shell_exec".into(),
+            summary: "cargo test".into(),
+            status: ToolStatus::Failed {
+                reason: "命令退出码 1".into(),
+                ms: 12,
+            },
+        }];
+        let line = tool_line(&items, "shell_exec");
+        assert!(line.contains('✖'), "失败应显示 ✖: {line}");
+        assert!(line.contains("12ms"), "失败也应给出耗时: {line}");
+        assert!(line.contains("命令退出码 1"), "失败应给出原因: {line}");
+    }
+
+    #[test]
+    fn render_rejected_tool_shows_reason_without_ms() {
+        // 被拒即未执行，显示耗时是误导。
+        let items = vec![Line::Tool {
+            name: "web_fetch".into(),
+            summary: "http://10.0.0.1".into(),
+            status: ToolStatus::Rejected {
+                reason: "命中内网访问规则".into(),
+            },
+        }];
+        let line = tool_line(&items, "web_fetch");
+        assert!(line.contains('⊘'), "被拒应显示 ⊘: {line}");
+        assert!(line.contains("命中内网访问规则"), "被拒应给出原因: {line}");
+        assert!(!line.contains("ms"), "被拒不应显示耗时: {line}");
+    }
+
+    #[test]
+    fn render_failed_tool_reason_is_flattened_to_one_line() {
+        // 多行错误若原样铺开会撑破「一行一工具」的紧凑布局。
+        let items = vec![Line::Tool {
+            name: "shell_exec".into(),
+            summary: "x".into(),
+            status: ToolStatus::Failed {
+                reason: "第一行\n  第二行".into(),
+                ms: 1,
+            },
+        }];
+        let line = tool_line(&items, "shell_exec");
+        assert!(
+            line.contains("第一行 第二行"),
+            "多行原因应压成单行: {line:?}"
+        );
+    }
+
+    #[test]
+    fn render_long_reason_is_clipped() {
+        let items = vec![Line::Tool {
+            name: "shell_exec".into(),
+            summary: "x".into(),
+            status: ToolStatus::Failed {
+                reason: "错误".repeat(200),
+                ms: 1,
+            },
+        }];
+        let line = tool_line(&items, "shell_exec");
+        assert!(line.ends_with('…'), "超长原因应截断: {line:?}");
+        assert!(
+            UnicodeWidthStr::width(line.as_str()) < 200,
+            "截断后宽度应显著变短: {line:?}"
+        );
+    }
+
+    // ---- truncate_display / one_line ----
+
+    #[test]
+    fn truncate_display_keeps_short_text() {
+        assert_eq!(truncate_display("短", 10), "短");
+    }
+
+    #[test]
+    fn truncate_display_cjk_counts_by_display_width() {
+        // 「工具」= 4 列；限宽 5 时应原样保留（不按字符数截断）。
+        assert_eq!(truncate_display("工具", 5), "工具");
+        let clipped = truncate_display("工具调用失败原因", 5);
+        assert_eq!(UnicodeWidthStr::width(clipped.as_str()), 5);
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn one_line_collapses_whitespace_and_newlines() {
+        assert_eq!(one_line("a\n  b\tc"), "a b c");
+        assert_eq!(one_line("  两侧留白  "), "两侧留白");
     }
 
     #[test]

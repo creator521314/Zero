@@ -31,9 +31,9 @@
 | `agent-tools::web` | HTML 标签与 script 剥离 |
 | `agent-providers` | tool 消息转换；assistant tool_call 转换（arguments 必须为字符串） |
 | `agent-runtime::context` | 上下文压缩保留固定区并生成摘要 |
-| `agent-tui::app` | 多字节字符编辑；流式增量合并为一行；空输入不提交 |
+| `agent-tui::app` | 多字节字符编辑；流式增量合并为一行；空输入不提交；工具四态流转（含迟到事件不覆盖已终结行） |
 | `agent-tui::theme` | 权限档位 → 徽章色/文案映射（三态、大小写不敏感） |
-| `agent-tui::render` | 六类消息符号与缩进；工具名固定列对齐（含中文宽度）；宽字符 wrap 行数；鼠标区段分流；`TestBackend` 渲染快照 |
+| `agent-tui::render` | 六类消息符号与缩进；工具四态符号/耗时/原因（多行压单行、超长截断）；工具名固定列对齐（含中文宽度）；宽字符 wrap 行数；鼠标区段分流；`TestBackend` 渲染快照 |
 | `agent-store` | 追加 + 重载；逻辑时钟单调；durability 保留 |
 
 ## M1 验收标准
@@ -74,8 +74,84 @@ P0 仅改渲染层，未动 `app.rs` 的事件与状态机。
 `cargo test --workspace` 92 passed / 0 failed；
 渲染快照测试（`TestBackend`）覆盖 header、六类符号、工具列对齐、占位提示、审批弹层。
 
-**后续**：P1（工具耗时/错误原因、Toast、`Ctrl+R` 历史、`/` 命令补全）、
+## TUI 界面增强（P1 部分完成：工具四态）
+
+2026-10-15 完成 P1 首项——工具调用从「成功 / 失败」二值升级为四态，并带上
+耗时与失败原因。改动链路：`agent-core`（事件扩字段）→ `agent-runtime`（填值）
+→ `agent-tui`（状态与渲染）。
+
+| 项 | 状态 | 位置 |
+|---|---|---|
+| `Event::ToolCallEnd` 新增 `outcome`（Ok/Failed/Denied/Rejected）与 `detail` | ✅ | `agent-core/src/event.rs` |
+| runner 四路分支填入状态与原因（Deny / Reject / Ok / Err） | ✅ | `agent-runtime/src/runner.rs` |
+| `Line::Tool` 的 `done`/`ok` 布尔替换为 `ToolStatus` 四态 | ✅ | `agent-tui/src/app.rs` |
+| 渲染耗时（成功 / 失败）与原因（失败 / 拒绝）；被拒不显示耗时 | ✅ | `agent-tui/src/render.rs` |
+| 多行原因压成单行 + 截断 60 显示列，避免撑破「一行一工具」布局 | ✅ | `render.rs::one_line` / `truncate_display` |
+
+**兼容性**：`outcome` 与 `detail` 均带 `#[serde(default)]`，旧 jsonl 审计日志仍可
+反序列化（兜底为 `Ok` / `None`）；`agent-cli` 等消费方仅解构 `id`，无需改动。
+
+**P1 验收**：`cargo clippy --workspace --all-targets` 0 warning；
+`cargo test --workspace` **121 passed / 0 failed**（新增 agent-core 2 + app 6 + render 9 + openai-compat 3）。
+
+**后续**：P1 剩余项（Toast、`Ctrl+R` 历史、`/` 命令补全、`Ctrl+H` 隐藏 footer）、
 P2（侧边栏、Markdown、diff 视图）见 `docs/ui-design.md` 第十章。
+
+## 缺陷修复：审批自锁（2026-10-15）
+
+**症状**：任务一旦走到需要审批的工具调用就彻底卡住。界面上既没有「任务完成」标志，
+按 `y` 批准 / `Esc` 取消都没有任何反应，之后提交的问题也永远等不到回应，且**毫无错误提示**。
+
+**根因**：`apps/agent-cli/src/main.rs` 的命令循环把 `runtime.run(...).await` 直接写在
+`match cmd` 分支里。而 runner 的 `wait_approval` 所等待的应答，其唯一发送方 `ap_tx`
+正由这个循环持有——**循环等任务结束，任务等循环转发审批，循环等待自己**：
+
+```
+cmd_rx.recv() ──► Command::SubmitTask ──► runtime.run().await ─┐
+      ▲                                                          │ 阻塞
+      └──◄── Command::Approve / Cancel 堆积于此，永不处理 ◄───────┘
+                                        │
+                            ap_tx.send() 永不执行
+                                        ▼
+                        wait_approval 永久挂起 → TaskFinished 永不发出
+```
+
+**修复**：
+
+| 改动 | 说明 |
+|---|---|
+| 任务改为 `tokio::spawn` 独立执行 | 命令循环不再被任务阻塞，Approve/Reject/Cancel 可即时转发 |
+| 新增运行中任务句柄并在循环内收割 | 任务结束后释放槽位，避免陈旧句柄挡住后续提交 |
+| 任务忙时显式拒绝并回报 `Event::Error` | 原先静默排队，用户会误以为提交没生效 |
+| TUI 处理 `TryRecvError::Disconnected` | 事件流关闭时落错误行提示「后端已断开」，不再无声卡住 |
+| 断连提示附带完整日志路径 | 用户无需自行翻找配置目录 |
+
+**配套日志**（默认写配置文件同级的 `logs/agent.log`，`RUST_LOG=debug` 可加详）：
+
+- 任务生命周期：`run start` / `task started` / `task run finished` / `task run failed`
+- 审批全链路：`awaiting user approval` → `waiting for approval reply` → `approval reply received`
+- 异常分支：`stale approval reply dropped`（审批 ID 错配）、`approval channel closed`、
+  `approval wait cancelled`、`rejected: another task is running`
+- 命令收发：`command received`（debug 级）、审批转发与取消
+
+**回归保护**：新增 3 个单测（断连提示幂等、撤下残留弹层、提示携带日志路径）；
+全量 **121 passed / 0 failed**，clippy 0 warning。
+
+## UI 重复输出修复：content / reasoning_content 重复（2026-10-15）
+
+**症状**：模型回复正常输出后，**同一段文字又以暗色（灰显）重复输出一遍**。
+
+**根因**：DeepSeek 等 OpenAI 兼容厂商会把同一段内容同时填入流式响应的
+`delta.content` 和 `delta.reasoning_content` 字段。`agent-providers` 原先的
+解析逻辑对两者都原样发送成 `StreamEvent`，于是 TUI 把同一段文本渲染为
+`Line::Assistant`（正常色）和 `Line::Reasoning`（暗色）各一次。
+
+**修复**：`crates/agent-providers/src/openai_compat.rs` 中提取
+`split_content_reasoning(delta)` 函数：当 `reasoning_content` 与 `content`
+内容完全相同时，只保留正文；仅在两者不同或正文为空时才发送思考链。
+
+**回归保护**：新增 3 个单测（重复去重、内容不同保留、正文为空时保留思考链）；
+`agent-providers` 33 passed / 0 failed，全量 **121 passed / 0 failed**。
 
 ## 已知限制（一期）
 

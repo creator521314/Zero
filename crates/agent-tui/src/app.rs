@@ -1,6 +1,6 @@
 //! UI 状态与事件处理（不含渲染，便于单测）。
 
-use agent_core::event::{Command, Event, Outcome};
+use agent_core::event::{Command, Event, Outcome, ToolOutcome};
 use agent_core::ids::{ApprovalId, TaskId};
 use agent_core::perm::ApprovalRequest;
 use agent_core::task::TaskSpec;
@@ -15,13 +15,28 @@ pub enum Line {
     Tool {
         name: String,
         summary: String,
-        done: bool,
-        ok: bool,
+        status: ToolStatus,
     },
     /// 思考链（灰显）。
     Reasoning(String),
     System(String),
     Error(String),
+}
+
+/// 工具调用的 UI 状态（四态）。
+///
+/// 比「成功 / 失败」二值布尔更细：被权限规则或用户拦下的调用**压根没执行**，
+/// 需要与「执行了但失败」区分开——符号、配色、要不要显示耗时都不一样。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolStatus {
+    /// 执行中。
+    Running,
+    /// 执行成功，携带耗时（毫秒）。
+    Ok { ms: u64 },
+    /// 执行失败，携带原因与耗时。
+    Failed { reason: String, ms: u64 },
+    /// 被拒绝（权限规则或用户），未执行。
+    Rejected { reason: String },
 }
 
 /// 待审批弹层。
@@ -119,6 +134,10 @@ pub struct App {
     pub cursor_visible: bool,
     /// 上次翻转软光标的时刻。
     cursor_last_blink: std::time::Instant,
+    /// 编排层事件流是否已断开（用于只提示一次，避免每帧刷屏）。
+    backend_down: bool,
+    /// 日志文件路径：断连提示里直接给出，省得用户翻配置目录。
+    log_path: Option<String>,
 }
 
 impl App {
@@ -149,6 +168,8 @@ impl Default for App {
             follow: true,
             cursor_visible: true,
             cursor_last_blink: std::time::Instant::now(),
+            backend_down: false,
+            log_path: None,
         }
     }
 }
@@ -194,23 +215,40 @@ impl App {
                 self.lines.push(Line::Tool {
                     name,
                     summary,
-                    done: false,
-                    ok: true,
+                    status: ToolStatus::Running,
                 });
                 self.status = "执行工具…".into();
                 self.auto_scroll();
             }
-            Event::ToolCallEnd { ok, ms, .. } => {
-                if let Some(Line::Tool { done, ok: o, .. }) = self
-                    .lines
-                    .iter_mut()
-                    .rev()
-                    .find(|l| matches!(l, Line::Tool { done, .. } if !*done))
-                {
-                    *done = true;
-                    *o = ok;
+            Event::ToolCallEnd {
+                outcome,
+                ms,
+                detail,
+                ..
+            } => {
+                // 认最后一个「执行中」的工具行。精确匹配 call_id 需要额外维护
+                // 索引；一期工具串行执行，「最后一个未完成」即当前调用。
+                let running = self.lines.iter_mut().rev().find(
+                    |l| matches!(l, Line::Tool { status, .. } if *status == ToolStatus::Running),
+                );
+                if let Some(Line::Tool { status, .. }) = running {
+                    *status = match outcome {
+                        ToolOutcome::Ok => ToolStatus::Ok { ms },
+                        ToolOutcome::Failed => ToolStatus::Failed {
+                            reason: detail.unwrap_or_else(|| "未提供错误详情".into()),
+                            ms,
+                        },
+                        ToolOutcome::Denied | ToolOutcome::Rejected => ToolStatus::Rejected {
+                            reason: detail.unwrap_or_else(|| "未说明原因".into()),
+                        },
+                    };
                 }
-                self.status = format!("工具完成 ({ms}ms)");
+                self.status = match outcome {
+                    ToolOutcome::Ok => format!("工具完成 ({ms}ms)"),
+                    ToolOutcome::Failed => format!("工具失败 ({ms}ms)"),
+                    ToolOutcome::Denied => "被权限规则拒绝".into(),
+                    ToolOutcome::Rejected => "已拒绝".into(),
+                };
                 self.auto_scroll();
             }
             Event::AwaitingApproval {
@@ -336,6 +374,44 @@ impl App {
     pub fn cancel_command(&self) -> Option<Command> {
         self.active_task.clone().map(Command::Cancel)
     }
+
+    /// 记录日志文件路径（启动时由装配层注入）。
+    ///
+    /// 用途有二：启动横幅里告知位置；断连提示中直接引用完整路径，
+    /// 省去用户去配置目录翻找。
+    pub fn set_log_path(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        self.lines.push(Line::System(format!("日志文件: {path}")));
+        self.log_path = Some(path);
+    }
+
+    /// 编排层事件流已断开：TUI 必须显式告知用户。
+    ///
+    /// 事件流关闭后 `try_recv` 只会返回 `Empty`，界面表现与「模型正在思考」
+    /// 完全一致——用户无从判断后端是死是活，只能干等。这里落一条醒目错误行，
+    /// 并给出可执行的下一步（看日志 / 退出）。
+    pub fn backend_disconnected(&mut self) {
+        if self.backend_down {
+            return; // 只提示一次，避免每帧刷屏
+        }
+        self.backend_down = true;
+        self.pending = None;
+        self.status = "后端已断开".into();
+        let hint = match &self.log_path {
+            Some(p) => format!("请查看日志定位原因：{p}"),
+            None => "请查看日志定位原因。".to_string(),
+        };
+        self.lines.push(Line::Error(format!(
+            "后端事件流已断开：Agent 循环已退出或崩溃，后续操作不会再有响应。\n\
+             {hint}\n按 Ctrl+C 退出。"
+        )));
+        self.scroll_to_bottom();
+    }
+
+    /// 编排层是否已断开。
+    pub fn is_backend_down(&self) -> bool {
+        self.backend_down
+    }
 }
 
 fn summarize_args(args: &serde_json::Value) -> String {
@@ -398,6 +474,169 @@ mod tests {
             .filter(|l| matches!(l, Line::Assistant(_)))
             .count();
         assert_eq!(assistant, 1, "连续增量应合并为一行");
+    }
+
+    // ---- 工具调用四态流转 ----
+
+    fn start_tool(app: &mut App, name: &str) {
+        app.apply_event(Event::ToolCallStart {
+            id: TaskId::new(),
+            call_id: agent_core::ids::ToolCallId::new(),
+            name: name.into(),
+            args: serde_json::json!({ "command": "ls" }),
+        });
+    }
+
+    fn end_tool(app: &mut App, outcome: ToolOutcome, ms: u64, detail: Option<&str>) {
+        app.apply_event(Event::ToolCallEnd {
+            id: TaskId::new(),
+            call_id: agent_core::ids::ToolCallId::new(),
+            outcome,
+            ms,
+            detail: detail.map(str::to_string),
+        });
+    }
+
+    fn last_tool_status(app: &App) -> &ToolStatus {
+        match app.lines.last() {
+            Some(Line::Tool { status, .. }) => status,
+            other => panic!("最后一行应为工具行，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_start_enters_running() {
+        let mut app = App::default();
+        start_tool(&mut app, "shell_exec");
+        assert_eq!(last_tool_status(&app), &ToolStatus::Running);
+    }
+
+    #[test]
+    fn tool_call_end_ok_carries_ms() {
+        let mut app = App::default();
+        start_tool(&mut app, "shell_exec");
+        end_tool(&mut app, ToolOutcome::Ok, 37, None);
+        assert_eq!(last_tool_status(&app), &ToolStatus::Ok { ms: 37 });
+        assert!(app.status.contains("37ms"), "状态栏应显示耗时");
+    }
+
+    #[test]
+    fn tool_call_end_failed_carries_reason_and_ms() {
+        let mut app = App::default();
+        start_tool(&mut app, "shell_exec");
+        end_tool(&mut app, ToolOutcome::Failed, 9, Some("命令退出码 1"));
+        assert_eq!(
+            last_tool_status(&app),
+            &ToolStatus::Failed {
+                reason: "命令退出码 1".into(),
+                ms: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn tool_call_end_denied_and_rejected_share_rejected_status() {
+        // 两者都是「未被许可、压根没执行」，UI 上归为一态。
+        for outcome in [ToolOutcome::Denied, ToolOutcome::Rejected] {
+            let mut app = App::default();
+            start_tool(&mut app, "shell_exec");
+            end_tool(&mut app, outcome, 0, Some("命中高危规则"));
+            assert_eq!(
+                last_tool_status(&app),
+                &ToolStatus::Rejected {
+                    reason: "命中高危规则".into()
+                },
+                "{outcome:?} 应映射为 Rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_end_without_detail_falls_back_to_placeholder() {
+        // 旧 jsonl 日志缺 detail 字段（serde 默认 None）时不应渲染出空原因。
+        let mut app = App::default();
+        start_tool(&mut app, "shell_exec");
+        end_tool(&mut app, ToolOutcome::Failed, 5, None);
+        assert_eq!(
+            last_tool_status(&app),
+            &ToolStatus::Failed {
+                reason: "未提供错误详情".into(),
+                ms: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn tool_call_end_does_not_overwrite_finished_line() {
+        // 迟到／重复的 ToolCallEnd 不应改写已经终结的工具行。
+        let mut app = App::default();
+        start_tool(&mut app, "shell_exec");
+        end_tool(&mut app, ToolOutcome::Ok, 1, None);
+        end_tool(&mut app, ToolOutcome::Failed, 2, Some("迟到的事件"));
+        assert_eq!(last_tool_status(&app), &ToolStatus::Ok { ms: 1 });
+    }
+
+    // ---- 后端断开 ----
+
+    fn pending_approval() -> PendingApproval {
+        PendingApproval {
+            id: ApprovalId::new(),
+            req: ApprovalRequest {
+                id: ApprovalId::new(),
+                task_id: TaskId::new(),
+                tool: "shell".into(),
+                args: serde_json::json!({ "command": "rm -rf /" }),
+                risk: agent_core::perm::Risk::High,
+                reason: "命中高危命令规则".into(),
+                matched_rule: None,
+            },
+        }
+    }
+
+    #[test]
+    fn backend_disconnected_reports_exactly_once() {
+        // 事件流关闭后每帧的 try_recv 都返回 Disconnected，
+        // 若不幂等，对话区会被同一条错误刷爆。
+        let mut app = App::default();
+        let before = app.lines.len();
+        app.backend_disconnected();
+        app.backend_disconnected();
+        app.backend_disconnected();
+        assert_eq!(app.lines.len(), before + 1, "重复调用应只落一条提示");
+        assert!(app.is_backend_down());
+        assert_eq!(app.status, "后端已断开");
+    }
+
+    #[test]
+    fn backend_disconnected_dismisses_pending_approval() {
+        // 后端已死，弹层还挂在那儿只会让用户白白按键。
+        let mut app = App {
+            pending: Some(pending_approval()),
+            ..Default::default()
+        };
+        app.backend_disconnected();
+        assert!(app.pending.is_none(), "断连后应撤下审批弹层");
+    }
+
+    #[test]
+    fn disconnect_hint_carries_log_path() {
+        // 提示里给出完整路径，用户才不必去翻配置目录找日志。
+        let mut app = App::default();
+        app.set_log_path(r"C:\tmp\agent.log");
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, Line::System(s) if s.contains(r"C:\tmp\agent.log"))),
+            "启动时应告知日志位置"
+        );
+
+        app.backend_disconnected();
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, Line::Error(s) if s.contains(r"C:\tmp\agent.log"))),
+            "断连提示应带上日志路径"
+        );
     }
 
     #[test]

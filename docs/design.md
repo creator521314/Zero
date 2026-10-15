@@ -94,11 +94,18 @@ pub enum Event {                       // Agent → 外界（TUI/落盘/同步�
     TextDelta { id: TaskId, text: String },        // 流式正文
     ReasoningDelta { id: TaskId, text: String },   // 思考链（TUI 灰显）
     ToolCallStart { id: TaskId, call_id: ToolCallId, name: String, args: Value },
-    ToolCallEnd { id: TaskId, call_id: ToolCallId, ok: bool, ms: u64 },
+    ToolCallEnd {                                  // 终结状态 + 耗时 + 原因
+        id: TaskId, call_id: ToolCallId,
+        outcome: ToolOutcome, ms: u64, detail: Option<String>,
+    },
     AwaitingApproval { id: TaskId, req: ApprovalRequest },
     TaskFinished { id: TaskId, outcome: Outcome },
     Error { id: TaskId, err: ErrorInfo },
 }
+
+/// 工具终结状态：区分「跑了但失败」与「压根没跑」。
+pub enum ToolOutcome { Ok, Failed, Denied, Rejected }
+
 pub type EventBus = tokio::sync::broadcast::Sender<Event>;
 
 pub enum Command {                     // 外界 → Agent

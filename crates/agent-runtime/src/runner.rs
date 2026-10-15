@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_core::error::AgentError;
-use agent_core::event::{Event, EventBus, Outcome};
+use agent_core::event::{Event, EventBus, Outcome, ToolOutcome};
 use agent_core::ids::{ApprovalId, ToolCallId};
 use agent_core::perm::{ApprovalRequest, Decision, PermissionEngine};
 use agent_core::provider::{
@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::context::{ContextConfig, ContextManager};
 
 /// 审批应答。
+#[derive(Debug, Clone)]
 pub enum ApprovalReply {
     Approve { remember: bool },
     Reject { reason: String },
@@ -204,6 +205,13 @@ impl AgentRunner for AgentRuntime {
         ctl: RunControl,
     ) -> Result<Outcome, AgentError> {
         let task_id = task.id.clone();
+        tracing::info!(
+            task = %task_id.0,
+            provider = %self.deps.provider_name,
+            max_iterations = task.max_iterations,
+            workspace = %task.workspace,
+            "run start"
+        );
         let _ = bus.send(Event::TaskStarted {
             id: task_id.clone(),
             title: task.title.clone(),
@@ -334,13 +342,20 @@ impl AgentRunner for AgentRuntime {
                         let _ = bus.send(Event::ToolCallEnd {
                             id: task_id.clone(),
                             call_id: call_id.clone(),
-                            ok: false,
+                            outcome: ToolOutcome::Denied,
                             ms: 0,
+                            detail: Some(reason),
                         });
                         continue;
                     }
                     Decision::AskUser => {
                         let approval_id = ApprovalId::new();
+                        tracing::info!(
+                            task = %task_id.0,
+                            tool = %call.name,
+                            approval = %approval_id.0,
+                            "awaiting user approval"
+                        );
                         let _ = bus.send(Event::AwaitingApproval {
                             id: task_id.clone(),
                             approval_id: approval_id.clone(),
@@ -375,8 +390,9 @@ impl AgentRunner for AgentRuntime {
                                 let _ = bus.send(Event::ToolCallEnd {
                                     id: task_id.clone(),
                                     call_id: call_id.clone(),
-                                    ok: false,
+                                    outcome: ToolOutcome::Rejected,
                                     ms: 0,
+                                    detail: Some(reason),
                                 });
                                 continue;
                             }
@@ -415,8 +431,9 @@ impl AgentRunner for AgentRuntime {
                         let _ = bus.send(Event::ToolCallEnd {
                             id: task_id.clone(),
                             call_id: call_id.clone(),
-                            ok: true,
+                            outcome: ToolOutcome::Ok,
                             ms,
+                            detail: None,
                         });
                     }
                     Err(e) => {
@@ -430,8 +447,9 @@ impl AgentRunner for AgentRuntime {
                         let _ = bus.send(Event::ToolCallEnd {
                             id: task_id.clone(),
                             call_id: call_id.clone(),
-                            ok: false,
+                            outcome: ToolOutcome::Failed,
                             ms,
+                            detail: Some(e.to_string()),
                         });
                     }
                 }
@@ -484,21 +502,47 @@ impl AgentRuntime {
     }
 
     /// 等待审批应答。
+    ///
+    /// 这是「任务无声卡住」最常见的悬挂点：只要应答送不进来（前端没转发、
+    /// 编排层阻塞、通道关闭），任务就会一直停在这里且界面上毫无动静。
+    /// 因此进出与异常分支都留日志，便于事后从 logs/agent.log 复盘。
     async fn wait_approval(
         &self,
         approval_id: &ApprovalId,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<ApprovalReply, AgentError> {
+        tracing::info!(approval = %approval_id.0, "waiting for approval reply");
         let mut rx = self.deps.approvals.lock().await;
         loop {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Err(AgentError::Cancelled),
+                _ = cancel.cancelled() => {
+                    tracing::warn!(approval = %approval_id.0, "approval wait cancelled");
+                    return Err(AgentError::Cancelled);
+                }
                 msg = rx.recv() => {
                     match msg {
-                        Some((id, reply)) if id == *approval_id => return Ok(reply),
-                        Some(_) => continue,     // 非本请求，丢弃
-                        None => return Err(AgentError::Internal("approval channel closed".into())),
+                        Some((id, reply)) if id == *approval_id => {
+                            tracing::info!(
+                                approval = %approval_id.0,
+                                reply = ?reply,
+                                "approval reply received"
+                            );
+                            return Ok(reply);
+                        }
+                        Some((id, _)) => {
+                            // 通常意味着前端把应答发给了另一个审批（ID 错配）。
+                            tracing::warn!(
+                                got = %id.0,
+                                want = %approval_id.0,
+                                "stale approval reply dropped"
+                            );
+                            continue;
+                        }
+                        None => {
+                            tracing::error!(approval = %approval_id.0, "approval channel closed");
+                            return Err(AgentError::Internal("approval channel closed".into()));
+                        }
                     }
                 }
             }
@@ -564,8 +608,13 @@ impl AgentRuntime {
                 Event::ToolCallEnd {
                     id: task.id.clone(),
                     call_id: call.id.clone(),
-                    ok: !out.is_error,
+                    outcome: if out.is_error {
+                        ToolOutcome::Failed
+                    } else {
+                        ToolOutcome::Ok
+                    },
                     ms: 0,
+                    detail: None,
                 },
             )
             .await;

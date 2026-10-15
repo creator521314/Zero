@@ -243,16 +243,12 @@ impl LlmProvider for OpenAiCompatProvider {
                             continue;
                         };
                         if let Some(delta) = choice.get("delta") {
-                            if let Some(t) = delta.get("content").and_then(|c| c.as_str()) {
-                                if !t.is_empty() {
-                                    yield Ok(StreamEvent::TextDelta(t.to_string()));
-                                }
+                            let (text_delta, reasoning_delta) = split_content_reasoning(delta);
+                            if let Some(t) = text_delta {
+                                yield Ok(StreamEvent::TextDelta(t));
                             }
-                            // 思考链（部分厂商用 reasoning_content）
-                            if let Some(r) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
-                                if !r.is_empty() {
-                                    yield Ok(StreamEvent::ReasoningDelta(r.to_string()));
-                                }
+                            if let Some(r) = reasoning_delta {
+                                yield Ok(StreamEvent::ReasoningDelta(r));
                             }
                             if let Some(tcs) = delta.get("tool_calls").and_then(|c| c.as_array()) {
                                 for tc in tcs {
@@ -391,6 +387,25 @@ fn parse_usage(v: Option<&Value>) -> Usage {
     }
 }
 
+/// 从 OpenAI 流式 delta 中提取正文与思考链。
+///
+/// 某些厂商（如 DeepSeek）会把完全相同的内容同时填入 `content` 和
+/// `reasoning_content`，导致 UI 把同一句输出两遍（正文一次，灰色思考链
+/// 又一次）。这里做去重：若两者内容相同，只保留正文。
+fn split_content_reasoning(delta: &Value) -> (Option<String>, Option<String>) {
+    let text = delta
+        .get("content")
+        .and_then(|c| c.as_str())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string());
+    let reasoning = delta
+        .get("reasoning_content")
+        .and_then(|c| c.as_str())
+        .filter(|r| !r.is_empty() && text.as_deref() != Some(r))
+        .map(|r| r.to_string());
+    (text, reasoning)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +447,40 @@ mod tests {
     fn parses_finish_reason() {
         assert_eq!(map_finish(Some("tool_calls")), FinishReason::ToolCalls);
         assert_eq!(map_finish(Some("stop")), FinishReason::Stop);
+    }
+
+    #[test]
+    fn deduplicates_reasoning_identical_to_content() {
+        // 回归：DeepSeek 会把同一段内容同时填入 content / reasoning_content，
+        // 导致 TUI 把同一句话输出两遍（正文 + 灰色思考链）。
+        let delta = json!({
+            "content": "你好，世界",
+            "reasoning_content": "你好，世界"
+        });
+        let (text, reasoning) = split_content_reasoning(&delta);
+        assert_eq!(text.as_deref(), Some("你好，世界"));
+        assert_eq!(reasoning, None, "与正文重复的思考链应被丢弃");
+    }
+
+    #[test]
+    fn keeps_reasoning_when_different_from_content() {
+        let delta = json!({
+            "content": "答案是 42。",
+            "reasoning_content": "让我先计算 6*7"
+        });
+        let (text, reasoning) = split_content_reasoning(&delta);
+        assert_eq!(text.as_deref(), Some("答案是 42。"));
+        assert_eq!(reasoning.as_deref(), Some("让我先计算 6*7"));
+    }
+
+    #[test]
+    fn keeps_reasoning_when_content_empty() {
+        let delta = json!({
+            "content": "",
+            "reasoning_content": "我在思考..."
+        });
+        let (text, reasoning) = split_content_reasoning(&delta);
+        assert_eq!(text, None);
+        assert_eq!(reasoning.as_deref(), Some("我在思考..."));
     }
 }

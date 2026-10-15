@@ -100,10 +100,11 @@ fn parse_tier(s: &str) -> PermissionTier {
 async fn main() -> anyhow::Result<()> {
     let cfg_path = ProvidersFile::config_path();
 
-    // 日志写文件，避免污染 TUI
-    if let Some(dir) = cfg_path.parent() {
-        let _ = std::fs::create_dir_all(dir.join("logs"));
-        let file_appender = tracing_appender::rolling::never(dir.join("logs"), "agent.log");
+    // 日志写文件，避免污染 TUI（stdout 已被 alternate screen 占用）
+    let log_file = cfg_path.parent().map(|dir| {
+        let logs_dir = dir.join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+        let file_appender = tracing_appender::rolling::never(&logs_dir, "agent.log");
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -111,7 +112,8 @@ async fn main() -> anyhow::Result<()> {
             )
             .with_writer(file_appender)
             .init();
-    }
+        logs_dir.join("agent.log")
+    });
 
     // 启动期配置加载：缺/坏 → 自动进入 wizard（仅 stdin 是 TTY 时）。
     let cfg = wizard::ensure_loaded()?;
@@ -212,13 +214,47 @@ async fn main() -> anyhow::Result<()> {
         let max_iter = cfg.agent.max_iterations;
 
         tokio::spawn(async move {
-            // 每任务一个取消令牌
-            #[allow(unused_assignments)]
-            let mut current: Option<tokio_util::sync::CancellationToken> = None;
+            // 当前运行中的任务：取消令牌 + 句柄。
+            //
+            // 任务必须 spawn 到独立 task 执行，**不能在本循环里 await**：
+            // 本循环同时负责把 Approve/Reject/Cancel 转发给 runner，而 runner
+            // 的 wait_approval 正等着这些应答。若在此 await 任务结束，就形成
+            // 「循环等任务结束、任务等循环转发审批」的自锁——表现为任务永远
+            // 不结束、审批按了没反应、取消也无效。
+            type RunningTask = (
+                tokio_util::sync::CancellationToken,
+                tokio::task::JoinHandle<()>,
+            );
+            let mut current: Option<RunningTask> = None;
 
             while let Some(cmd) = cmd_rx.recv().await {
+                tracing::debug!(?cmd, "command received");
+
+                // 先收割已结束的任务：否则陈旧句柄会把后续提交一直挡在门外。
+                if current.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+                    if let Some((_, h)) = current.take() {
+                        if let Err(e) = h.await {
+                            tracing::error!(error = %e, "task join failed");
+                        }
+                    }
+                }
+
                 match cmd {
                     Command::SubmitTask(mut spec) => {
+                        // 一期为串行执行：同一时刻只跑一个任务。明确拒绝并回报，
+                        // 而不是静默排队——静默排队会让用户以为提交没生效。
+                        if current.is_some() {
+                            tracing::warn!(task = %spec.id.0, "rejected: another task is running");
+                            let _ = bus.send(Event::Error {
+                                id: spec.id.clone(),
+                                err: agent_core::ErrorInfo::new(
+                                    "busy",
+                                    "上一个任务仍在执行。请等它结束，或按 Esc 取消后再提交。",
+                                ),
+                            });
+                            continue;
+                        }
+
                         if spec.workspace.is_empty() {
                             let ws = agent_store::workspace_of(&cfg_root, &spec.id);
                             tokio::fs::create_dir_all(&ws).await.ok();
@@ -230,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
                         let provider = match router.resolve(None, spec.model.as_deref()).await {
                             Ok(p) => p,
                             Err(e) => {
+                                tracing::error!(error = %e, "provider resolve failed");
                                 let _ = bus.send(Event::Error {
                                     id: spec.id.clone(),
                                     err: agent_core::ErrorInfo::new("provider", e.to_string()),
@@ -239,13 +276,15 @@ async fn main() -> anyhow::Result<()> {
                         };
 
                         let ctl = RunControl::new();
-                        // current 供 Cancel 命令触发取消
-                        current = Some(ctl.cancel.clone());
+                        let cancel = ctl.cancel.clone();
+                        let bus_task = bus.clone();
+                        let task_id = spec.id.0.clone();
+                        let provider_name = provider.name().to_string();
 
                         let runtime =
                             agent_runtime::AgentRuntime::new(agent_runtime::RuntimeDeps {
                                 provider: provider.clone(),
-                                provider_name: provider.name().to_string(),
+                                provider_name: provider_name.clone(),
                                 tools: lookup2.clone(),
                                 tool_defs: tool_defs2.clone(),
                                 perm: perm2.clone(),
@@ -256,33 +295,49 @@ async fn main() -> anyhow::Result<()> {
                                 per_task_budget: router.per_task_limit(),
                             });
 
-                        if let Err(e) = runtime.run(spec, bus.clone(), ctl).await {
-                            tracing::error!(error = %e, "task run failed");
-                        }
-                        // 任务结束后清空，避免 Cancel 命中已结束的任务
-                        let _ = current.take();
+                        tracing::info!(task = %task_id, provider = %provider_name, "task started");
+                        let handle = tokio::spawn(async move {
+                            match runtime.run(spec, bus_task, ctl).await {
+                                Ok(_) => tracing::info!(task = %task_id, "task run finished"),
+                                Err(e) => {
+                                    tracing::error!(task = %task_id, error = %e, "task run failed")
+                                }
+                            }
+                        });
+                        current = Some((cancel, handle));
                     }
                     Command::Approve(id) => {
-                        let _ = ap_tx
+                        tracing::info!(approval = %id.0, "approve forwarded to runner");
+                        if ap_tx
                             .send((
                                 id,
                                 agent_runtime::runner::ApprovalReply::Approve { remember: false },
                             ))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            tracing::error!("approval channel closed; runner gone");
+                        }
                     }
                     Command::Reject {
                         approval_id,
                         reason,
                     } => {
-                        let _ = ap_tx
+                        tracing::info!(approval = %approval_id.0, "reject forwarded to runner");
+                        if ap_tx
                             .send((
                                 approval_id,
                                 agent_runtime::runner::ApprovalReply::Reject { reason },
                             ))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            tracing::error!("approval channel closed; runner gone");
+                        }
                     }
-                    Command::Cancel(_) => {
-                        if let Some(t) = &current {
+                    Command::Cancel(id) => {
+                        tracing::info!(task = %id.0, "cancel requested");
+                        if let Some((t, _)) = &current {
                             t.cancel();
                         }
                     }
@@ -292,8 +347,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = App::with_identity(cfg.agent.default_tier.clone(), router.available().join(","));
+    let mut app = App::with_identity(cfg.agent.default_tier.clone(), router.available().join(","));
+    if let Some(p) = &log_file {
+        app.set_log_path(p.display().to_string());
+    }
 
+    tracing::info!("tui starting");
     run_tui(app, ev_rx, cmd_tx).await?;
+    tracing::info!("tui exited");
     Ok(())
 }
