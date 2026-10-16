@@ -8,6 +8,9 @@
 //!
 //! 命令以**平台原生解释器**执行：Windows 上没有 `/bin/sh`，硬编码它会让
 //! 每一次调用都在 spawn 阶段失败（os error 3），历史上 100% 不可用。
+//!
+//! 子进程输出先按 UTF-8 严格解码，失败再按系统 OEM 代码页解（见
+//! [`decode_output`]）。
 
 use agent_core::perm::Risk;
 use agent_core::tool::{Tool, ToolCtx, ToolError, ToolOutput};
@@ -23,15 +26,66 @@ const SHELL: (&str, &str) = ("cmd", "/C");
 
 pub struct ShellExec;
 
-/// 控制台代码页在中文 Windows 上是 GBK，直接取字节会得到乱码；
-/// 先切到 65001，输出才是 UTF-8。
-#[cfg(windows)]
-fn decorate(cmd: &str) -> String {
-    format!("chcp 65001 >nul && {cmd}")
+/// 把子进程输出解成文本。
+///
+/// 两种来源都要照顾：
+/// - `dir` / `echo` 这类系统命令按**本地 OEM 代码页**输出（中文 Windows 是
+///   GBK），硬按 UTF-8 解会得到一串 `U+FFFD`，模型看到的目录名全是乱码
+///   ——真实会话里的 `dir /a` 就是这样变废的；
+/// - `git` / `rg` / `python` 这类工具本身就吐 UTF-8，按 GBK 解会把它们弄坏。
+///
+/// 所以先严格试 UTF-8，失败再退回 OEM 代码页。注意 `chcp 65001` 解决不了
+/// 这个问题：它只改控制台**显示**用的代码页，对管道里的字节毫无影响
+/// （实测 `chcp 65001 && echo 中文` 的字节与不加时完全一致）。
+fn decode_output(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    decode_oem(bytes)
 }
-#[cfg(unix)]
-fn decorate(cmd: &str) -> String {
-    cmd.to_string()
+
+/// 按系统 OEM 代码页转码（交给系统做，省得自带一张 GBK 表）。
+#[cfg(windows)]
+fn decode_oem(bytes: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::MultiByteToWideChar;
+    /// 预定义代码页：当前系统 OEM 代码页（中文 Windows = 936/GBK）。
+    /// 不用 `GetOEMCP()`——windows-sys 0.61 没导出它，而这个常量等价。
+    const CP_OEMCP: u32 = 1;
+    // dwFlags = 0：非法字节由系统替换成默认字符，而不是整段失败。
+    unsafe {
+        let cp = CP_OEMCP;
+        let len = MultiByteToWideChar(
+            cp,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        );
+        if len <= 0 {
+            return String::from_utf8_lossy(bytes).to_string();
+        }
+        let mut buf = vec![0u16; len as usize];
+        let n = MultiByteToWideChar(
+            cp,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            buf.as_mut_ptr(),
+            len,
+        );
+        if n <= 0 {
+            return String::from_utf8_lossy(bytes).to_string();
+        }
+        buf.truncate(n as usize);
+        String::from_utf16_lossy(&buf)
+    }
+}
+
+/// 非 Windows 只有 UTF-8 一种约定，非法字节只能 lossy。
+#[cfg(not(windows))]
+fn decode_oem(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).to_string()
 }
 
 #[async_trait]
@@ -81,15 +135,30 @@ impl Tool for ShellExec {
 
         // 一条命令字符串交给平台解释器；cwd 锁定沙箱，高危模式已在权限层拦截。
         let (prog, flag) = SHELL;
-        let mut command = tokio::process::Command::new(prog);
-        command
+        let mut std_cmd = std::process::Command::new(prog);
+        std_cmd
             .arg(flag)
-            .arg(decorate(cmd))
+            .arg(cmd)
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
+
+        // Windows：给子进程一个自己的（不可见）控制台。
+        //
+        // 否则它共享 TUI 的控制台，`chcp` 这类改控制台状态的调用会连带把整个
+        // 屏幕擦掉（`cls`、改标题同理）。而 TUI 只发送差分，被擦掉的静态区域
+        // （边框、输入框、页脚）再也不会被重画，用户看到的就是「大部分区域
+        // 变黑，只剩下还在刷新的那几行」。
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut command = tokio::process::Command::from(std_cmd);
+        command.kill_on_drop(true);
 
         let child = command
             .spawn()
@@ -97,8 +166,8 @@ impl Tool for ShellExec {
 
         let fut = async {
             let out = child.wait_with_output().await?;
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let stdout = decode_output(&out.stdout);
+            let stderr = decode_output(&out.stderr);
             Ok::<_, std::io::Error>((out.status, stdout, stderr))
         };
 
@@ -162,6 +231,42 @@ mod tests {
             .expect("本平台的 shell 必须能起来");
         assert!(!out.is_error, "实际: {}", out.content);
         assert!(out.content.contains("hello"), "实际: {}", out.content);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 中文必须活着回来：`echo` 按本地 OEM 代码页（中文 Windows = GBK）
+    /// 输出，以前硬按 UTF-8 解就是一堆 `U+FFFD`。
+    #[tokio::test]
+    async fn chinese_output_from_builtin_is_readable() {
+        let dir = std::env::temp_dir().join("agent-tools-shell-gbk-test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let out = ShellExec
+            .execute(json!({ "cmd": "echo 中文测试" }), &ctx(&dir))
+            .await
+            .unwrap();
+        assert!(out.content.contains("中文测试"), "实际: {}", out.content);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// `type`/`cat` 原样吐文件字节：UTF-8 文件必须原样活着回来，
+    /// 不能被「一律按 GBK 解」这种更省事的做法弄坏。
+    #[tokio::test]
+    async fn utf8_output_from_tools_survives_roundtrip() {
+        let dir = std::env::temp_dir().join("agent-tools-shell-utf8-test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("u8.txt"), "中文测试")
+            .await
+            .unwrap();
+        let cmd = if cfg!(windows) {
+            "type u8.txt"
+        } else {
+            "cat u8.txt"
+        };
+        let out = ShellExec
+            .execute(json!({ "cmd": cmd }), &ctx(&dir))
+            .await
+            .unwrap();
+        assert!(out.content.contains("中文测试"), "实际: {}", out.content);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 

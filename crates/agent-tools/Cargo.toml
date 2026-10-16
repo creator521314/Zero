@@ -14,3 +14,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 thiserror.workspace = true
 reqwest.workspace = true
+
+# shell_exec 的子进程输出要按系统 OEM 代码页转码（见 shell.rs decode_output）。
+# 该版本已在依赖树中（crossterm 侧），不引入额外下载。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
