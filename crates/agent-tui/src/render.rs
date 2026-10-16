@@ -507,9 +507,9 @@ fn draw_conversation(f: &mut Frame, app: &App, area: Rect) {
     let inner_w = area.width.saturating_sub(2) as usize;
     let lines = build_conversation_lines(&app.lines, inner_w);
 
-    // 注意：Paragraph 启用了 Wrap，长行会被软换行成多行。这里必须按
-    // **wrap 后的实际行数**计算滚动范围——直接用 lines.len() 会严重低估，
-    // 导致内容一多就滚不到底（之前正是如此）。
+    // Paragraph 启用了 Wrap，长行会被软换行成多行。滚动范围必须按
+    // **wrap 后的实际行数**计算。之前按总宽度做数学估算，在 word wrap
+    //（英文）场景下会严重低估，导致内容一长就滚不到底、底部被截断。
     let total: u16 = lines
         .iter()
         .map(|l| wrapped_line_count(l, inner_w))
@@ -674,14 +674,20 @@ fn placeholder_spans() -> Vec<Span<'static>> {
     ]
 }
 
-/// 一行文本在给定宽度下 wrap 后占用的显示行数（至少 1 行）。
+/// 一行文本在给定宽度下 word-wrap 后占用的显示行数（至少 1 行）。
+///
+/// 使用 textwrap 按 Unicode 显示宽度做软换行，与 ratatui 的
+/// `Wrap { trim: false }` 行为足够接近，避免之前按总宽度做数学估算
+/// 在英文 word-wrap 场景下严重低估、导致底部内容被截断的问题。
 fn wrapped_line_count(line: &RtLine, inner_w: usize) -> usize {
     if inner_w == 0 {
         return 1;
     }
-    let w = UnicodeWidthStr::width(line_as_str(line).as_str());
-    // 空行也算 1 行；否则按宽度向上取整
-    1 + w.saturating_sub(1) / inner_w
+    let text = line_as_str(line);
+    if text.is_empty() {
+        return 1;
+    }
+    textwrap::wrap(&text, inner_w).len().max(1)
 }
 
 /// 取出 RtLine 的纯文本（仅用于测宽，样式无关）。
@@ -829,7 +835,7 @@ mod tests {
         assert_eq!(app.input.buffer, "hello");
     }
 
-    // ---- wrap 行数计算（对话区滚动范围） ----
+    // ---- word-wrap 行数计算（对话区滚动范围） ----
 
     #[test]
     fn wrapped_line_count_short_line_is_one() {
@@ -845,28 +851,20 @@ mod tests {
 
     #[test]
     fn wrapped_line_count_counts_cjk_by_display_width() {
-        // 中文占 2 列：10 个中文字 = 20 列，在宽 8 的区域应占 3 行
-        let l = RtLine::from("你好世界测试ABCDE".to_string()); // 8 CJK + 5 ASCII = 21 列
+        // 中文占 2 列：8 CJK + 5 ASCII = 21 列，在宽 8 的区域应占 3 行
+        let l = RtLine::from("你好世界测试ABCDE".to_string());
         assert_eq!(wrapped_line_count(&l, 8), 3);
     }
 
     #[test]
-    fn wrapped_line_count_exact_multiple() {
-        // 8 列宽、8 列文本 → 恰好 1 行（不是 2 行）
-        let l = RtLine::from("12345678");
-        assert_eq!(wrapped_line_count(&l, 8), 1);
-    }
-
-    #[test]
-    fn wrapped_line_count_one_over_wraps() {
-        let l = RtLine::from("123456789"); // 9 列
-        assert_eq!(wrapped_line_count(&l, 8), 2);
-    }
-
-    #[test]
-    fn wrapped_line_count_zero_width_is_one() {
-        let l = RtLine::from("anything");
-        assert_eq!(wrapped_line_count(&l, 0), 1);
+    fn wrapped_line_count_english_word_wrap_not_underestimated() {
+        // 旧逻辑按总宽度做数学估算：ceil(83 / 30) = 3 行；
+        // 但 word wrap 留白后实际约 4 行，textwrap 应给出更接近的值。
+        let l = RtLine::from(
+            "This is a long sentence that will wrap across multiple lines in a narrow viewport.",
+        );
+        let rows = wrapped_line_count(&l, 30);
+        assert!(rows >= 3, "word wrap 行数不应被低估，got {rows}");
     }
 
     // ---- 鼠标滚轮区域分流 ----

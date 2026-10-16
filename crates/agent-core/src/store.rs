@@ -49,6 +49,35 @@ pub enum Durability {
     Transient,
 }
 
+/// 审计日志落盘策略。
+///
+/// 取舍：定位问题时最想要的是「模型当时看到了什么、回了什么、工具返回了什么」，
+/// 但逐条记录流式增量会让 jsonl 大一个数量级（实测 21 次工具调用 ≈ 400KB）。
+/// 因此默认记录**按轮次的完整快照**，把逐字增量作为可选项。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogConfig {
+    /// 每轮记录一份完整上下文（system 固定区 + 全部历史消息）。
+    #[serde(default = "default_true")]
+    pub save_context: bool,
+    /// 逐条记录流式增量（`TextDelta` / `ReasoningDelta`）。
+    /// 有了按轮次的快照后二者内容重合，仅在需要逐字复现时开启。
+    #[serde(default)]
+    pub save_stream_deltas: bool,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            save_context: true,
+            save_stream_deltas: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub id: TaskId,

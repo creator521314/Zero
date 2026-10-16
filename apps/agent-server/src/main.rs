@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use agent_core::event::{event_bus, Event};
-use agent_core::ids::SessionId;
 use agent_core::perm::{PermissionEngine, PermissionTier};
 use agent_core::task::{RunControl, TaskSpec};
 use agent_core::AgentRunner;
@@ -73,6 +72,9 @@ async fn main() -> anyhow::Result<()> {
     let provider = router.resolve(None, None).await?;
     let bus = event_bus();
 
+    // jsonl 落盘：与 TUI 模式共用同一套规则（agent_store::recorder）
+    agent_store::spawn_event_sink(bus.clone(), store.clone(), cfg.log.clone(), None);
+
     // 打印事件流
     {
         let mut sub = bus.subscribe();
@@ -103,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         tool_defs: registry.defs(),
         perm,
         store: store.clone(),
+        log_cfg: cfg.log.clone(),
         approvals: Arc::new(Mutex::new(ap_rx)),
         context_cfg: Default::default(),
         batch_approve: None,
@@ -115,20 +118,11 @@ async fn main() -> anyhow::Result<()> {
     let ws = agent_store::workspace_of(&root, &spec.id);
     tokio::fs::create_dir_all(&ws).await.ok();
     spec.workspace = ws.display().to_string();
+    // 工具沙箱 = 项目根（默认启动目录）；私有工作区只放系统数据。
+    spec.project_root = Some(cfg.agent.resolved_project_root().display().to_string());
 
-    let sid = SessionId(spec.id.0.clone());
-    store
-        .record(
-            &sid,
-            &spec.id,
-            agent_core::store::Durability::Persistent,
-            Event::TaskStarted {
-                id: spec.id.clone(),
-                title: spec.title.clone(),
-            },
-        )
-        .await?;
-
+    // 注意：不再在此手写 `TaskStarted`——落盘统一由 recorder 订阅总线完成，
+    // 否则同一条事件会被写两遍。
     match runtime.run(spec, bus, RunControl::new()).await {
         Ok(o) => {
             println!("\n最终结果: {o:?}");

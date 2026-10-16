@@ -1,5 +1,8 @@
 //! 配置模型（对应方案 5.3）。
 
+// 审计落盘策略定义在 agent-core（落盘规则与事件模型同处一个 crate），
+// 此处再导出，让配置的使用方统一从 `config` 取。
+pub use agent_core::store::LogConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,6 +34,9 @@ pub struct ProvidersFile {
     pub search: SearchConfig,
     #[serde(default)]
     pub agent: AgentConfig,
+    /// 审计日志落盘策略。
+    #[serde(default)]
+    pub log: LogConfig,
 }
 
 /// 配置校验错误。
@@ -118,6 +124,7 @@ impl Default for ProvidersFile {
             budget: Budget::default(),
             search: SearchConfig::default(),
             agent: AgentConfig::default(),
+            log: LogConfig::default(),
         }
     }
 }
@@ -238,9 +245,17 @@ pub struct SearchConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
-    /// 工作区根目录。
+    /// 私有数据根目录（日志、每任务工作区）。
     #[serde(default = "default_root")]
     pub root: String,
+    /// 项目根目录：工具读写的沙箱，也是相对路径的基准。
+    ///
+    /// 默认为 `.`，即**启动 agent 时的当前目录**——Agent 只有在真实项目
+    /// 目录里才能对「介绍当前项目」这类任务给出有效回答；每任务的私有
+    /// 数据仍放在 `root/workspace/<task-id>`，不会污染项目。
+    /// 也支持绝对路径与 `~`；留空则退回私有工作区（旧行为）。
+    #[serde(default = "default_project_root")]
+    pub project_root: String,
     /// 默认权限档。
     #[serde(default = "default_tier")]
     pub default_tier: String,
@@ -253,6 +268,9 @@ pub struct AgentConfig {
 
 fn default_root() -> String {
     "~/agent".into()
+}
+fn default_project_root() -> String {
+    ".".into()
 }
 fn default_tier() -> String {
     "L2".into()
@@ -271,6 +289,18 @@ impl AgentConfig {
     /// 目录**下创建字面名为 `~` 的目录（Windows 上表现为项目里出现 `~/agent/`）。
     pub fn resolved_root(&self) -> PathBuf {
         expand_home(&self.root)
+    }
+
+    /// 解析项目根目录：`.` 取启动目录，其余展开 `~`。
+    ///
+    /// 取不到当前目录时退回私有根目录，绝不静默变成空路径。
+    pub fn resolved_project_root(&self) -> PathBuf {
+        let raw = self.project_root.trim();
+        if raw.is_empty() || raw == "." || raw == "./" {
+            return std::env::current_dir()
+                .unwrap_or_else(|_| self.resolved_root().join("workspace"));
+        }
+        expand_home(raw)
     }
 }
 
@@ -309,6 +339,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             root: default_root(),
+            project_root: default_project_root(),
             default_tier: default_tier(),
             max_iterations: default_max_iter(),
             transient_retention_days: default_retention(),
@@ -373,6 +404,15 @@ impl ProvidersFile {
                     ));
                 }
             }
+        }
+        // 项目根不存在会让所有文件类工具集体失败，且症状看起来像「工具坏了」。
+        let proj = self.agent.resolved_project_root();
+        if !proj.is_dir() {
+            out.push(format!(
+                "agent.project_root 指向的目录不存在：{}（工具会找不到任何文件；\
+                 改为 `.` 表示启动目录）",
+                proj.display()
+            ));
         }
         out
     }

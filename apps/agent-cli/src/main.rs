@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_core::event::{event_bus, Command, Event};
-use agent_core::ids::SessionId;
 use agent_core::perm::{PermissionEngine, PermissionTier, Risk};
 use agent_core::provider::{ChatRequest, LlmProvider, Message, ToolCall};
 use agent_core::task::{RunControl, TaskSpec};
@@ -137,6 +136,8 @@ async fn main() -> anyhow::Result<()> {
 
     let root = cfg.agent.resolved_root();
     tokio::fs::create_dir_all(root.join("workspace")).await.ok();
+    // 工具沙箱：默认启动目录，这样「介绍当前项目」才有东西可看。
+    let project_root = cfg.agent.resolved_project_root();
 
     // 工具集
     let registry = Arc::new(agent_tools::default_tools(
@@ -173,32 +174,8 @@ async fn main() -> anyhow::Result<()> {
     // 事件通道（TUI 消费）
     let (ev_tx, ev_rx) = mpsc::channel::<Event>(2048);
 
-    // broadcast -> mpsc 转发 + JSONL 落盘
-    {
-        let store = store.clone();
-        let mut sub = bus.subscribe();
-        tokio::spawn(async move {
-            while let Ok(ev) = sub.recv().await {
-                let _ = ev_tx.send(ev.clone()).await;
-                let (tid, durable) = match &ev {
-                    Event::TaskStarted { id, .. }
-                    | Event::TaskFinished { id, .. }
-                    | Event::Error { id, .. } => {
-                        (id.clone(), agent_core::store::Durability::Persistent)
-                    }
-                    Event::TextDelta { id, .. }
-                    | Event::ReasoningDelta { id, .. }
-                    | Event::ToolCallStart { id, .. }
-                    | Event::ToolCallEnd { id, .. }
-                    | Event::AwaitingApproval { id, .. } => {
-                        (id.clone(), agent_core::store::Durability::Transient)
-                    }
-                };
-                let sid = SessionId(tid.0.clone());
-                let _ = store.record(&sid, &tid, durable, ev).await;
-            }
-        });
-    }
+    // 总线 → TUI 转发 + jsonl 落盘（落盘规则集中在 agent_store::recorder）
+    agent_store::spawn_event_sink(bus.clone(), store.clone(), cfg.log.clone(), Some(ev_tx));
 
     // Agent 命令循环
     {
@@ -209,7 +186,9 @@ async fn main() -> anyhow::Result<()> {
         let lookup2 = lookup.clone();
         let perm2 = perm.clone();
         let approvals2 = approvals.clone();
+        let log_cfg2 = cfg.log.clone();
         let cfg_root = root.clone();
+        let proj_root = project_root.clone();
         let default_tier = parse_tier(&cfg.agent.default_tier);
         let max_iter = cfg.agent.max_iterations;
 
@@ -260,6 +239,10 @@ async fn main() -> anyhow::Result<()> {
                             tokio::fs::create_dir_all(&ws).await.ok();
                             spec.workspace = ws.display().to_string();
                         }
+                        // 工具沙箱 = 项目根（默认启动目录）；私有工作区只放系统数据。
+                        if spec.project_root.is_none() {
+                            spec.project_root = Some(proj_root.display().to_string());
+                        }
                         spec.tier = default_tier;
                         spec.max_iterations = max_iter;
 
@@ -289,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
                                 tool_defs: tool_defs2.clone(),
                                 perm: perm2.clone(),
                                 store: store.clone(),
+                                log_cfg: log_cfg2.clone(),
                                 approvals: approvals2.clone(),
                                 context_cfg: Default::default(),
                                 batch_approve: None,

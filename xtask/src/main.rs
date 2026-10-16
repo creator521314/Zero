@@ -1,10 +1,13 @@
-//! xtask —— 构建/校验辅助脚本。
+//! xtask —— 构建/校验/排障辅助脚本。
 //!
 //! 用法：
 //!   cargo xtask check    # fmt 检查 + clippy + test
 //!   cargo xtask test     # 仅测试
 //!   cargo xtask fmt      # 格式化
 //!   cargo xtask gen-cfg  # 生成默认配置文件
+//!   cargo xtask log <id|路径> [--full] [--errors]   # 读会话日志
+
+mod log_view;
 
 use std::process::Command;
 
@@ -23,9 +26,27 @@ fn main() -> anyhow::Result<()> {
             agent_providers::ProvidersFile::write_template(&path)?;
             println!("wrote {}", path.display());
         }
+        "log" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let full = rest.iter().any(|a| a == "--full");
+            let errors_only = rest.iter().any(|a| a == "--errors");
+            let Some(target) = rest.iter().find(|a| !a.starts_with("--")) else {
+                eprintln!("用法: cargo xtask log <session.jsonl | task-id> [--full] [--errors]");
+                eprintln!("  --full    展开完整上下文与工具返回原文");
+                eprintln!("  --errors  只看失败项（工具失败 / 被拦 / 报错）");
+                std::process::exit(2);
+            };
+            let path = log_view::resolve(target);
+            if !path.exists() {
+                eprintln!("找不到会话文件：{}", path.display());
+                std::process::exit(2);
+            }
+            let opts = log_view::ViewOpts { full, errors_only };
+            print!("{}", log_view::render(&path, &opts)?);
+        }
         other => {
             eprintln!("unknown task: {other}");
-            eprintln!("available: check | test | fmt | gen-cfg");
+            eprintln!("available: check | test | fmt | gen-cfg | log");
             std::process::exit(2);
         }
     }

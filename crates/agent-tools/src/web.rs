@@ -5,7 +5,7 @@ use agent_core::tool::{Artifact, Tool, ToolCtx, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::paths::resolve_in_workspace;
+use crate::paths::resolve_in_ctx;
 
 /// 抓取网页正文（简化：取纯文本，去除标签）。
 pub struct WebFetch {
@@ -85,7 +85,7 @@ impl Tool for WebFetch {
 
         let mut out = ToolOutput::ok(body);
         if let Some(save) = args.get("save_as").and_then(|v| v.as_str()) {
-            let full = resolve_in_workspace(&ctx.workspace, save)?;
+            let full = resolve_in_ctx(ctx, save)?;
             if let Some(parent) = full.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }

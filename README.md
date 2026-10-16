@@ -112,6 +112,15 @@ code = ["deepseek", "qwen"]
 [budget]
 monthly_limit_usd = 20.0
 per_task_limit_usd = 0.5
+
+# 工具读写的沙箱：**先 cd 到你的项目再启动 agent**，默认值就能命中它
+[agent]
+project_root = "."     # 也支持绝对路径与 ~；留空则退回私有工作区
+
+# 审计日志（默认即可，见下方「排障」一节）
+[log]
+save_context       = true    # 每轮记录完整上下文（system + 全部历史消息）
+save_stream_deltas = false   # 逐字增量（开着日志会大一数量级）
 ```
 
 > 注意：TOML **没有 `null` 字面量**。「无需 API key」的表达方式是省略 `api_key_env` 这一行。
@@ -123,7 +132,10 @@ per_task_limit_usd = 0.5
 
 `file_read` / `file_write` / `file_edit` / `list_dir` / `shell_exec` / `web_fetch` / `web_search`
 
-- 所有文件操作限制在工作区内（防 `../` 逃逸）；
+- 所有文件操作限制在**项目目录**内（防 `../` 逃逸）。项目目录默认就是
+  你启动 agent 时的当前目录（`agent.project_root`），这样「介绍当前项目」
+  才有东西可看；每任务的私有数据仍单独存放，不污染项目。
+- `shell_exec` 用平台原生解释器：Windows 上 `cmd /C`、Unix 上 `/bin/sh -c`。
 - `web_fetch` 有 SSRF 防护（禁内网/非 http(s)）；
 - 超大工具输出自动外置到 `ctx/`。
 
@@ -139,8 +151,37 @@ per_task_limit_usd = 0.5
 └── tasks/<task-id>.json
 ```
 
+> 两个目录要分清：
+>
+> - **项目目录**（`agent.project_root`，默认 = 启动目录）—— 工具读写的沙箱，
+>   相对路径的基准。删掉它，工具就没东西可看。
+> - **私有工作区**（`agent.root/workspace/<task-id>`）—— 只放 `ctx/` 等系统
+>   数据，绝不写到项目里。
+>
 > jsonl 事件流已是二期同步（分级同步 / AI 合并 / 回滚）的数据基础：
 > 每行带 `schema_version`、逻辑时钟 `Clock`、以及 `durability`（持久化/临时）字段。
+
+## 排障：读会话日志
+
+日志里保存的是**完整对话上下文**，而不只是工具调用记录：
+
+| 事件 | 内容 | 用途 |
+|---|---|---|
+| `context_snapshot` | 每轮送往模型的系统提示词 + 全部历史消息 + 可用工具 | 模型当时看到了什么 |
+| `assistant_turn` | 本轮完整回复（正文 / 工具调用 / token 用量） | 模型回了什么 |
+| `tool_call_start` | 工具名 + 参数 | 准备做什么 |
+| `tool_call_end` | 四态结局 + 耗时 + 原因 + **工具返回原文** | 工具实际返回了什么 |
+| `task_started` / `task_finished` / `error` | 任务生命周期 | 是否跑完 |
+
+```bash
+cargo xtask log <task-id>            # 按时间线读（也可直接给 .jsonl 路径）
+cargo xtask log <task-id> --errors   # 只看失败项：工具失败 / 被拦 / 报错
+cargo xtask log <task-id> --full     # 展开完整上下文与工具返回原文
+```
+
+落盘规则集中在 `crates/agent-store/src/recorder.rs`：逐字增量默认不落
+（内容已由 `assistant_turn` 完整覆盖，开着会让日志大一数量级——同一段
+对话实测从 687 条事件降到约 20 条）。
 
 ## 测试
 

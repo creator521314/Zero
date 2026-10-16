@@ -14,6 +14,10 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+pub mod recorder;
+
+pub use recorder::{classify, spawn_event_sink};
+
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// 基于 jsonl 的存储。

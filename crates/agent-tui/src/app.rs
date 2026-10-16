@@ -251,6 +251,8 @@ impl App {
                 };
                 self.auto_scroll();
             }
+            // 上下文快照与整轮回复只服务审计复盘，不进对话流。
+            Event::ContextSnapshot { .. } | Event::AssistantTurn { .. } => {}
             Event::AwaitingApproval {
                 approval_id, req, ..
             } => {
@@ -494,6 +496,7 @@ mod tests {
             outcome,
             ms,
             detail: detail.map(str::to_string),
+            output: None,
         });
     }
 

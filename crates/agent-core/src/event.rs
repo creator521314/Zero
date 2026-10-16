@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 use crate::error::ErrorInfo;
 use crate::ids::{ApprovalId, TaskId, ToolCallId};
 use crate::perm::ApprovalRequest;
+use crate::provider::{Message, ToolCall, Usage};
 use crate::task::TaskSpec;
 
 /// Agent → 外界的广播事件。
@@ -29,6 +30,30 @@ pub enum Event {
         id: TaskId,
         text: String,
     },
+    /// 每轮送给模型的**完整上下文快照**（system 固定区 + 全部历史消息）。
+    ///
+    /// 复盘时最关键的一条：模型是依据这些材料做出的判断。
+    /// 只服务审计，不进对话流（TUI 忽略）。
+    ContextSnapshot {
+        id: TaskId,
+        /// 第几轮（从 0 开始）。
+        iteration: u32,
+        model: String,
+        messages: Vec<Message>,
+        /// 本轮可用的工具名。
+        tools: Vec<String>,
+    },
+    /// 模型本轮的完整回复（正文 + 工具调用 + 用量）。
+    ///
+    /// 与 `TextDelta` 内容重合，但一行可还原整轮，且流被中断时也有部分留存。
+    AssistantTurn {
+        id: TaskId,
+        iteration: u32,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        calls: Vec<ToolCall>,
+        usage: Usage,
+    },
     ToolCallStart {
         id: TaskId,
         call_id: ToolCallId,
@@ -47,6 +72,10 @@ pub enum Event {
         /// 失败或拒绝的原因；成功时为 `None`。
         #[serde(default)]
         detail: Option<String>,
+        /// 工具返回给模型的原文（超大输出已外置，这里留的是摘要 + 路径）。
+        /// 未执行（被拒绝 / 被拦截）时为 `None`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     /// 等待用户审批（L3 逐步确认 / 高危拦截）。
     AwaitingApproval {
@@ -128,6 +157,7 @@ mod tests {
             outcome: ToolOutcome::Denied,
             ms: 0,
             detail: Some("命中高危规则".into()),
+            output: None,
         };
         let s = serde_json::to_string(&ev).expect("应可序列化");
         match serde_json::from_str::<Event>(&s).expect("应可反序列化") {
@@ -164,6 +194,105 @@ mod tests {
                 assert!(detail.is_none(), "缺省应兜底为 None");
             }
             other => panic!("应为 ToolCallEnd: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_end_keeps_tool_output() {
+        let ev = Event::ToolCallEnd {
+            id: TaskId::new(),
+            call_id: ToolCallId::new(),
+            outcome: ToolOutcome::Failed,
+            ms: 3,
+            detail: Some("系统找不到指定的路径".into()),
+            output: Some("[error] 系统找不到指定的路径".into()),
+        };
+        let s = serde_json::to_string(&ev).expect("应可序列化");
+        match serde_json::from_str::<Event>(&s).expect("应可反序列化") {
+            Event::ToolCallEnd { output, .. } => {
+                assert_eq!(output.as_deref(), Some("[error] 系统找不到指定的路径"));
+            }
+            other => panic!("应为 ToolCallEnd: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_end_accepts_legacy_payload_without_output() {
+        let legacy = r#"{
+            "type": "tool_call_end",
+            "id": "t-1",
+            "call_id": "c-1",
+            "outcome": "failed",
+            "ms": 9,
+            "detail": "boom"
+        }"#;
+        match serde_json::from_str::<Event>(legacy).expect("旧日志应可反序列化") {
+            Event::ToolCallEnd { output, .. } => assert!(output.is_none(), "缺省应兜底为 None"),
+            other => panic!("应为 ToolCallEnd: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_snapshot_roundtrip_keeps_full_messages() {
+        let ev = Event::ContextSnapshot {
+            id: TaskId::new(),
+            iteration: 2,
+            model: "deepseek-flash".into(),
+            messages: vec![
+                Message::system("你是个人助理"),
+                Message::user("介绍下本项目"),
+                Message::assistant("先看看工作区"),
+            ],
+            tools: vec!["list_dir".into(), "file_read".into()],
+        };
+        let s = serde_json::to_string(&ev).expect("应可序列化");
+        match serde_json::from_str::<Event>(&s).expect("应可反序列化") {
+            Event::ContextSnapshot {
+                iteration,
+                model,
+                messages,
+                tools,
+                ..
+            } => {
+                assert_eq!(iteration, 2);
+                assert_eq!(model, "deepseek-flash");
+                assert_eq!(messages.len(), 3);
+                assert_eq!(messages[0].text(), "你是个人助理", "system 必须留下");
+                assert_eq!(tools, vec!["list_dir", "file_read"]);
+            }
+            other => panic!("应为 ContextSnapshot: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_turn_roundtrip_keeps_text_and_calls() {
+        let ev = Event::AssistantTurn {
+            id: TaskId::new(),
+            iteration: 1,
+            text: "我来列一下目录".into(),
+            calls: vec![ToolCall {
+                id: ToolCallId::new(),
+                name: "list_dir".into(),
+                arguments: serde_json::json!({ "path": "." }),
+            }],
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                reasoning_tokens: None,
+                cached_tokens: None,
+            },
+        };
+        let s = serde_json::to_string(&ev).expect("应可序列化");
+        match serde_json::from_str::<Event>(&s).expect("应可反序列化") {
+            Event::AssistantTurn {
+                text, calls, usage, ..
+            } => {
+                assert_eq!(text, "我来列一下目录");
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "list_dir");
+                assert_eq!(usage.total(), 120);
+            }
+            other => panic!("应为 AssistantTurn: {other:?}"),
         }
     }
 }

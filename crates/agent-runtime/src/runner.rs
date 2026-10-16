@@ -19,7 +19,7 @@ use agent_core::perm::{ApprovalRequest, Decision, PermissionEngine};
 use agent_core::provider::{
     ChatRequest, ContentPart, LlmProvider, Message, RequestMeta, Role, StreamEvent, ToolCall, Usage,
 };
-use agent_core::store::Durability;
+use agent_core::store::LogConfig;
 use agent_core::task::{AgentRunner, RunControl, TaskSpec};
 use agent_core::tool::{Tool, ToolCtx};
 use agent_store::JsonlStore;
@@ -56,6 +56,8 @@ pub struct RuntimeDeps {
     pub tool_defs: Vec<agent_core::provider::ToolDef>,
     pub perm: Arc<dyn PermissionEngine>,
     pub store: Arc<JsonlStore>,
+    /// 审计日志落盘策略：决定上下文快照与逐字增量的去留。
+    pub log_cfg: LogConfig,
     /// 审批应答接收端（一次一个，由前端回填）。
     pub approvals: Arc<Mutex<mpsc::Receiver<ApprovalMsg>>>,
     pub context_cfg: ContextConfig,
@@ -76,18 +78,26 @@ impl AgentRuntime {
     }
 
     fn system_prompt(task: &TaskSpec) -> String {
+        // 工具的相对路径基于项目根（没有项目根时就是私有工作区）；
+        // 提示词里给出的必须是同一个目录，否则模型会照着它去猜不存在的路径。
+        let ws = task
+            .project_root
+            .clone()
+            .unwrap_or_else(|| task.workspace.clone());
         format!(
             "你是一个个人助理 Agent，通过工具在用户电脑上完成真实任务。\n\
              【用户任务】{prompt}\n\
-             【工作区】{ws}（所有文件读写必须在此目录内）\n\
+             【工作目录】{ws}（相对路径基于它；所有文件读写必须在此目录内）\n\
              \n\
              规则：\n\
              1. 先思考再行动；能一次调用多个工具就并行调用。\n\
-             2. 产出文件时写入工作区，并在最终回复中列出产物路径。\n\
+             2. 产出文件时写入工作目录，并在最终回复中列出产物路径。\n\
              3. 任务完成时给出简洁总结，不要啰嗦。\n\
-             4. 如果某个操作被拒绝，换一种策略，不要重复同样的调用。",
+             4. 如果某个操作被拒绝，换一种策略，不要重复同样的调用。\n\
+             5. 目标文件/目录不存在或目录为空时，**不要继续猜路径**；\n\
+                直接说明缺什么，向用户索要材料或改用其他思路。",
             prompt = task.prompt,
-            ws = task.workspace,
+            ws = ws,
         )
     }
 
@@ -196,6 +206,18 @@ struct StreamOutcome {
     usage: Usage,
 }
 
+/// 工具执行结果。
+///
+/// 除了回填给模型的内容，还要把**工具原文**带回执行循环：它是审计里唯一
+/// 能回答「工具到底返回了什么」的字段（工具的错误文本只存在于这一路）。
+struct ToolExecuted {
+    /// 回填给模型的内容（大输出已外置，出错时带 `[error]` 前缀）。
+    content: String,
+    /// 工具自报失败（如 `web_search` 未配置后端）。
+    is_error: bool,
+    artifacts: Vec<String>,
+}
+
 #[async_trait]
 impl AgentRunner for AgentRuntime {
     async fn run(
@@ -210,6 +232,7 @@ impl AgentRunner for AgentRuntime {
             provider = %self.deps.provider_name,
             max_iterations = task.max_iterations,
             workspace = %task.workspace,
+            project_root = %task.project_root.clone().unwrap_or_else(|| "-".into()),
             "run start"
         );
         let _ = bus.send(Event::TaskStarted {
@@ -225,6 +248,11 @@ impl AgentRunner for AgentRuntime {
         let mut repeats: std::collections::HashMap<u64, usize> = Default::default();
         let mut no_progress = 0usize;
         let mut spent = 0.0f64;
+        // 审计用：记录真实生效的模型（未显式指定时取 provider 名）。
+        let model = task
+            .model
+            .clone()
+            .unwrap_or_else(|| self.deps.provider_name.clone());
 
         for iteration in 0..task.max_iterations {
             if cancel.is_cancelled() {
@@ -235,6 +263,18 @@ impl AgentRunner for AgentRuntime {
                 return Ok(Outcome::Cancelled);
             }
             cm.maybe_compress();
+
+            // 落盘本轮送往模型的完整上下文（含 system 固定区）。
+            // 放在请求之前：即使本轮流被中断或报错，也知道模型当时看到了什么。
+            if self.deps.log_cfg.save_context {
+                let _ = bus.send(Event::ContextSnapshot {
+                    id: task_id.clone(),
+                    iteration: iteration as u32,
+                    model: model.clone(),
+                    messages: cm.messages().to_vec(),
+                    tools: self.deps.tool_defs.iter().map(|t| t.name.clone()).collect(),
+                });
+            }
 
             let out = match self
                 .stream_once(&bus, &task_id.0, &mut cm, &cancel, &task)
@@ -256,6 +296,16 @@ impl AgentRunner for AgentRuntime {
                     return Err(e);
                 }
             };
+
+            // 本轮模型的完整回复：正文 + 工具调用 + 用量。
+            // 与逐字增量内容重合，但一行即可还原整轮，也是默认的落盘形态。
+            let _ = bus.send(Event::AssistantTurn {
+                id: task_id.clone(),
+                iteration: iteration as u32,
+                text: out.text.clone(),
+                calls: out.calls.clone(),
+                usage: out.usage,
+            });
 
             // 成本累计（简化：按 provider 单价）
             if let Some(price) = self.deps.provider.price("") {
@@ -345,6 +395,7 @@ impl AgentRunner for AgentRuntime {
                             outcome: ToolOutcome::Denied,
                             ms: 0,
                             detail: Some(reason),
+                            output: None,
                         });
                         continue;
                     }
@@ -393,6 +444,7 @@ impl AgentRunner for AgentRuntime {
                                     outcome: ToolOutcome::Rejected,
                                     ms: 0,
                                     detail: Some(reason),
+                                    output: None,
                                 });
                                 continue;
                             }
@@ -410,20 +462,27 @@ impl AgentRunner for AgentRuntime {
                 let ms = started.elapsed().as_millis() as u64;
 
                 match result {
-                    Ok((content, arts)) => {
-                        if !arts.is_empty() {
+                    Ok(r) => {
+                        if !r.artifacts.is_empty() {
                             progressed = true;
-                            for a in arts {
-                                if !artifacts.contains(&a) {
-                                    artifacts.push(a);
+                            for a in &r.artifacts {
+                                if !artifacts.contains(a) {
+                                    artifacts.push(a.clone());
                                 }
                             }
-                        } else if !content.is_empty() {
+                        } else if !r.content.is_empty() {
                             progressed = true;
                         }
+                        // 工具自报失败（is_error）也算失败：以前统一按 Ok 记，
+                        // 「工具返回了错误文本」在日志里反而显示成功。
+                        let outcome = if r.is_error {
+                            ToolOutcome::Failed
+                        } else {
+                            ToolOutcome::Ok
+                        };
                         tool_messages.push(Message {
                             role: Role::Tool,
-                            content: vec![ContentPart::text(content)],
+                            content: vec![ContentPart::text(r.content.clone())],
                             tool_calls: vec![],
                             tool_call_id: Some(call_id.clone()),
                             reasoning: None,
@@ -431,9 +490,16 @@ impl AgentRunner for AgentRuntime {
                         let _ = bus.send(Event::ToolCallEnd {
                             id: task_id.clone(),
                             call_id: call_id.clone(),
-                            outcome: ToolOutcome::Ok,
+                            outcome,
                             ms,
-                            detail: None,
+                            detail: if r.is_error {
+                                Some(r.content.clone())
+                            } else {
+                                None
+                            },
+                            // 工具返回的原文一并落盘：这是事后回答「工具到底
+                            // 返回了什么」的唯一依据。
+                            output: Some(r.content),
                         });
                     }
                     Err(e) => {
@@ -450,6 +516,7 @@ impl AgentRunner for AgentRuntime {
                             outcome: ToolOutcome::Failed,
                             ms,
                             detail: Some(e.to_string()),
+                            output: None,
                         });
                     }
                 }
@@ -556,13 +623,18 @@ impl AgentRuntime {
         task: &TaskSpec,
         cancel: &tokio_util::sync::CancellationToken,
         cm: &mut ContextManager,
-    ) -> Result<(String, Vec<String>), AgentError> {
+    ) -> Result<ToolExecuted, AgentError> {
         let Some(tool) = (self.deps.tools)(&call.name) else {
-            return Ok((format!("[error] unknown tool: {}", call.name), vec![]));
+            return Ok(ToolExecuted {
+                content: format!("[error] unknown tool: {}", call.name),
+                is_error: true,
+                artifacts: vec![],
+            });
         };
 
         let ctx = ToolCtx {
             workspace: std::path::PathBuf::from(&task.workspace),
+            project_root: task.project_root.as_ref().map(std::path::PathBuf::from),
             task_id: task.id.0.clone(),
             timeout: Duration::from_secs(120),
             cancel: cancel.clone(),
@@ -597,29 +669,13 @@ impl AgentRuntime {
             content
         };
 
-        // 审计落盘（区分持久化/临时）
-        let _ = self
-            .deps
-            .store
-            .record(
-                &agent_core::ids::SessionId(task.id.0.clone()),
-                &task.id,
-                Durability::Transient,
-                Event::ToolCallEnd {
-                    id: task.id.clone(),
-                    call_id: call.id.clone(),
-                    outcome: if out.is_error {
-                        ToolOutcome::Failed
-                    } else {
-                        ToolOutcome::Ok
-                    },
-                    ms: 0,
-                    detail: None,
-                },
-            )
-            .await;
-
-        Ok((content, arts))
+        // 注意：这里**不落盘**。事件一律由执行循环统一发到总线，
+        // 交给 `agent_store::recorder` 单点裁决，避免同一条事件被写两遍。
+        Ok(ToolExecuted {
+            content,
+            is_error: out.is_error,
+            artifacts: arts,
+        })
     }
 }
 
@@ -629,4 +685,494 @@ fn hash_call(call: &ToolCall) -> u64 {
     // 规范化参数（serde_json::Value 的 Hash 对对象顺序不敏感）
     call.arguments.to_string().hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::event::event_bus;
+    use agent_core::ids::SessionId;
+    use agent_core::perm::{Decision, PermissionEngine, Risk};
+    use agent_core::provider::{
+        BoxStream, Capabilities, ChatResponse, FinishReason, LlmError, ModelPrice, StreamEvent,
+        ToolDef,
+    };
+    use agent_core::store::Store;
+    use agent_core::tool::{ToolError, ToolOutput};
+    use futures::stream;
+    use std::path::PathBuf;
+
+    /// 按脚本吐流式事件的假 provider：每轮取走一条剧本。
+    struct ScriptedProvider {
+        turns: Mutex<Vec<Vec<StreamEvent>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedProvider {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
+            Err(LlmError::InvalidRequest("tests use chat_stream".into()))
+        }
+        async fn chat_stream(
+            &self,
+            _req: ChatRequest,
+        ) -> Result<BoxStream<Result<StreamEvent, LlmError>>, LlmError> {
+            let mut turns = self.turns.lock().await;
+            let turn = if turns.is_empty() {
+                Vec::new()
+            } else {
+                turns.remove(0)
+            };
+            Ok(Box::pin(stream::iter(turn.into_iter().map(Ok))))
+        }
+        fn price(&self, _model: &str) -> Option<ModelPrice> {
+            None
+        }
+    }
+
+    /// 固定返回的工具：`fail` 为真时自报失败。
+    struct FixedTool {
+        name: &'static str,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Tool for FixedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "测试用固定输出工具"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn risk_level(&self) -> Risk {
+            Risk::Low
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            if self.fail {
+                Ok(ToolOutput::err("工具自报失败"))
+            } else {
+                Ok(ToolOutput::ok("工具原文输出"))
+            }
+        }
+    }
+
+    /// 回报自己看到的沙箱根：用于验证 runner → ToolCtx 的接线。
+    struct SandboxProbe;
+
+    #[async_trait]
+    impl Tool for SandboxProbe {
+        fn name(&self) -> &str {
+            "sandbox_probe"
+        }
+        fn description(&self) -> &str {
+            "回报工具沙箱根"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn risk_level(&self) -> Risk {
+            Risk::Low
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok(ctx.sandbox_root().display().to_string()))
+        }
+    }
+
+    struct AllowAll;
+
+    #[async_trait]
+    impl PermissionEngine for AllowAll {
+        async fn check(&self, _call: &ToolCall, _task: &TaskSpec) -> Decision {
+            Decision::Allow
+        }
+    }
+
+    /// 装配一个「脚本化 provider + 固定输出工具」的运行时。
+    ///
+    /// 返回 (运行时, store, 临时根目录)；工作区固定为 `<临时根>/workspace`。
+    fn make_runtime(
+        turns: Vec<Vec<StreamEvent>>,
+        log_cfg: LogConfig,
+    ) -> (AgentRuntime, Arc<JsonlStore>, PathBuf) {
+        let tmp = std::env::temp_dir().join(format!("agent-rt-log-{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(FixedTool {
+                name: "ok_tool",
+                fail: false,
+            }),
+            Arc::new(FixedTool {
+                name: "fail_tool",
+                fail: true,
+            }),
+        ];
+        let defs: Vec<ToolDef> = tools
+            .iter()
+            .map(|t| ToolDef {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters(),
+            })
+            .collect();
+        let lookup: ToolLookup = Arc::new(move |name: &str| {
+            let ok: Arc<dyn Tool> = Arc::new(FixedTool {
+                name: "ok_tool",
+                fail: false,
+            });
+            let bad: Arc<dyn Tool> = Arc::new(FixedTool {
+                name: "fail_tool",
+                fail: true,
+            });
+            match name {
+                "ok_tool" => Some(ok),
+                "fail_tool" => Some(bad),
+                "sandbox_probe" => Some(Arc::new(SandboxProbe)),
+                _ => None,
+            }
+        });
+        let (_ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(1);
+
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: Arc::new(ScriptedProvider {
+                turns: Mutex::new(turns),
+            }),
+            provider_name: "scripted".into(),
+            tools: lookup,
+            tool_defs: defs,
+            perm: Arc::new(AllowAll),
+            store: store.clone(),
+            log_cfg,
+            approvals: Arc::new(Mutex::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            batch_approve: None,
+            per_task_budget: 0.0,
+        });
+        (runtime, store, tmp)
+    }
+
+    /// 跑一次任务，返回总线上收到的全部事件。
+    async fn run_scripted(turns: Vec<Vec<StreamEvent>>) -> (Vec<Event>, Outcome) {
+        let (runtime, _store, tmp) = make_runtime(turns, LogConfig::default());
+        let bus = event_bus();
+        let mut sub = bus.subscribe();
+        let mut spec = TaskSpec::new("介绍下本项目", tmp.join("workspace").display().to_string());
+        spec.max_iterations = 4;
+        let outcome = runtime.run(spec, bus, RunControl::new()).await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = sub.try_recv() {
+            events.push(ev);
+        }
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        (events, outcome)
+    }
+
+    fn tool_call(index: usize, id: &str, name: &str) -> StreamEvent {
+        StreamEvent::ToolCallDelta {
+            index,
+            id: Some(agent_core::ids::ToolCallId(id.to_string())),
+            name: Some(name.to_string()),
+            args_delta: "{}".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_full_context_and_tool_output() {
+        // 第一轮：说话 + 调两个工具（一个成功、一个自报失败）；第二轮：纯文本收尾。
+        let (events, outcome) = run_scripted(vec![
+            vec![
+                StreamEvent::TextDelta("我先看看工作区".into()),
+                tool_call(0, "c1", "ok_tool"),
+                tool_call(1, "c2", "fail_tool"),
+                StreamEvent::Usage(Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    reasoning_tokens: None,
+                    cached_tokens: None,
+                }),
+                StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+            ],
+            vec![
+                StreamEvent::TextDelta("工作区是空的".into()),
+                StreamEvent::Usage(Usage {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                    reasoning_tokens: None,
+                    cached_tokens: None,
+                }),
+                StreamEvent::Done(agent_core::provider::FinishReason::Stop),
+            ],
+        ])
+        .await;
+        assert!(matches!(outcome, Outcome::Success { .. }));
+
+        let snapshots: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ContextSnapshot {
+                    iteration,
+                    model,
+                    messages,
+                    tools,
+                    ..
+                } => Some((*iteration, model.clone(), messages.clone(), tools.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(snapshots.len(), 2, "每轮都要留一份上下文快照");
+        // 第 0 轮：system + user
+        assert_eq!(snapshots[0].2.len(), 2);
+        assert!(
+            snapshots[0].2[0].text().contains("个人助理 Agent"),
+            "system 固定区必须留存：{}",
+            snapshots[0].2[0].text()
+        );
+        assert_eq!(snapshots[0].2[1].text(), "介绍下本项目");
+        // 第 1 轮：system + user + assistant + 2 条工具结果
+        assert_eq!(snapshots[1].2.len(), 5, "工具结果应回填进下一轮上下文");
+        assert_eq!(snapshots[1].0, 1);
+        assert_eq!(snapshots[1].1, "scripted");
+        assert_eq!(snapshots[1].3.len(), 2, "可用工具名要记录");
+
+        let turns: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::AssistantTurn {
+                    iteration,
+                    text,
+                    calls,
+                    ..
+                } => Some((*iteration, text.clone(), calls.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0], (0, "我先看看工作区".to_string(), 2));
+        assert_eq!(turns[1], (1, "工作区是空的".to_string(), 0));
+
+        let ends: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolCallEnd {
+                    outcome,
+                    detail,
+                    output,
+                    ..
+                } => Some((*outcome, detail.clone(), output.clone())),
+                _ => None,
+            })
+            .collect();
+        // 回归：曾经 execute_tool 直写 store、总线订阅者再写一遍，导致每条落两遍。
+        assert_eq!(ends.len(), 2, "两次工具调用 → 两条终结事件，不得重复");
+        let ok = ends.iter().find(|(o, _, _)| *o == ToolOutcome::Ok).unwrap();
+        assert_eq!(ok.2.as_deref(), Some("工具原文输出"), "工具原文要落盘");
+        let bad = ends
+            .iter()
+            .find(|(o, _, _)| *o == ToolOutcome::Failed)
+            .unwrap();
+        assert_eq!(
+            bad.2.as_deref(),
+            Some("[error] 工具自报失败"),
+            "工具自报失败也要留下原文"
+        );
+        assert_eq!(bad.1.as_deref(), Some("[error] 工具自报失败"));
+    }
+
+    #[tokio::test]
+    async fn context_snapshot_is_skipped_when_disabled() {
+        let (runtime, _store, tmp) = make_runtime(
+            vec![vec![StreamEvent::TextDelta("hi".into())]],
+            LogConfig {
+                save_context: false,
+                save_stream_deltas: false,
+            },
+        );
+        let bus = event_bus();
+        let mut sub = bus.subscribe();
+        let mut spec = TaskSpec::new("t", tmp.join("workspace").display().to_string());
+        spec.max_iterations = 2;
+        let _ = runtime.run(spec, bus, RunControl::new()).await.unwrap();
+
+        let mut snapshots = 0;
+        let mut turns = 0;
+        while let Ok(ev) = sub.try_recv() {
+            match ev {
+                Event::ContextSnapshot { .. } => snapshots += 1,
+                Event::AssistantTurn { .. } => turns += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(snapshots, 0, "关闭后不再记录上下文");
+        assert_eq!(turns, 1, "整轮回复不受影响");
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// 端到端：runner → 总线 → recorder → jsonl。
+    ///
+    /// 前两个用例只验证「事件发出去了」，这里验证「确实写进文件、且没写多余内容」。
+    #[tokio::test]
+    async fn recorder_writes_context_and_tool_output_to_jsonl() {
+        let (runtime, store, tmp) = make_runtime(
+            vec![
+                vec![
+                    StreamEvent::TextDelta("我先看看工作区".into()),
+                    tool_call(0, "c1", "ok_tool"),
+                    StreamEvent::Usage(Usage {
+                        input_tokens: 5,
+                        output_tokens: 1,
+                        reasoning_tokens: None,
+                        cached_tokens: None,
+                    }),
+                    StreamEvent::Done(FinishReason::ToolCalls),
+                ],
+                vec![
+                    StreamEvent::TextDelta("看完了".into()),
+                    StreamEvent::Usage(Usage::default()),
+                    StreamEvent::Done(FinishReason::Stop),
+                ],
+            ],
+            LogConfig::default(),
+        );
+        let bus = event_bus();
+        let mut spec = TaskSpec::new("介绍下本项目", tmp.join("workspace").display().to_string());
+        spec.max_iterations = 4;
+        let tid = spec.id.clone();
+        let sid = SessionId(tid.0.clone());
+
+        agent_store::spawn_event_sink(bus.clone(), store.clone(), LogConfig::default(), None);
+        runtime.run(spec, bus, RunControl::new()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let session = store.load_session(&sid).await.unwrap();
+        let kinds: Vec<&str> = session
+            .events
+            .iter()
+            .map(|e| match &e.payload {
+                Event::TaskStarted { .. } => "task_started",
+                Event::ContextSnapshot { .. } => "context_snapshot",
+                Event::AssistantTurn { .. } => "assistant_turn",
+                Event::ToolCallStart { .. } => "tool_call_start",
+                Event::ToolCallEnd { .. } => "tool_call_end",
+                Event::TaskFinished { .. } => "task_finished",
+                Event::TextDelta { .. } => "text_delta",
+                other => panic!("不该落盘的事件: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "task_started",
+                "context_snapshot",
+                "assistant_turn",
+                "tool_call_start",
+                "tool_call_end",
+                "context_snapshot",
+                "assistant_turn",
+                "task_finished",
+            ]
+        );
+
+        // 上下文快照带着 system 提示词一起落盘
+        let snap = session.events[1].payload.clone();
+        match snap {
+            Event::ContextSnapshot {
+                messages, tools, ..
+            } => {
+                assert!(messages[0].text().contains("个人助理 Agent"));
+                assert_eq!(messages[1].text(), "介绍下本项目");
+                assert_eq!(tools.len(), 2);
+            }
+            other => panic!("应为 ContextSnapshot: {other:?}"),
+        }
+        // 工具返回原文落盘
+        match &session.events[4].payload {
+            Event::ToolCallEnd { output, .. } => {
+                assert_eq!(output.as_deref(), Some("工具原文输出"));
+            }
+            other => panic!("应为 ToolCallEnd: {other:?}"),
+        }
+        // 逻辑时钟单调（seq 由 store 统一分配）
+        let seqs: Vec<u64> = session.events.iter().map(|e| e.clock.seq).collect();
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "seq 应单调递增：{seqs:?}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// 修 P0 的关键接线：项目根必须一路传到工具，否则工具还是在空工作区里干活。
+    #[tokio::test]
+    async fn tools_see_the_project_root_not_the_private_workspace() {
+        let (runtime, _store, tmp) = make_runtime(
+            vec![
+                vec![
+                    tool_call(0, "c1", "sandbox_probe"),
+                    StreamEvent::Usage(Usage::default()),
+                    StreamEvent::Done(FinishReason::ToolCalls),
+                ],
+                vec![
+                    StreamEvent::TextDelta("好了".into()),
+                    StreamEvent::Usage(Usage::default()),
+                    StreamEvent::Done(FinishReason::Stop),
+                ],
+            ],
+            LogConfig::default(),
+        );
+        let project = tmp.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let bus = event_bus();
+        let mut sub = bus.subscribe();
+        let mut spec = TaskSpec::new("介绍下本项目", tmp.join("workspace").display().to_string());
+        spec.project_root = Some(project.display().to_string());
+        spec.max_iterations = 4;
+        let _ = runtime.run(spec, bus, RunControl::new()).await.unwrap();
+
+        let mut probe = None;
+        while let Ok(ev) = sub.try_recv() {
+            if let Event::ToolCallEnd { output, .. } = ev {
+                probe = output;
+            }
+        }
+        assert_eq!(
+            probe.as_deref(),
+            Some(project.display().to_string().as_str()),
+            "工具的沙箱根必须是项目根，而不是私有工作区"
+        );
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[test]
+    fn system_prompt_points_at_project_root() {
+        let mut spec = TaskSpec::new("介绍下本项目", "/private/workspace/t1");
+        spec.project_root = Some("/home/u/proj/zero".into());
+        let p = AgentRuntime::system_prompt(&spec);
+        assert!(p.contains("/home/u/proj/zero"), "提示词应给项目根: {p}");
+        assert!(
+            !p.contains("/private/workspace/t1"),
+            "不应漏私有工作区: {p}"
+        );
+        // 提示词与工具行为一致：目标不存在时别再猜路径。
+        assert!(p.contains("不要继续猜路径"), "提示词应约束盲目重试: {p}");
+    }
 }

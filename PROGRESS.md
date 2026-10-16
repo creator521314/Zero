@@ -27,14 +27,19 @@
 | `agent-net` | SSRF 阻断内网/非 http(s)；放行公网 |
 | `agent-perm::rules` | 8 类高危命令命中；4 类正常命令放行；受保护路径 |
 | `agent-perm` | L1 高危拦截；L2 无审视器降级；L3 逐个确认 + 批量批准 |
-| `agent-tools::paths` | `../` 逃逸拒绝；工作区内路径接受 |
+| `agent-tools::paths` | `../` 逃逸拒绝；工作区内路径接受；项目根为基准；私有工作区仍可达；Windows 盘符大小写/斜杠方向不误判 |
 | `agent-tools::web` | HTML 标签与 script 剥离 |
+| `agent-tools::shell` | 本平台解释器能起命令；非 0 退出码标为错误；描述串与平台一致 |
+| `agent-tools::fs_tools` | 相对路径落到项目根；无项目根时退回私有工作区；空目录明说；读目录给出替代工具 |
 | `agent-providers` | tool 消息转换；assistant tool_call 转换（arguments 必须为字符串） |
 | `agent-runtime::context` | 上下文压缩保留固定区并生成摘要 |
 | `agent-tui::app` | 多字节字符编辑；流式增量合并为一行；空输入不提交；工具四态流转（含迟到事件不覆盖已终结行） |
 | `agent-tui::theme` | 权限档位 → 徽章色/文案映射（三态、大小写不敏感） |
 | `agent-tui::render` | 六类消息符号与缩进；工具四态符号/耗时/原因（多行压单行、超长截断）；工具名固定列对齐（含中文宽度）；宽字符 wrap 行数；鼠标区段分流；`TestBackend` 渲染快照 |
 | `agent-store` | 追加 + 重载；逻辑时钟单调；durability 保留 |
+| `agent-store::recorder` | 落盘分类（持久/临时/不落）；总线滞后跳过而不退出；每条事件只落一次；增量默认不落 |
+| `agent-core::event` | 上下文快照与整轮回复往返；工具输出留存；旧日志缺字段时兜底 |
+| `agent-runtime::runner` | 每轮记录上下文快照与整轮回复；工具原文 + 自报失败 → Failed；关闭时不记录快照；项目根传到工具；提示词指向项目根且约束盲目重试 |
 
 ## M1 验收标准
 
@@ -50,7 +55,7 @@
 
 ### 规模
 
-- Rust 源文件 36 个，约 **5200 行**
+- Rust 源文件 39 个，约 **8900 行**（含测试模块）
 - 9 个库 crate + 2 个二进制 + xtask
 
 ## TUI 界面改造（P0 已完成）
@@ -152,6 +157,72 @@ cmd_rx.recv() ──► Command::SubmitTask ──► runtime.run().await ─┐
 
 **回归保护**：新增 3 个单测（重复去重、内容不同保留、正文为空时保留思考链）；
 `agent-providers` 33 passed / 0 failed，全量 **121 passed / 0 failed**。
+
+## 日志增强：对话上下文入审计流（2026-10-16）
+
+**动机**：定位「工具为什么没跑成」时，日志里只有 `tool_call_start/end`
+与一堆逐字增量，三个关键问题都答不上来：模型当时**看到了什么**、**回了什么**、
+**工具返回了什么**。逐字增量占了 95% 的体积（21 次工具调用 ≈ 400KB /
+687 条事件），却是最没信息量的那部分。
+
+**改动**：
+
+| 项 | 位置 |
+|---|---|
+| 新增 `LogConfig`（`save_context` / `save_stream_deltas`） | `agent-core/src/store.rs` |
+| 新增 `Event::ContextSnapshot`（system + 全部历史消息 + 可用工具） | `agent-core/src/event.rs` |
+| 新增 `Event::AssistantTurn`（正文 + 工具调用 + 用量） | 同上 |
+| `Event::ToolCallEnd` 增加 `output`（工具返回原文） | 同上 |
+| 落盘规则集中到 `classify` + `spawn_event_sink`（含滞后容错） | `agent-store/src/recorder.rs` |
+| 每轮请求前记录快照、请求后记录整轮回复；工具原文回传执行循环 | `agent-runtime/src/runner.rs` |
+| CLI / server 统一接入 recorder（不再各处手写落盘） | `apps/agent-*` |
+| `[log]` 配置段 + `cargo xtask log`（`--full` / `--errors`） | `config/*` + `xtask/src/log_view.rs` |
+
+**顺带修掉的两个缺陷**：
+
+1. **同一条事件落两遍**：`execute_tool` 曾直写 store，总线订阅者又写一遍，
+   成功的 `ToolCallEnd` 在 jsonl 里成对出现（且两处结论相反：store 记
+   `Failed`、总线记 `Ok`）。现在事件一律只从总线走，落盘单点裁决。
+2. **工具自报失败被记成成功**：工具返回 `is_error=true`（如 `web_search`
+   未配置后端）时，结局曾是 `Ok`。现在统一判 `Failed` 并带上原文。
+
+**兼容性**：`output` 带 `#[serde(default)]`，新字段缺失时兜底为 `None`，
+旧 jsonl 仍可反序列化（已用 10-16 的历史日志验证阅读器输出正常）。
+
+**验收**：`cargo xtask check` 通过（fmt + clippy 0 warning + 测试）；
+`cargo test --workspace` **130 passed / 0 failed**（新增 11 个）。
+
+## P0 修复：让工具真正作用于项目（2026-10-16）
+
+**症状**：连续三次会话「介绍当前项目」，工具失败率 8/11；`list_dir` 全部
+返回空，`file_read` 全部报「文件不存在」，`shell_exec` 100% spawn 失败，
+模型最后只能回答「工作区里没有项目文件」。
+
+**根因 A —— 工作区从来就不是项目目录**：每提交一个任务就
+`create_dir_all` 一个全新的空目录 `<root>/workspace/<uuid>`，路径护栏又
+把读写锁死在里面，于是「当前文件夹」= 一个刚创建的空文件夹。
+
+**根因 B —— `shell_exec` 硬编码 `/bin/sh`**：Windows 上没有它，每次调用
+在 spawn 阶段就失败（os error 3），模型想用 `ls`/`dir` 兜底的路全部落空。
+
+**改动**：
+
+| 项 | 位置 |
+|---|---|
+| `TaskSpec.project_root`（可选）+ `ToolCtx.project_root` | `agent-core/src/{task,tool}.rs` |
+| `ToolCtx::sandbox_root` / `allowed_roots`（双根） | 同上 |
+| 多根解析 `resolve_in` / `resolve_in_ctx`；Windows 盘符大小写与斜杠方向不参与路径语义 | `agent-tools/src/paths.rs` |
+| `#[cfg(windows)]` → `cmd /C`（并切 65001 代码页取 UTF-8 输出）；工具描述随平台变 | `agent-tools/src/shell.rs` |
+| 相对路径基于项目根；空目录明说；读目录给出「请用 list_dir」 | `agent-tools/src/fs_tools.rs` |
+| 提示词给项目根 + 「目标不存在别再猜路径」 | `agent-runtime/src/runner.rs` |
+| `agent.project_root`（默认 `.` = 启动目录）+ 目录不存在时告警 | `agent-providers/src/config.rs` |
+
+**为什么是两个根**：项目根只负责工具读写；`ctx/` 外置输出等私有数据仍放
+`<root>/workspace/<task-id>`，不会在用户仓库里留垃圾。私有工作区始终保持
+可达，否则外置到 `ctx/` 的内容连工具自己也读不回来。
+
+**验收**：`cargo xtask check` 通过；新增 13 个单测（含 3 个真实进程 /
+真实 IO 用例），`cargo test --workspace` **143 passed / 0 failed**。
 
 ## 已知限制（一期）
 

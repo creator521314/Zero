@@ -17,8 +17,8 @@ use std::path::Path;
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 
 use crate::config::{
-    AgentConfig, Budget, ConfigError, ProviderConfig, ProvidersFile, RouterConfig, SearchConfig,
-    EXAMPLE_TOML,
+    AgentConfig, Budget, ConfigError, LogConfig, ProviderConfig, ProvidersFile, RouterConfig,
+    SearchConfig, EXAMPLE_TOML,
 };
 
 /// 预置 provider 模板。
@@ -166,6 +166,7 @@ pub fn run_first_time() -> anyhow::Result<ProvidersFile> {
         budget: Budget::default(),
         search: SearchConfig::default(),
         agent: AgentConfig::default(),
+        log: LogConfig::default(),
     };
 
     confirm_and_write(&cfg, false)?;
@@ -200,6 +201,7 @@ pub fn run_invalid(existing: &Path, reason: &str) -> anyhow::Result<ProvidersFil
         budget: Budget::default(),
         search: SearchConfig::default(),
         agent: AgentConfig::default(),
+        log: LogConfig::default(),
     };
 
     confirm_and_write(&cfg, true)?;

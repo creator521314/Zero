@@ -29,8 +29,14 @@ pub struct TaskSpec {
     /// 用户原始任务描述（system 中固化，永不丢弃）。
     pub prompt: String,
     pub tier: PermissionTier,
-    /// 工作区根目录。
+    /// 每任务私有工作区：外置输出等**系统数据**落在里面。
     pub workspace: String,
+    /// 项目根目录（可选）：工具的读写沙箱，也是相对路径的基准。
+    ///
+    /// 为空时沿用 `workspace`——那是一个每任务新建的空目录，Agent 因此
+    /// 看不见用户的真实项目（历史上「介绍当前项目」全部工具失败的根因）。
+    #[serde(default)]
+    pub project_root: Option<String>,
     /// 模型覆盖（None 走路由默认）。
     pub model: Option<String>,
     /// 该任务的最大迭代数。
@@ -49,6 +55,7 @@ impl TaskSpec {
             prompt,
             tier: PermissionTier::L2,
             workspace: workspace.into(),
+            project_root: None,
             model: None,
             max_iterations: 25,
             budget_usd: None,

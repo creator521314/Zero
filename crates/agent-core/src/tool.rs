@@ -8,14 +8,39 @@ use std::time::Duration;
 use crate::perm::Risk;
 use tokio_util::sync::CancellationToken;
 
-/// 工具执行上下文：提供工作区根、超时与取消令牌。
+/// 工具执行上下文：提供沙箱根、超时与取消令牌。
 #[derive(Clone)]
 pub struct ToolCtx {
-    /// 工作区根目录（工具只能在其中读写；shell 的 cwd 锁定于此）。
+    /// 每任务私有工作区：外置输出等系统数据落在里面，不受项目根影响。
     pub workspace: PathBuf,
+    /// 项目根目录（可选）：工具的读写沙箱，相对路径以它为基准。
+    ///
+    /// 为空时沙箱就是 `workspace`（每任务一个空目录）。
+    pub project_root: Option<PathBuf>,
     pub task_id: String,
     pub timeout: Duration,
     pub cancel: CancellationToken,
+}
+
+impl ToolCtx {
+    /// 工具沙箱根：项目根优先，否则私有工作区。
+    pub fn sandbox_root(&self) -> PathBuf {
+        self.project_root
+            .clone()
+            .unwrap_or_else(|| self.workspace.clone())
+    }
+
+    /// 允许访问的根集合。
+    ///
+    /// 私有工作区始终在内：否则外置到 `ctx/` 的内容工具自己也读不回来。
+    pub fn allowed_roots(&self) -> Vec<PathBuf> {
+        let sandbox = self.sandbox_root();
+        let mut roots = vec![sandbox.clone()];
+        if self.workspace != sandbox {
+            roots.push(self.workspace.clone());
+        }
+        roots
+    }
 }
 
 /// 工具产出的一个文件（用于产物登记与审计）。
