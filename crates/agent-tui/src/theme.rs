@@ -65,6 +65,10 @@ pub mod glyph {
     pub const REASONING: &str = "⋯";
     /// 系统提示。
     pub const SYSTEM: &str = "·";
+    /// 发送（输入框右侧指示器，空闲态）。
+    pub const SEND: &str = "⏎";
+    /// 工作指示器（输入框右侧，运行态）的旋转帧。
+    pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 }
 
 /// 权限档位 → header 徽章的底色（三态语义与 iCode approval badge 一致）。

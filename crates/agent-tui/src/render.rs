@@ -12,6 +12,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::layout::Alignment;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line as RtLine, Span, Text};
@@ -600,6 +601,15 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Rounded)
         .title(Span::styled(" 输入 ", Style::default().fg(ink::PRIMARY)))
         .border_style(Style::default().fg(ink::PRIMARY));
+    // 边框单独画：内容区与右侧指示器是两个独立区域，各画各的，
+    // 指示器才不会被横向滚动带走。
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let indicator = send_indicator(app);
+    // 宽度固定：两种文案长度不同，若跟着变，内容区宽度就会来回抖。
+    let ind_w = SEND_COL as u16;
+    let content_w = inner.width.saturating_sub(ind_w);
 
     // 软光标：把 buffer 按光标切成 前 / 光标处 / 后 三段，光标处用反显。
     // 不依赖 f.set_cursor_position()——alternate screen 下 Windows Terminal
@@ -613,13 +623,11 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 
     // 输入框是单行且不 wrap：内容超过框宽时靠**横向滚动**保证光标可见，
     // 否则超长输入直接被裁掉、光标也跑出视野（之前正是如此）。
-    let inner_w = area.width.saturating_sub(2) as usize;
     let cursor_col = UnicodeWidthStr::width(before.as_str());
 
     let mut spans: Vec<Span> = Vec::new();
     if buf.is_empty() {
-        // 空输入：软光标 + 占位文字 + 反显 pill。
-        // 只提示**已实现**的功能（Enter 发送），避免误导。
+        // 空输入：软光标 + 占位文字（Enter 的提示在右侧指示器上）。
         spans.push(cursor_cell(app.cursor_visible, ' '));
         spans.extend(placeholder_spans());
     } else {
@@ -628,13 +636,52 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw(after.as_str()));
     }
     // 光标 + 光标块占 cursor_col+1 列；放不下就往右滚，让光标贴右沿。
-    // inner_w 为 0（极端窄终端）时 saturating_sub 自然得到 0。
-    let hscroll = (cursor_col + 1).saturating_sub(inner_w) as u16;
+    let hscroll = (cursor_col + 1).saturating_sub(content_w as usize) as u16;
 
-    let p = Paragraph::new(RtLine::from(spans))
-        .block(block)
-        .scroll((0, hscroll));
-    f.render_widget(p, area);
+    let content = Rect {
+        width: content_w,
+        ..inner
+    };
+    f.render_widget(
+        Paragraph::new(RtLine::from(spans)).scroll((0, hscroll)),
+        content,
+    );
+
+    // 指示器贴右沿，固定不动。
+    let ind_area = Rect {
+        x: inner.x.saturating_add(content_w),
+        width: ind_w,
+        ..inner
+    };
+    f.render_widget(
+        Paragraph::new(indicator).alignment(Alignment::Right),
+        ind_area,
+    );
+}
+
+/// 输入框右侧指示器的固定显示宽度（列）。
+///
+/// 两种文案一长一短，宽度若跟着变，内容区就会在状态切换时来回抖。
+const SEND_COL: usize = 11;
+
+/// 输入框右侧的发送指示器。
+///
+/// - 工作中：spinner + `working`（橙）——此时提交也是排队，不该显得可点；
+/// - 空闲且有输入：**可发送**（绿）；
+/// - 空闲但空输入：灰（空输入不提交）。
+fn send_indicator(app: &App) -> Span<'static> {
+    if app.is_working() {
+        return Span::styled(
+            format!(" {} working ", app.spinner()),
+            Style::default().fg(ink::WARNING),
+        );
+    }
+    let style = if app.input.buffer.trim().is_empty() {
+        Style::default().fg(ink::FG_MUTED)
+    } else {
+        Style::default().fg(ink::SUCCESS)
+    };
+    Span::styled(format!(" {} 发送 ", glyph::SEND), style)
 }
 
 /// 工具名在列表中的固定显示列宽（超出截断，不足补空格）。
@@ -686,19 +733,13 @@ fn cursor_cell(visible: bool, ch: char) -> Span<'static> {
     span
 }
 
-/// 空输入时的占位提示：灰字 + 反显 pill。
+/// 空输入时的占位提示。
 ///
-/// 只提示**已实现**的功能，避免出现「提示了却做不到」的入口。
+/// 只提示**已实现**的功能，避免出现「提示了却做不到」的入口；Enter 的提示
+/// 交给右侧的发送指示器（见 [`send_indicator`]），这里不重复。
 fn placeholder_spans() -> Vec<Span<'static>> {
     let hint = Style::default().fg(ink::FG_MUTED);
-    let pill = Style::default()
-        .fg(ink::FG)
-        .add_modifier(Modifier::REVERSED);
-    vec![
-        Span::styled(" 输入任务… ", hint),
-        Span::styled(" ⏎ ", pill),
-        Span::styled(" 发送", hint),
-    ]
+    vec![Span::styled(" 输入任务… ", hint)]
 }
 
 /// 把一行按显示宽度软换行成多行（保留样式，不丢字符）。
@@ -1156,10 +1197,9 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_spans_hint_enter_only() {
+    fn placeholder_spans_have_no_unimplemented_prefixes() {
         let spans = placeholder_spans();
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(joined.contains("⏎"), "应提示 Enter: {joined:?}");
         // 只提示已实现的功能，不应出现尚未落地的前缀入口。
         for not_yet in ["/", "@", "!", "$", "#"] {
             assert!(
@@ -1167,6 +1207,71 @@ mod tests {
                 "P0 不应提示未实现入口 {not_yet}: {joined:?}"
             );
         }
+    }
+    // ---- 输入框右侧的发送指示器 ----
+
+    #[test]
+    fn send_indicator_ready_when_idle_with_input() {
+        let mut app = App::default();
+        app.input.buffer = "写个脚本".into();
+        let s = send_indicator(&app);
+        assert!(s.content.contains("发送"), "{:?}", s.content);
+        assert_eq!(s.style.fg, Some(ink::SUCCESS), "有输入时应是可发送的绿");
+    }
+
+    #[test]
+    fn send_indicator_muted_when_input_empty() {
+        // 空输入不提交，指示器不该显得可点。
+        let app = App::default();
+        assert_eq!(send_indicator(&app).style.fg, Some(ink::FG_MUTED));
+    }
+
+    #[test]
+    fn send_indicator_shows_working_while_task_runs() {
+        use agent_core::ids::TaskId;
+        let mut app = App::default();
+        app.apply_event(Event::TaskStarted {
+            id: TaskId::new(),
+            title: "t".into(),
+        });
+        let s = send_indicator(&app);
+        assert!(s.content.contains("working"), "{:?}", s.content);
+        assert_eq!(s.style.fg, Some(ink::WARNING));
+    }
+
+    #[test]
+    fn send_indicator_back_to_ready_after_task_finished() {
+        use agent_core::event::Outcome;
+        use agent_core::ids::TaskId;
+        let mut app = App::default();
+        let id = TaskId::new();
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
+        assert!(send_indicator(&app).content.contains("working"));
+        app.apply_event(Event::TaskFinished {
+            id,
+            outcome: Outcome::Success {
+                summary: "done".into(),
+                artifacts: vec![],
+            },
+        });
+        assert!(
+            !send_indicator(&app).content.contains("working"),
+            "任务结束后应回到可发送态"
+        );
+    }
+
+    #[test]
+    fn spinner_advances_with_ticks() {
+        let mut app = App::default();
+        let first = app.spinner();
+        let moved = (0..3).any(|_| {
+            app.on_tick();
+            app.spinner() != first
+        });
+        assert!(moved, "spinner 应随 tick 转动");
     }
 
     // ---- 审批弹层字段行 ----

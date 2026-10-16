@@ -6,6 +6,8 @@ use agent_core::perm::ApprovalRequest;
 use agent_core::task::TaskSpec;
 use tokio::sync::mpsc;
 
+use crate::theme::glyph;
+
 /// 一条对话行。
 #[derive(Debug, Clone)]
 pub enum Line {
@@ -134,6 +136,8 @@ pub struct App {
     pub cursor_visible: bool,
     /// 上次翻转软光标的时刻。
     cursor_last_blink: std::time::Instant,
+    /// 帧计数（每 tick +1）：驱动工作指示器的旋转帧。
+    tick: u32,
     /// 编排层事件流是否已断开（用于只提示一次，避免每帧刷屏）。
     backend_down: bool,
     /// 请求下一帧整屏重绘（实现为 `Terminal::clear()`，见 render.rs）。
@@ -178,6 +182,7 @@ impl Default for App {
             follow: true,
             cursor_visible: true,
             cursor_last_blink: std::time::Instant::now(),
+            tick: 0,
             backend_down: false,
             needs_repaint: false,
             log_path: None,
@@ -362,11 +367,24 @@ impl App {
 
     /// 每个渲染 tick 调用一次：到点则翻转软光标可见性。
     pub fn on_tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
         let elapsed = self.cursor_last_blink.elapsed().as_millis() as u64;
         if elapsed >= Self::CURSOR_BLINK_MS {
             self.cursor_visible = !self.cursor_visible;
             self.cursor_last_blink = std::time::Instant::now();
         }
+    }
+
+    /// agent 是否正在工作（有活动任务）。
+    ///
+    /// 等待审批**不算**工作——那时是球在用户手里。
+    pub fn is_working(&self) -> bool {
+        self.active_task.is_some() && self.pending.is_none()
+    }
+
+    /// 工作指示器当前的旋转帧（由 tick 驱动）。
+    pub fn spinner(&self) -> &'static str {
+        glyph::SPINNER[(self.tick % glyph::SPINNER.len() as u32) as usize]
     }
 
     /// 任意键盘活动后立即使光标常亮（避免闪到一半被按键打断的突兀感）。
