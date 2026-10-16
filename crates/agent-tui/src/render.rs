@@ -530,16 +530,17 @@ fn build_conversation_lines(items: &[Line], inner_w: usize) -> Vec<RtLine<'stati
 fn draw_conversation(f: &mut Frame, app: &App, area: Rect) {
     // inner_w 需在构建行时可用：用户消息整行铺底要填满内容宽度。
     let inner_w = area.width.saturating_sub(2) as usize;
-    let lines = build_conversation_lines(&app.lines, inner_w);
-
-    // Paragraph 启用了 Wrap，长行会被软换行成多行。滚动范围必须按
-    // **wrap 后的实际行数**计算。之前按总宽度做数学估算，在 word wrap
-    //（英文）场景下会严重低估，导致内容一长就滚不到底、底部被截断。
-    let total: u16 = lines
-        .iter()
-        .map(|l| wrapped_line_count(l, inner_w))
-        .sum::<usize>()
-        .min(u16::MAX as usize) as u16;
+    // 自己软换行：滚动上限必须等于实际渲染行数（见 `wrap_line` 的注释），
+    // 切完之后 Paragraph 不再二次换行，于是「所见行数 = 滚动上限」。
+    // 自己软换行：滚动上限必须等于实际渲染行数（见 `wrap_line` 的注释），
+    // 切完之后 Paragraph 不再二次换行，于是「所见行数 = 滚动上限」。
+    // 自己软换行：滚动上限必须等于实际渲染行数（见 `wrap_line` 的注释），
+    // 切完之后 Paragraph 不再二次换行，于是「所见行数 = 滚动上限」。
+    let mut lines: Vec<RtLine<'static>> = Vec::new();
+    for l in build_conversation_lines(&app.lines, inner_w) {
+        lines.extend(wrap_line(l, inner_w));
+    }
+    let total: u16 = lines.len().min(u16::MAX as usize) as u16;
     let height = area.height.saturating_sub(2);
     let max_scroll = total.saturating_sub(height);
     let scroll = max_scroll.saturating_sub(app.scroll_from_bottom);
@@ -551,7 +552,8 @@ fn draw_conversation(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(surface::LINE));
     let p = Paragraph::new(Text::from(lines))
         .block(block)
-        .wrap(Wrap { trim: false })
+        // 不设 .wrap()：行已经按显示宽度切好，再让它换一次行，滚动上限就会
+        // 再次和实际渲染行数对不上（`wrap_line` 注释里有实测）。
         .scroll((scroll, 0));
     f.render_widget(p, area);
 
@@ -699,20 +701,83 @@ fn placeholder_spans() -> Vec<Span<'static>> {
     ]
 }
 
-/// 一行文本在给定宽度下 word-wrap 后占用的显示行数（至少 1 行）。
+/// 把一行按显示宽度软换行成多行（保留样式，不丢字符）。
 ///
-/// 使用 textwrap 按 Unicode 显示宽度做软换行，与 ratatui 的
-/// `Wrap { trim: false }` 行为足够接近，避免之前按总宽度做数学估算
-/// 在英文 word-wrap 场景下严重低估、导致底部内容被截断的问题。
-fn wrapped_line_count(line: &RtLine, inner_w: usize) -> usize {
-    if inner_w == 0 {
-        return 1;
+/// **为什么自己换行，而不是交给 `Paragraph::wrap`**：对话区的滚动上限必须
+/// 等于**实际渲染行数**，否则滚到底时底部内容就被切掉了。以前的做法是照
+/// 另一个库（textwrap）的算法「估算」行数、再拿估算值当滚动上限——两家的
+/// 断行策略不同（尤其没有空格的中文段落），真实会话实测少算 4 行，症状正是
+/// 「模型输出的最后一部分显示不出来，有新输出才被推上来」。
+///
+/// 自己换行后 `Paragraph` 不再二次换行，所见行数 = 滚动上限，不会再失配。
+fn wrap_line(line: RtLine<'static>, width: usize) -> Vec<RtLine<'static>> {
+    if width == 0 {
+        return vec![line];
     }
-    let text = line_as_str(line);
-    if text.is_empty() {
-        return 1;
+    let wide = |c: char| UnicodeWidthChar::width(c).unwrap_or(0);
+    if UnicodeWidthStr::width(line_as_str(&line).as_str()) <= width {
+        return vec![line];
     }
-    textwrap::wrap(&text, inner_w).len().max(1)
+
+    // 切成「空白串 / 非空白串」交替的 token：英文按词断，中文整段是一个
+    // 超宽 token，走下面按字符切的分支（中文任意两字之间都能断）。
+    let mut tokens: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut cur: Vec<(char, Style)> = Vec::new();
+    for sp in &line.spans {
+        for c in sp.content.chars() {
+            if let Some((last, _)) = cur.last() {
+                if (*last == ' ') != (c == ' ') {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            }
+            cur.push((c, sp.style));
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+
+    let mut out: Vec<RtLine<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for tok in tokens {
+        let tok_w: usize = tok.iter().map(|(c, _)| wide(*c)).sum();
+        if tok_w > width {
+            // 超宽（中文长段 / 超长单词）：按字符切，保证每行都不超宽
+            for (c, st) in tok {
+                if used + wide(c) > width && !spans.is_empty() {
+                    out.push(RtLine::from(std::mem::take(&mut spans)));
+                    used = 0;
+                }
+                push_styled_char(&mut spans, c, st);
+                used += wide(c);
+            }
+        } else {
+            if used + tok_w > width && !spans.is_empty() {
+                out.push(RtLine::from(std::mem::take(&mut spans)));
+                used = 0;
+            }
+            for (c, st) in tok {
+                push_styled_char(&mut spans, c, st);
+            }
+            used += tok_w;
+        }
+    }
+    if !spans.is_empty() {
+        out.push(RtLine::from(spans));
+    }
+    if out.is_empty() {
+        out.push(RtLine::from(""));
+    }
+    out
+}
+
+/// 把字符追加到行尾：样式相同就并进最后一个 span，否则新开一个。
+fn push_styled_char(spans: &mut Vec<Span<'static>>, c: char, st: Style) {
+    match spans.last_mut() {
+        Some(s) if s.style == st => s.content.to_mut().push(c),
+        _ => spans.push(Span::styled(c.to_string(), st)),
+    }
 }
 
 /// 取出 RtLine 的纯文本（仅用于测宽，样式无关）。
@@ -861,36 +926,98 @@ mod tests {
         assert_eq!(app.input.buffer, "hello");
     }
 
-    // ---- word-wrap 行数计算（对话区滚动范围） ----
+    // ---- 软换行（对话区滚动范围） ----
 
     #[test]
-    fn wrapped_line_count_short_line_is_one() {
+    fn wrap_line_short_line_is_one() {
         let l = RtLine::from("hello");
-        assert_eq!(wrapped_line_count(&l, 80), 1);
+        assert_eq!(wrap_line(l, 80).len(), 1);
     }
 
     #[test]
-    fn wrapped_line_count_empty_line_is_one() {
+    fn wrap_line_empty_line_is_one() {
         let l = RtLine::from("");
-        assert_eq!(wrapped_line_count(&l, 80), 1);
+        assert_eq!(wrap_line(l, 80).len(), 1);
     }
 
     #[test]
-    fn wrapped_line_count_counts_cjk_by_display_width() {
+    fn wrap_line_counts_cjk_by_display_width() {
         // 中文占 2 列：8 CJK + 5 ASCII = 21 列，在宽 8 的区域应占 3 行
         let l = RtLine::from("你好世界测试ABCDE".to_string());
-        assert_eq!(wrapped_line_count(&l, 8), 3);
+        assert_eq!(wrap_line(l, 8).len(), 3);
     }
 
     #[test]
-    fn wrapped_line_count_english_word_wrap_not_underestimated() {
-        // 旧逻辑按总宽度做数学估算：ceil(83 / 30) = 3 行；
-        // 但 word wrap 留白后实际约 4 行，textwrap 应给出更接近的值。
+    fn wrap_line_breaks_english_on_word_boundaries() {
         let l = RtLine::from(
             "This is a long sentence that will wrap across multiple lines in a narrow viewport.",
         );
-        let rows = wrapped_line_count(&l, 30);
-        assert!(rows >= 3, "word wrap 行数不应被低估，got {rows}");
+        let rows = wrap_line(l, 30);
+        assert!(rows.len() >= 3, "应按词断成多行，got {}", rows.len());
+        for r in &rows {
+            assert!(
+                UnicodeWidthStr::width(line_as_str(r).as_str()) <= 30,
+                "断出的行不得超过宽度（超宽会被 Paragraph 截断）：{:?}",
+                line_as_str(r)
+            );
+        }
+    }
+
+    /// 换行不能丢字符、不能超宽、样式要跟着字走——这三条任一失守，
+    /// 「滚到底」都会丢内容。
+    #[test]
+    fn wrap_line_keeps_every_character_and_style() {
+        let l = RtLine::from(vec![
+            Span::styled("中文段落没有空格".repeat(6), Style::default().fg(ink::FG)),
+            Span::styled(" tail", Style::default().fg(ink::ERROR)),
+        ]);
+        let before = line_as_str(&l);
+        let rows = wrap_line(l, 24);
+
+        let after: String = rows.iter().map(line_as_str).collect();
+        assert_eq!(after, before, "换行不能丢字符");
+        for r in &rows {
+            assert!(
+                UnicodeWidthStr::width(line_as_str(r).as_str()) <= 24,
+                "断出的行超宽：{:?}",
+                line_as_str(r)
+            );
+        }
+        // 红色那段要留在某一行里，且不能整行都被染成前一个 span 的颜色
+        assert!(
+            rows.iter()
+                .any(|r| r.spans.iter().any(|s| s.style.fg == Some(ink::ERROR))),
+            "样式要跟着字走：{:?}",
+            rows.iter().map(line_as_str).collect::<Vec<_>>()
+        );
+    }
+
+    /// 回归：跟随时滚到底，最后一行必须看得见。
+    ///
+    /// 以前用 textwrap 估算 wrap 后行数当滚动上限，与 ratatui 的实际换行
+    /// 对不上（真实会话实测少算 4 行），底部就被切掉了——表现是「模型输出的
+    /// 最后一部分显示不出来，等下一次有新输出才被推上来」。
+    #[test]
+    fn scrolled_to_bottom_shows_the_last_line() {
+        use agent_core::ids::TaskId;
+        let mut app = App::default();
+        // 中英混合、带空格的长句——正是两种换行策略分道扬镳的形态：
+        // 实测在宽 98 下，textwrap 算 3 行、ratatui 实际渲染 4 行。
+        let para = "**它是干什么的**：一个个人独占使用、跑在自己设备上、\
+                    能实际动手干活的通用 AI Agent（personal-agent，当前处于 M1 骨架阶段）。";
+        for _ in 0..8 {
+            app.apply_event(Event::TextDelta {
+                id: TaskId::new(),
+                text: format!("{para}{para}\n"),
+            });
+        }
+        app.apply_event(Event::TextDelta {
+            id: TaskId::new(),
+            text: "  - 收尾标记 ZZZEND".into(),
+        });
+
+        let dump = render_to_string(&app, 100, 28);
+        assert!(dump.contains("ZZZEND"), "滚到底应能看到最后一行：\n{dump}");
     }
 
     // ---- 鼠标滚轮区域分流 ----
