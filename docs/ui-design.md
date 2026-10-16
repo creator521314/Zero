@@ -403,7 +403,7 @@ Textual → ratatui 的逐项转换对照：
 | `text-style: bold` | `Modifier::BOLD` |
 | Toast（右上角） | `Clear` + 定位 `Paragraph` 叠加，2s 后消失（需 `App` 加时间戳） |
 | 150ms 过渡动画 | **不实现** |
-| 滚轮 / 点击事件 | 已有 `EnableMouseCapture` + `handle_mouse`，扩展为点击 pill 触发补全（P1） |
+| 滚轮 / 点击事件 | 已有 `EnableMouseCapture` + `handle_mouse`：滚轮区段分流、点击输入框定位光标、点击/拖动滚动条、点击 header 徽章切档、点击审批弹层按钮 |
 
 ### 9.1 代码组织建议
 

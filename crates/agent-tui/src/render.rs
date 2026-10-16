@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -126,42 +126,9 @@ async fn event_loop(
                     // 别写成 `if !… { continue; }`——那会落在外层主循环上：
                     // 白画一帧不说，还跳过本轮末尾的退出检查。
                     if should_handle_key(&key) {
-                        match handle_key(app, key) {
-                            UiAction::Quit => {
-                                let _ = cmd_tx.send(Command::Quit).await;
-                                return Ok(());
-                            }
-                            UiAction::Submit(text) => {
-                                let mut spec =
-                                    agent_core::task::TaskSpec::new(text.clone(), String::new());
-                                spec.title = text.chars().take(24).collect();
-                                // 工作区由编排层填入；这里发送带 prompt 的任务
-                                if cmd_tx.send(Command::SubmitTask(spec)).await.is_err() {
-                                    app.backend_disconnected();
-                                }
-                            }
-                            UiAction::Cancel => {
-                                if let Some(c) = app.cancel_command() {
-                                    if cmd_tx.send(c).await.is_err() {
-                                        app.backend_disconnected();
-                                    }
-                                }
-                            }
-                            UiAction::Approve { remember } => {
-                                if let Some(c) = app.take_approval(true, remember) {
-                                    if cmd_tx.send(c).await.is_err() {
-                                        app.backend_disconnected();
-                                    }
-                                }
-                            }
-                            UiAction::Reject => {
-                                if let Some(c) = app.take_approval(false, false) {
-                                    if cmd_tx.send(c).await.is_err() {
-                                        app.backend_disconnected();
-                                    }
-                                }
-                            }
-                            UiAction::None => {}
+                        let action = handle_key(app, key);
+                        if dispatch(app, action, cmd_tx).await? {
+                            return Ok(());
                         }
                     }
                 }
@@ -169,8 +136,15 @@ async fn event_loop(
                 // 变了」时才自己 clear（窗口动画 / DPI 变化可能查不到差异）。
                 // 这里直接清屏 + 重置后台缓冲，保证下一帧是干净的整屏重画。
                 CtEvent::Resize(_, _) => terminal.clear()?,
-                // 鼠标滚轮：按指针所在区域分流——对话区上下滚，输入区左右滚。
-                CtEvent::Mouse(m) => handle_mouse(app, m, area),
+                // 鼠标：滚轮 / 点击分流——对话区滚动、输入框定位、滚动条拖拽、
+                // header 徽章切档、审批弹层按钮（见 `handle_mouse`）。
+                CtEvent::Mouse(m) => {
+                    if let Some(action) = handle_mouse(app, m, area) {
+                        if dispatch(app, action, cmd_tx).await? {
+                            return Ok(());
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -178,6 +152,57 @@ async fn event_loop(
         if app.should_quit {
             return Ok(());
         }
+    }
+}
+
+/// 消费一个 UI 动作（按键与鼠标点击共用），返回 true 表示应退出。
+///
+/// 抽出独立函数是为了让 `handle_mouse` 产出的动作（如审批弹层按钮的
+/// 批准/拒绝）与 `handle_key` 走同一条派发路径，不重复一遍 send 逻辑。
+async fn dispatch(
+    app: &mut App,
+    action: UiAction,
+    cmd_tx: &mpsc::Sender<Command>,
+) -> anyhow::Result<bool> {
+    match action {
+        UiAction::Quit => {
+            let _ = cmd_tx.send(Command::Quit).await;
+            Ok(true)
+        }
+        UiAction::Submit(text) => {
+            let mut spec = agent_core::task::TaskSpec::new(text.clone(), String::new());
+            spec.title = text.chars().take(24).collect();
+            // 工作区由编排层填入；这里发送带 prompt 的任务。
+            if cmd_tx.send(Command::SubmitTask(spec)).await.is_err() {
+                app.backend_disconnected();
+            }
+            Ok(false)
+        }
+        UiAction::Cancel => {
+            if let Some(c) = app.cancel_command() {
+                if cmd_tx.send(c).await.is_err() {
+                    app.backend_disconnected();
+                }
+            }
+            Ok(false)
+        }
+        UiAction::Approve { remember } => {
+            if let Some(c) = app.take_approval(true, remember) {
+                if cmd_tx.send(c).await.is_err() {
+                    app.backend_disconnected();
+                }
+            }
+            Ok(false)
+        }
+        UiAction::Reject => {
+            if let Some(c) = app.take_approval(false, false) {
+                if cmd_tx.send(c).await.is_err() {
+                    app.backend_disconnected();
+                }
+            }
+            Ok(false)
+        }
+        UiAction::None => Ok(false),
     }
 }
 
@@ -190,15 +215,25 @@ fn should_handle_key(key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
 }
 
-/// 鼠标滚轮事件：按指针所在区域分流。
+/// 鼠标事件：滚轮滚动 + 点击交互（返回要派发的 UI 动作）。
 ///
-/// - 对话区：上下滚动历史输出；
-/// - 输入区：左右移动光标（输入框是单行，超长时靠横向滚动查看）。
+/// 分流规则（按指针所在区域）：
+/// - 审批弹层期间：只认弹层内的「批准 / 拒绝」按钮，其余吞掉；
+/// - 滚轮：对话区上下滚历史，输入区左右移光标；
+/// - 左键点击：header 徽章切权限档、输入框定位光标、对话区滚动条跳转；
+/// - 左键拖拽：拖动滚动条。
 ///
 /// 注意：输入区**不是**最后一段（其后还有 footer），因此必须用
 /// `[y, y+height)` 的闭开区间判断，不能用 `row >= y`。
-fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
+fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
+    // 弹层优先：审批期间其它鼠标交互一律吞掉，避免误触背后的界面。
+    if app.pending.is_some() {
+        return handle_approval_mouse(m, area);
+    }
+
     let chunks = layout_chunks(area);
+    let header = chunks[0];
+    let conv = chunks[1];
     let input = chunks[2];
     let in_input = m.row >= input.y && m.row < input.y.saturating_add(input.height);
     const WHEEL_STEP: u16 = 3;
@@ -224,8 +259,161 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) {
             }
             app.wake_cursor();
         }
+        MouseEventKind::Down(button) | MouseEventKind::Drag(button)
+            if button == MouseButton::Left =>
+        {
+            // 命中优先级：header 徽章 > 输入框 > 滚动条。
+            if m.row >= header.y && m.row < header.y.saturating_add(header.height) {
+                if point_in(header_badge_rect(header, &app.tier), m.row, m.column) {
+                    app.cycle_tier();
+                }
+            } else if in_input {
+                click_input_cursor(app, m.column, input_content_rect(input));
+            } else if let Some((sx, sy, sh)) = scrollbar_track(conv) {
+                if m.column == sx && m.row >= sy && m.row < sy.saturating_add(sh) {
+                    scroll_to_position(app, m.row, conv);
+                }
+            }
+        }
         _ => {}
     }
+    None
+}
+
+/// 审批弹层期间的鼠标：只认底部两个按钮。
+fn handle_approval_mouse(m: MouseEvent, area: Rect) -> Option<UiAction> {
+    if !matches!(m.kind, MouseEventKind::Down(button) if button == MouseButton::Left) {
+        return None;
+    }
+    let (approve, reject) = approval_button_areas(area);
+    if point_in(approve, m.row, m.column) {
+        Some(UiAction::Approve { remember: false })
+    } else if point_in(reject, m.row, m.column) {
+        Some(UiAction::Reject)
+    } else {
+        None
+    }
+}
+
+/// 点是否落在矩形内（闭开区间，与 ratatui 坐标约定一致）。
+fn point_in(rect: Rect, row: u16, column: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+/// header 右侧权限徽章的命中区域（右对齐，`" {LABEL} "`）。
+fn header_badge_rect(header: Rect, tier: &str) -> Rect {
+    let badge_w = (UnicodeWidthStr::width(tier_label(tier)) + 2) as u16;
+    let x = header.x + header.width.saturating_sub(badge_w);
+    Rect::new(x, header.y, badge_w, 1)
+}
+
+/// 输入框的**内容区**（边框内侧、去掉右侧固定宽度的发送指示器）。
+fn input_content_rect(input: Rect) -> Rect {
+    let content_w = input
+        .width
+        .saturating_sub(2)
+        .saturating_sub(SEND_COL as u16);
+    Rect::new(
+        input.x + 1,
+        input.y + 1,
+        content_w,
+        input.height.saturating_sub(2),
+    )
+}
+
+/// 点击输入框：把点击列折算成字符索引，定位光标。
+///
+/// 中文等宽字符占 2 列，不能简单用「列 = 字符数」；同时输入框超长时内容
+/// 会被横向滚动（hscroll），点击列要先加回滚动量才是相对 buffer 起点的列。
+fn click_input_cursor(app: &mut App, column: u16, content: Rect) {
+    let cursor_idx = app.input.cursor_char_index();
+    let before: String = app.input.buffer.chars().take(cursor_idx).collect();
+    let cursor_col = UnicodeWidthStr::width(before.as_str());
+    let hscroll = (cursor_col + 1).saturating_sub(content.width as usize) as u16;
+
+    let rel = column.saturating_sub(content.x).saturating_add(hscroll) as usize;
+
+    // 按显示宽度累加，光标落在覆盖该列的那个字符之前。
+    let mut width_so_far = 0usize;
+    let mut char_idx = 0usize;
+    for (i, c) in app.input.buffer.chars().enumerate() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if width_so_far + cw > rel {
+            break;
+        }
+        width_so_far += cw;
+        char_idx = i + 1;
+    }
+    app.input.set_char_index(char_idx);
+    app.wake_cursor();
+}
+
+/// 对话区滚动条轨道：`(x, y, 高度)`；太窄/太矮时无滚动条。
+fn scrollbar_track(conv: Rect) -> Option<(u16, u16, u16)> {
+    if conv.width < 4 || conv.height < 4 {
+        return None;
+    }
+    Some((
+        conv.x + conv.width - 1,
+        conv.y + 1,
+        conv.height.saturating_sub(2),
+    ))
+}
+
+/// 对话区的滚动参数 `(总行数, 可见行数)`——与 `draw_conversation` 用同一套
+/// 换行逻辑，保证滚动条命中与渲染位置一致。
+fn conversation_scroll_params(app: &App, conv: Rect) -> (u16, u16) {
+    let inner_w = conv.width.saturating_sub(2) as usize;
+    let mut lines: Vec<RtLine<'static>> = Vec::new();
+    for l in build_conversation_lines(&app.lines, inner_w) {
+        lines.extend(wrap_line(l, inner_w));
+    }
+    let total = lines.len().min(u16::MAX as usize) as u16;
+    let view = conv.height.saturating_sub(2);
+    (total, view)
+}
+
+/// 点击/拖动滚动条：把点击行反解成滚动位置（让滑块顶部对齐点击行）。
+fn scroll_to_position(app: &mut App, row: u16, conv: Rect) {
+    let (total, view) = conversation_scroll_params(app, conv);
+    if total <= view {
+        return;
+    }
+    let (sx, sy, sh) = match scrollbar_track(conv) {
+        Some(t) => t,
+        None => return,
+    };
+    let _ = sx;
+    let i = row.saturating_sub(sy);
+    let thumb = ((view as u32 * sh as u32) / total as u32).max(1) as u16;
+    let thumb = thumb.min(sh);
+    let i = i.min(sh.saturating_sub(thumb));
+
+    let max_scroll = total - view;
+    let offset = (i as u32 * max_scroll as u32 / (sh - thumb).max(1) as u32) as u16;
+    let offset = offset.min(max_scroll);
+    app.scroll_from_bottom = max_scroll - offset;
+    app.follow = app.scroll_from_bottom == 0;
+}
+
+/// 审批弹层的「批准 / 拒绝」按钮命中区域（与 `draw_approval` 底部按钮对齐）。
+///
+/// 弹层居中，内区 `(x+1, y+1)`；按钮固定在内区**倒数第 2 行**，批准靠左、
+/// 拒绝紧邻其右，各 12 列宽。
+fn approval_button_areas(area: Rect) -> (Rect, Rect) {
+    let w = area.width.min(72);
+    let h = 11.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let inner_x = x + 1;
+    let inner_y = y + 1;
+    let btn_y = inner_y + h.saturating_sub(2).saturating_sub(2);
+    let approve = Rect::new(inner_x, btn_y, 12, 1);
+    let reject = Rect::new(inner_x + 12, btn_y, 12, 1);
+    (approve, reject)
 }
 
 /// 按键 -> 动作。
@@ -884,26 +1072,57 @@ fn draw_approval(f: &mut Frame, _app: &App, p: &crate::app::PendingApproval, are
         )));
         body.push(RtLine::from(""));
     }
-    body.push(RtLine::from(vec![
-        Span::styled(" [y] ", key),
-        Span::styled(" 批准   ", label),
-        Span::styled(" [n] ", key),
-        Span::styled(" 拒绝", label),
-    ]));
-    body.push(RtLine::from(Span::styled(
-        " 也可按 Enter 批准、Esc 拒绝",
-        Style::default().fg(ink::FG_MUTED),
-    )));
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(Span::styled(" 权限确认 ", Style::default().fg(accent)))
         .border_style(Style::default().fg(accent));
-    let para = Paragraph::new(Text::from(body))
-        .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(para, popup);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    // 字段 + 高危警告渲染在内区顶部，底部 2 行留给按钮与提示。
+    let body_h = inner.height.saturating_sub(2);
+    f.render_widget(
+        Paragraph::new(Text::from(body)).wrap(Wrap { trim: false }),
+        Rect {
+            height: body_h,
+            ..inner
+        },
+    );
+
+    // 按钮固定在倒数第 2 行：位置与 `approval_button_areas` 严格对齐，
+    // 鼠标点击命中才有稳定坐标（否则参数 wrap 会把按钮往下挤）。
+    let btn_y = inner.y + inner.height.saturating_sub(2);
+    let approve_btn = RtLine::from(vec![
+        Span::styled(" [y] ", key),
+        Span::styled(" 批准", label),
+    ]);
+    let reject_btn = RtLine::from(vec![
+        Span::styled(" [n] ", key),
+        Span::styled(" 拒绝", label),
+    ]);
+    f.render_widget(
+        Paragraph::new(approve_btn),
+        Rect::new(inner.x, btn_y, 12, 1),
+    );
+    f.render_widget(
+        Paragraph::new(reject_btn),
+        Rect::new(inner.x + 12, btn_y, 12, 1),
+    );
+
+    let hint = RtLine::from(Span::styled(
+        " 也可按 Enter 批准、Esc 拒绝",
+        Style::default().fg(ink::FG_MUTED),
+    ));
+    f.render_widget(
+        Paragraph::new(hint),
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        ),
+    );
 }
 
 /// 审批弹层中的一行「字段  值」。
@@ -1157,17 +1376,180 @@ mod tests {
     }
 
     #[test]
-    fn mouse_other_kinds_ignored() {
+    fn click_on_empty_area_has_no_effect() {
+        // 左键点击对话区中部（不在滚动条、不在 header/输入框）应无副作用。
         let mut app = App::default();
         let before = app.scroll_from_bottom;
-        let m = MouseEvent {
-            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            row: 5,
-            column: 5,
-            modifiers: KeyModifiers::NONE,
-        };
+        let m = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            5, // 列 5，远离右缘滚动条
+            5, // 行 5，对话区中部
+        );
         handle_mouse(&mut app, m, rect(80, 30));
         assert_eq!(app.scroll_from_bottom, before);
+        assert_eq!(app.tier, "L2", "未点徽章不该切档");
+    }
+
+    // ---- 鼠标点击交互 ----
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn click_input_positions_cursor_by_char() {
+        let mut app = App::default();
+        app.input.buffer = "你好ab".to_string(); // 显示宽：你2 好2 a1 b1 = 6
+        let content = Rect::new(0, 0, 40, 3);
+
+        click_input_cursor(&mut app, 0, content);
+        assert_eq!(app.input.cursor_char_index(), 0, "第 0 列 → 光标 0");
+
+        click_input_cursor(&mut app, 4, content);
+        assert_eq!(app.input.cursor_char_index(), 2, "「你好」占 4 列 → 光标 2");
+
+        click_input_cursor(&mut app, 5, content);
+        assert_eq!(app.input.cursor_char_index(), 3, "第 5 列是「a」→ 光标 3");
+
+        click_input_cursor(&mut app, 100, content);
+        assert_eq!(app.input.cursor_char_index(), 4, "点击超出末尾 → 光标末尾");
+    }
+
+    #[test]
+    fn click_input_accounts_for_hscroll() {
+        let mut app = App::default();
+        app.input.buffer = "aaaaaaaaaa".to_string();
+        app.input.set_char_index(10); // 光标在末尾 → 光标列 10
+        let content = Rect::new(2, 0, 5, 3); // x=2、宽 5
+                                             // hscroll = (10+1)-5 = 6；点内容区最左列 2 → rel = 2-2+6 = 6
+        click_input_cursor(&mut app, 2, content);
+        assert_eq!(app.input.cursor_char_index(), 6);
+    }
+
+    #[test]
+    fn set_char_index_lands_on_byte_offset() {
+        let mut input = crate::app::InputState {
+            buffer: "你好a".to_string(), // 你(3B) 好(3B) a(1B)
+            ..Default::default()
+        };
+        input.set_char_index(2);
+        assert_eq!(input.cursor, 6, "第 2 个字符「好」之后是字节 6");
+        input.set_char_index(0);
+        assert_eq!(input.cursor, 0);
+        input.set_char_index(99);
+        assert_eq!(input.cursor, 7, "越界应 clamp 到末尾字节");
+    }
+
+    #[test]
+    fn cycle_tier_rounds_l1_l2_l3() {
+        let mut app = App::default();
+        app.tier = "L1".into();
+        app.cycle_tier();
+        assert_eq!(app.tier, "L2");
+        app.cycle_tier();
+        assert_eq!(app.tier, "L3");
+        app.cycle_tier();
+        assert_eq!(app.tier, "L1");
+    }
+
+    #[test]
+    fn tier_enum_maps_display_to_permission() {
+        use agent_core::perm::PermissionTier;
+        let mut app = App::default();
+        app.tier = "L1".into();
+        assert_eq!(app.tier_enum(), PermissionTier::L1);
+        app.tier = "L3".into();
+        assert_eq!(app.tier_enum(), PermissionTier::L3);
+        app.tier = "L2".into();
+        assert_eq!(app.tier_enum(), PermissionTier::L2);
+        app.tier = "未知".into();
+        assert_eq!(app.tier_enum(), PermissionTier::L2, "未知档位回落 L2");
+    }
+
+    #[test]
+    fn click_header_badge_cycles_tier() {
+        let mut app = App::default();
+        app.tier = "L2".into();
+        let area = rect(80, 30);
+        let header = layout_chunks(area)[0];
+        let badge = header_badge_rect(header, &app.tier);
+        let m = mouse(MouseEventKind::Down(MouseButton::Left), badge.x, badge.y);
+        let action = handle_mouse(&mut app, m, area);
+        assert!(action.is_none(), "切档是就地状态变更，不产出动作");
+        assert_eq!(app.tier, "L3", "点击徽章应从 L2 切到 L3");
+    }
+
+    #[test]
+    fn approval_button_areas_match_layout() {
+        let area = rect(80, 24);
+        let (approve, reject) = approval_button_areas(area);
+        // w=72、h=11，居中 → x=4、y=6；内区 x=5、y=7，按钮行 = 7 + 9 - 2 = 14。
+        assert_eq!(approve, Rect::new(5, 14, 12, 1));
+        assert_eq!(reject, Rect::new(17, 14, 12, 1));
+    }
+
+    #[test]
+    fn approval_buttons_return_actions() {
+        let area = rect(80, 24);
+        let (approve, reject) = approval_button_areas(area);
+
+        let ma = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            approve.x,
+            approve.y,
+        );
+        assert!(matches!(
+            handle_approval_mouse(ma, area),
+            Some(UiAction::Approve { remember: false })
+        ));
+        let mr = mouse(MouseEventKind::Down(MouseButton::Left), reject.x, reject.y);
+        assert!(matches!(
+            handle_approval_mouse(mr, area),
+            Some(UiAction::Reject)
+        ));
+
+        // 点弹层空白处、或右键，都不该触发。
+        let m0 = mouse(MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert!(handle_approval_mouse(m0, area).is_none());
+        let m1 = mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            approve.x,
+            approve.y,
+        );
+        assert!(handle_approval_mouse(m1, area).is_none());
+    }
+
+    #[test]
+    fn scrollbar_click_jumps_to_position() {
+        use agent_core::ids::TaskId;
+        let mut app = App::default();
+        for i in 0..60 {
+            app.apply_event(Event::TextDelta {
+                id: TaskId::new(),
+                text: format!("第 {i} 行\n"),
+            });
+        }
+        let area = rect(80, 30);
+        let conv = layout_chunks(area)[1];
+        let (sx, sy, sh) = scrollbar_track(conv).expect("有滚动条");
+        let (total, view) = conversation_scroll_params(&app, conv);
+        let max_scroll = total.saturating_sub(view);
+        assert!(max_scroll > 0, "测试前提：内容要超过一屏");
+
+        // 点轨道最顶 → 滚到最顶（scroll_from_bottom = max_scroll）。
+        scroll_to_position(&mut app, sy, conv);
+        assert_eq!(app.scroll_from_bottom, max_scroll, "点顶部应滚到最顶");
+
+        // 点轨道最底 → 贴底（scroll_from_bottom = 0，恢复 follow）。
+        let _ = sx;
+        scroll_to_position(&mut app, sy + sh - 1, conv);
+        assert_eq!(app.scroll_from_bottom, 0, "点底部应贴底");
+        assert!(app.follow, "贴底应恢复 follow");
     }
 
     // ---- 工具名固定列（pad_display） ----

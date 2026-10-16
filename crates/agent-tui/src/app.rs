@@ -2,11 +2,11 @@
 
 use agent_core::event::{Command, Event, Outcome, ToolOutcome};
 use agent_core::ids::{ApprovalId, TaskId};
-use agent_core::perm::ApprovalRequest;
+use agent_core::perm::{ApprovalRequest, PermissionTier};
 use agent_core::task::TaskSpec;
 use tokio::sync::mpsc;
 
-use crate::theme::glyph;
+use crate::theme::{glyph, tier_label};
 
 /// 一条对话行。
 #[derive(Debug, Clone)]
@@ -97,6 +97,17 @@ impl InputState {
     }
     pub fn move_end(&mut self) {
         self.cursor = self.buffer.len();
+    }
+    /// 把光标定位到第 `char_idx` 个字符**之后**（`char_idx` 可到 `char 总数`）。
+    ///
+    /// 供鼠标点击定位用：点击列先折算成字符索引，再落回字节偏移。
+    pub fn set_char_index(&mut self, char_idx: usize) {
+        self.cursor = self
+            .buffer
+            .char_indices()
+            .nth(char_idx)
+            .map(|(i, _)| i)
+            .unwrap_or(self.buffer.len());
     }
     /// 光标所在的字符索引（用于渲染定位，按 char 计非字节）。
     pub fn cursor_char_index(&self) -> usize {
@@ -398,6 +409,29 @@ impl App {
         self.cursor_last_blink = std::time::Instant::now();
     }
 
+    /// 循环切换权限档位 L1 → L2 → L3 → L1（点击 header 徽章时调用）。
+    ///
+    /// 切换立即影响**之后提交的任务**（见 [`Self::submit`]），当前在跑的任务
+    /// 不受影响——档位是任务创建时写进 `TaskSpec` 的。
+    pub fn cycle_tier(&mut self) {
+        self.tier = match self.tier.to_ascii_uppercase().as_str() {
+            "L1" => "L2".into(),
+            "L2" => "L3".into(),
+            _ => "L1".into(),
+        };
+        self.status = format!("权限档位 {}", tier_label(&self.tier));
+        self.wake_cursor();
+    }
+
+    /// 当前显示档位对应的权限枚举（提交任务时写入 `TaskSpec.tier`）。
+    pub fn tier_enum(&self) -> PermissionTier {
+        match self.tier.to_ascii_uppercase().as_str() {
+            "L1" => PermissionTier::L1,
+            "L3" => PermissionTier::L3,
+            _ => PermissionTier::L2,
+        }
+    }
+
     /// 提交当前输入；空输入返回 None。
     pub fn submit(&mut self) -> Option<Command> {
         let text = self.input.take();
@@ -408,6 +442,7 @@ impl App {
         self.lines.push(Line::User(trimmed.to_string()));
         self.scroll_to_bottom();
         let mut spec = TaskSpec::new(trimmed.to_string(), String::new());
+        spec.tier = self.tier_enum();
         spec.workspace = String::new(); // 由编排层补齐
         Some(Command::SubmitTask(spec))
     }
