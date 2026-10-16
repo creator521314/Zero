@@ -25,6 +25,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use agent_core::event::{Command, Event};
 
 use crate::app::{App, Line, ToolStatus, UiAction};
+use crate::markdown;
 use crate::theme::{glyph, ink, surface, tier_badge_color, tier_label, BG};
 
 /// 启动 TUI 主循环。
@@ -426,14 +427,12 @@ fn build_conversation_lines(items: &[Line], inner_w: usize) -> Vec<RtLine<'stati
                     ]));
                 }
             }
-            // 助手回答：缩进 2，正文近白。
+            // 助手回答：按 Markdown 渲染（标题/粗斜体/代码/列表…，见 `markdown`）。
+            //
+            // 行在这里已经按 `inner_w` 软换行（含列表的悬挂缩进），外层再
+            // `wrap_line` 一次是幂等的——每行都 ≤ inner_w，会原样返回。
             Line::Assistant(s) => {
-                for tl in s.lines() {
-                    lines.push(RtLine::from(Span::styled(
-                        format!("  {tl}"),
-                        Style::default().fg(ink::FG),
-                    )));
-                }
+                lines.extend(markdown::parse(s, inner_w));
             }
             // 思考链：灰显，首行带 ⋯ 标记。
             Line::Reasoning(s) => {
@@ -760,6 +759,8 @@ fn placeholder_spans() -> Vec<Span<'static>> {
     vec![Span::styled(" 输入任务… ", hint)]
 }
 
+/// [wrap_line][crate::markdown] 也要用（软换行 + 悬挂缩进），故为 crate 内可见。
+///
 /// 把一行按显示宽度软换行成多行（保留样式，不丢字符）。
 ///
 /// **为什么自己换行，而不是交给 `Paragraph::wrap`**：对话区的滚动上限必须
@@ -769,7 +770,7 @@ fn placeholder_spans() -> Vec<Span<'static>> {
 /// 「模型输出的最后一部分显示不出来，有新输出才被推上来」。
 ///
 /// 自己换行后 `Paragraph` 不再二次换行，所见行数 = 滚动上限，不会再失配。
-fn wrap_line(line: RtLine<'static>, width: usize) -> Vec<RtLine<'static>> {
+pub(crate) fn wrap_line(line: RtLine<'static>, width: usize) -> Vec<RtLine<'static>> {
     if width == 0 {
         return vec![line];
     }
@@ -1291,6 +1292,73 @@ mod tests {
         });
         assert!(moved, "spinner 应随 tick 转动");
     }
+
+    // ---- 助手回答走 Markdown 渲染 ----
+
+    /// 助手输出的是 Markdown：终端里该看到渲染结果，不是源码。
+    #[test]
+    fn assistant_text_is_rendered_as_markdown_not_source() {
+        use agent_core::ids::TaskId;
+
+        let mut app = App::default();
+        app.apply_event(Event::TextDelta {
+            id: TaskId::new(),
+            text: "## 小结\n\n- **要点**：先跑测试\n".into(),
+        });
+        let rows = build_conversation_lines(&app.lines, 60);
+        let all: String = rows
+            .iter()
+            .map(|r| {
+                r.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert!(!all.contains('#'), "不该印出 # 源码符号：{all:?}");
+        assert!(!all.contains("**"), "不该印出加粗标记：{all:?}");
+        assert!(
+            all.contains(&format!("{} 要点", glyph::BULLET)),
+            "列表要有项目符号：{all:?}"
+        );
+        assert!(
+            rows.iter().flat_map(|r| r.spans.clone()).any(
+                |s| s.content.contains("要点") && s.style.add_modifier.contains(Modifier::BOLD)
+            ),
+            "加粗要真的落到样式上"
+        );
+    }
+
+    /// 回归：代码块的底色与左竖条不能溢出到它后面的正文
+    ///（`TagEnd::CodeBlock` 忘了卸底色时，后面所有行都会带 ▎ 并铺底）。
+    #[test]
+    fn content_after_code_block_is_not_styled_as_code() {
+        use agent_core::ids::TaskId;
+
+        let mut app = App::default();
+        app.apply_event(Event::TextDelta {
+            id: TaskId::new(),
+            text: "```\ncode();\n```\n\n之后的正文\n".into(),
+        });
+        let rows = build_conversation_lines(&app.lines, 60);
+        let body = rows
+            .iter()
+            .find(|r| r.spans.iter().any(|s| s.content.contains("之后的正文")))
+            .expect("要有正文行");
+        assert!(
+            !body
+                .spans
+                .iter()
+                .any(|s| s.style.bg == Some(surface::FAINT)),
+            "正文不该带代码块底色"
+        );
+        assert!(
+            !body.spans.iter().any(|s| s.content.contains('▎')),
+            "正文不该带代码块竖条"
+        );
+    }
+
     // ---- 任务完成标志要显眼 ----
 
     #[test]

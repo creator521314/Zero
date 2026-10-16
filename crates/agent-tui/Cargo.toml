@@ -16,3 +16,4 @@ anyhow.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true
+pulldown-cmark.workspace = true

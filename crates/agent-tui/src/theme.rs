@@ -65,6 +65,8 @@ pub mod glyph {
     pub const REASONING: &str = "⋯";
     /// 系统提示。
     pub const SYSTEM: &str = "·";
+    /// 无序列表的项目符号（Markdown `- ` 在终端里的样子）。
+    pub const BULLET: &str = "•";
     /// 发送（输入框右侧指示器，空闲态）。
     pub const SEND: &str = "⏎";
     /// 工作指示器（输入框右侧，运行态）的旋转帧。
