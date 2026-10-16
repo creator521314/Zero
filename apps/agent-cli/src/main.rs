@@ -2,6 +2,7 @@
 //!
 //! 装配职责：读配置 → 建 provider 路由 → 建工具集 → 建权限引擎 → 拉起 TUI + Agent 循环。
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,24 +96,53 @@ fn parse_tier(s: &str) -> PermissionTier {
     }
 }
 
+/// 解析日志目录：`AGENT_LOG_DIR` 优先，否则 `agent.root/logs`。
+///
+/// 不再放 `config/` 下——那是代码仓库里的配置目录，运行期产物不该混进去，
+/// 也不该跟着 `config/` 一起被 gitignore 之外的规则误伤。
+///
+/// 此刻配置可能还没加载（甚至尚未生成、语法有误），所以只「看一眼」root，
+/// 取不到就用默认值：日志功能不该被配置问题连带拖死。
+fn resolve_log_dir(cfg_path: &Path, env_override: Option<String>) -> PathBuf {
+    if let Some(d) = env_override.filter(|s| !s.trim().is_empty()) {
+        return PathBuf::from(d);
+    }
+    ProvidersFile::load_or_default(cfg_path)
+        .unwrap_or_default()
+        .agent
+        .resolved_log_dir()
+}
+
+/// 初始化文件日志（stdout 被 TUI 的 alternate screen 占用，只能写文件），
+/// 返回日志文件路径，供界面展示。
+fn init_tracing(cfg_path: &Path) -> PathBuf {
+    let mut dir = resolve_log_dir(cfg_path, std::env::var("AGENT_LOG_DIR").ok());
+    if std::fs::create_dir_all(&dir).is_err() {
+        // 宁可换个地方，也不要把日志静默丢进写不进去的目录。
+        let fallback = std::env::temp_dir().join("agent-logs");
+        if std::fs::create_dir_all(&fallback).is_ok() {
+            eprintln!(
+                "[警告] 日志目录不可写：{}，改用 {}",
+                dir.display(),
+                fallback.display()
+            );
+            dir = fallback;
+        }
+    }
+    let file_appender = tracing_appender::rolling::never(&dir, "agent.log");
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(file_appender)
+        .init();
+    dir.join("agent.log")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cfg_path = ProvidersFile::config_path();
-
-    // 日志写文件，避免污染 TUI（stdout 已被 alternate screen 占用）
-    let log_file = cfg_path.parent().map(|dir| {
-        let logs_dir = dir.join("logs");
-        let _ = std::fs::create_dir_all(&logs_dir);
-        let file_appender = tracing_appender::rolling::never(&logs_dir, "agent.log");
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "info".into()),
-            )
-            .with_writer(file_appender)
-            .init();
-        logs_dir.join("agent.log")
-    });
+    let log_file = init_tracing(&cfg_path);
 
     // 启动期配置加载：缺/坏 → 自动进入 wizard（仅 stdin 是 TTY 时）。
     let cfg = wizard::ensure_loaded()?;
@@ -332,12 +362,74 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut app = App::with_identity(cfg.agent.default_tier.clone(), router.available().join(","));
-    if let Some(p) = &log_file {
-        app.set_log_path(p.display().to_string());
-    }
+    app.set_log_path(log_file.display().to_string());
 
     tracing::info!("tui starting");
     run_tui(app, ev_rx, cmd_tx).await?;
     tracing::info!("tui exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_cfg(dir: &Path, root: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let cfg = dir.join("config.toml");
+        // TOML 基本串里反斜杠是转义符，Windows 路径要换成正斜杠。
+        std::fs::write(
+            &cfg,
+            format!("[agent]\nroot = \"{}\"\n", root.replace('\\', "/")),
+        )
+        .unwrap();
+        cfg
+    }
+
+    /// 回归：日志曾写到代码仓库里的 `config/logs/agent.log`。
+    #[test]
+    fn log_dir_is_not_under_config() {
+        let d = resolve_log_dir(Path::new("config/config.toml"), None);
+        assert!(d.ends_with("logs"), "{d:?}");
+        assert!(!d.starts_with("config"), "日志不该落在 config/ 下: {d:?}");
+    }
+
+    /// 配置里改了 root，日志目录要跟着走。
+    #[test]
+    fn log_dir_follows_configured_root() {
+        let tmp = std::env::temp_dir().join("agent-cli-logdir-test");
+        let data = tmp.join("data");
+        let cfg = write_cfg(&tmp, &data.display().to_string());
+        assert_eq!(
+            resolve_log_dir(&cfg, None),
+            data.join("logs"),
+            "日志目录应挂在 agent.root 下"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 配置坏掉（语法错）时也不能让日志功能连带失效。
+    #[test]
+    fn broken_config_falls_back_to_default_root() {
+        let tmp = std::env::temp_dir().join("agent-cli-logdir-broken-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = tmp.join("config.toml");
+        std::fs::write(&cfg, "这不是 TOML = = =\n").unwrap();
+        let d = resolve_log_dir(&cfg, None);
+        assert!(d.ends_with("logs"), "{d:?}");
+        assert!(!d.starts_with(&tmp), "不该把日志丢进坏配置所在目录");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn env_override_wins_and_blank_is_ignored() {
+        let cfg = Path::new("config/config.toml");
+        assert_eq!(
+            resolve_log_dir(cfg, Some("/tmp/agent-logs".into())),
+            PathBuf::from("/tmp/agent-logs")
+        );
+        // 空白串视为未设置，继续走配置
+        let d = resolve_log_dir(cfg, Some("   ".into()));
+        assert!(d.ends_with("logs"), "{d:?}");
+    }
 }

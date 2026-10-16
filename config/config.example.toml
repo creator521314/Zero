@@ -119,11 +119,14 @@ max_iterations             = 25          # 单任务最大迭代轮（防死循�
 transient_retention_days   = 7           # 临时信息保留天数（P4）
 
 # ============================================================
-#  📝  log —— 审计日志（~/agent/logs/<task-id>.jsonl）
+#  📝  log —— 审计日志
 # ============================================================
-# 事件流是唯一真相源：任务的一问一答、工具调用与返回原文都在里面。
-# 用 `cargo xtask log <jsonl 文件>` 可按时间线读，
-# 加 `--errors` 只看失败项，加 `--full` 展开完整上下文。
+# 目录：`agent.root/logs/`（跟着上面的 root 走，**不在 config/ 下**），
+# 可用环境变量 AGENT_LOG_DIR 覆盖。里面两类文件：
+#   agent.log            运行期 tracing 日志
+#   <task-id>.jsonl      事件流（唯一真相源：一问一答、工具调用与返回原文）
+# 事件流用 `cargo xtask log` 读：加 `--errors` 只看失败项，
+# 加 `--full` 展开完整上下文。
 
 [log]
 save_context      = true    # 每轮记录一份完整上下文（system 固定区 + 全部历史消息）

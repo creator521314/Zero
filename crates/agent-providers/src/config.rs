@@ -302,6 +302,14 @@ impl AgentConfig {
         }
         expand_home(raw)
     }
+
+    /// 日志目录：`agent.root/logs`。
+    ///
+    /// 与 jsonl 会话日志同处一个目录，且**不在 `config/` 下**——那是代码仓库里
+    /// 的配置目录，运行期产物不该混进去。可用环境变量 `AGENT_LOG_DIR` 覆盖。
+    pub fn resolved_log_dir(&self) -> PathBuf {
+        self.resolved_root().join("logs")
+    }
 }
 
 /// 展开路径中的 `~` 前缀（`~` 或 `~/...`）。
@@ -480,6 +488,33 @@ mod tests {
     #[test]
     fn default_validates_ok() {
         assert!(ProvidersFile::default().validate().is_ok());
+    }
+
+    /// 日志目录跟 `agent.root` 走，**不在 `config/` 下**
+    /// （回归：曾写到仓库里的 `config/logs/agent.log`）。
+    #[test]
+    fn log_dir_follows_agent_root() {
+        let mut c = ProvidersFile::default();
+        c.agent.root = "/data/agent".into();
+        assert_eq!(
+            c.agent.resolved_log_dir(),
+            PathBuf::from("/data/agent/logs")
+        );
+        assert!(
+            !c.agent
+                .resolved_log_dir()
+                .to_string_lossy()
+                .contains("config"),
+            "日志不该落在 config/ 下"
+        );
+    }
+
+    #[test]
+    fn log_dir_expands_tilde() {
+        let c = ProvidersFile::default(); // root = ~/agent
+        let d = c.agent.resolved_log_dir();
+        assert!(d.ends_with("logs"), "{d:?}");
+        assert!(!d.to_string_lossy().contains('~'), "~ 必须展开: {d:?}");
     }
 
     #[test]
