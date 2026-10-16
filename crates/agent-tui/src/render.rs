@@ -523,6 +523,24 @@ fn build_conversation_lines(items: &[Line], inner_w: usize) -> Vec<RtLine<'stati
                     )));
                 }
             }
+            // 任务完成：成功色 + 加粗，上下各一条分隔线。
+            //
+            // 光靠颜色不够——一屏近白的正文里，绿色行（工具成功）已经有一堆，
+            // 完成标志得靠「整行铺满的分隔线」把自己从正文里切出来。
+            Line::Done(s) => {
+                let rule = "─".repeat(inner_w);
+                let rule_style = Style::default().fg(surface::LINE);
+                lines.push(RtLine::from(Span::styled(rule.clone(), rule_style)));
+                for tl in s.lines() {
+                    lines.push(RtLine::from(Span::styled(
+                        format!("  {tl}"),
+                        Style::default()
+                            .fg(ink::SUCCESS)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                }
+                lines.push(RtLine::from(Span::styled(rule, rule_style)));
+            }
         }
     }
     lines
@@ -1272,6 +1290,40 @@ mod tests {
             app.spinner() != first
         });
         assert!(moved, "spinner 应随 tick 转动");
+    }
+    // ---- 任务完成标志要显眼 ----
+
+    #[test]
+    fn task_done_marker_is_prominent() {
+        use agent_core::event::Outcome;
+        use agent_core::ids::TaskId;
+
+        let mut app = App::default();
+        app.apply_event(Event::TaskFinished {
+            id: TaskId::new(),
+            outcome: Outcome::Success {
+                summary: "done".into(),
+                artifacts: vec![],
+            },
+        });
+        let rows = build_conversation_lines(&app.lines, 40);
+
+        let idx = rows
+            .iter()
+            .position(|r| line_as_str(r).contains("任务完成"))
+            .expect("应有完成标志");
+        let st = rows[idx]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("任务完成"))
+            .expect("完成 span")
+            .style;
+        assert_eq!(st.fg, Some(ink::SUCCESS), "完成标志要用成功色");
+        assert!(st.add_modifier.contains(Modifier::BOLD), "完成标志要加粗");
+
+        // 上下各一条整行分隔线：光靠颜色分不出来，得靠版式切一刀
+        assert!(idx >= 1 && line_as_str(&rows[idx - 1]).contains('─'));
+        assert!(idx + 1 < rows.len() && line_as_str(&rows[idx + 1]).contains('─'));
     }
 
     // ---- 审批弹层字段行 ----

@@ -23,6 +23,11 @@ pub enum Line {
     Reasoning(String),
     System(String),
     Error(String),
+    /// 任务完成（成功收尾专用）。
+    ///
+    /// 与 `Error` 对称：一轮跑完要在满屏正文里一眼扫得到，所以不走
+    /// `System` 的灰显——成功色 + 加粗 + 上下分隔线，见 `render.rs`。
+    Done(String),
 }
 
 /// 工具调用的 UI 状态（四态）。
@@ -286,7 +291,7 @@ impl App {
             Event::TaskFinished { outcome, .. } => {
                 match &outcome {
                     Outcome::Success { summary, artifacts } => {
-                        self.lines.push(Line::System("✔ 任务完成。".into()));
+                        self.lines.push(Line::Done("✔ 任务完成。".into()));
                         // summary 就是最后一轮模型的原文（runner 直接 clone 的
                         // `out.text`），而原文已经作为 Line::Assistant 流式渲染
                         // 过一遍了。再整段塞一次，同一段话就显示两遍——而且还落
@@ -676,8 +681,8 @@ mod tests {
         assert!(
             app.lines
                 .iter()
-                .any(|l| matches!(l, Line::System(s) if s.contains("✔ 任务完成"))),
-            "完成标记仍要显示"
+                .any(|l| matches!(l, Line::Done(s) if s.contains("✔ 任务完成"))),
+            "完成标记仍要显示，且走 Done 的显眼样式而非 System 的灰"
         );
     }
 
