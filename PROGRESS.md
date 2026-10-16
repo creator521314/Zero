@@ -29,11 +29,11 @@
 | `agent-perm` | L1 高危拦截；L2 无审视器降级；L3 逐个确认 + 批量批准 |
 | `agent-tools::paths` | `../` 逃逸拒绝；工作区内路径接受；项目根为基准；私有工作区仍可达；Windows 盘符大小写/斜杠方向不误判 |
 | `agent-tools::web` | HTML 标签与 script 剥离 |
-| `agent-tools::shell` | 本平台解释器能起命令；非 0 退出码标为错误；描述串与平台一致 |
+| `agent-tools::shell` | 本平台解释器能起命令；非 0 退出码标为错误；描述串与平台一致；中文按 OEM 代码页解出可读文本；UTF-8 输出不被二次损坏 |
 | `agent-tools::fs_tools` | 相对路径落到项目根；无项目根时退回私有工作区；空目录明说；读目录给出替代工具 |
 | `agent-providers` | tool 消息转换；assistant tool_call 转换（arguments 必须为字符串） |
 | `agent-runtime::context` | 上下文压缩保留固定区并生成摘要 |
-| `agent-tui::app` | 多字节字符编辑；流式增量合并为一行；空输入不提交；工具四态流转（含迟到事件不覆盖已终结行） |
+| `agent-tui::app` | 多字节字符编辑；流式增量合并为一行；空输入不提交；工具四态流转（含迟到事件不覆盖已终结行）；重绘请求取走即清零；任务收尾不重复渲染已流式输出的原文（对不上时仍补），失败按错误样式显示 |
 | `agent-tui::theme` | 权限档位 → 徽章色/文案映射（三态、大小写不敏感） |
 | `agent-tui::render` | 六类消息符号与缩进；工具四态符号/耗时/原因（多行压单行、超长截断）；工具名固定列对齐（含中文宽度）；宽字符 wrap 行数；鼠标区段分流；`TestBackend` 渲染快照 |
 | `agent-store` | 追加 + 重载；逻辑时钟单调；durability 保留 |
@@ -223,6 +223,150 @@ cmd_rx.recv() ──► Command::SubmitTask ──► runtime.run().await ─┐
 
 **验收**：`cargo xtask check` 通过；新增 13 个单测（含 3 个真实进程 /
 真实 IO 用例），`cargo test --workspace` **143 passed / 0 failed**。
+
+## 日志目录归位（2026-10-16）
+
+**症状**：TUI 的 `list_dir` 里赫然出现 `config` —— 运行期日志写到了
+`<仓库>/config/logs/agent.log`。
+
+**根因**：日志目录取自**配置文件所在目录**（`cfg_path.parent().join("logs")`），
+把「配置放在哪」当成了「数据放哪」。代码仓库里的 `config/` 是配置目录，
+运行期产物混进去既脏，又只靠 `.gitignore` 的 `*.log` 侥幸没被提交。
+
+**改动**：
+
+| 项 | 位置 |
+|---|---|
+| `AgentConfig::resolved_log_dir()` = `agent.root/logs` | `agent-providers/src/config.rs` |
+| `resolve_log_dir`（`AGENT_LOG_DIR` > 配置 root > 默认）+ `init_tracing` | `apps/agent-cli/src/main.rs` |
+
+与 jsonl 会话日志同处 `<root>/logs/`（`JsonlStore` 本就是 `root/logs`）。
+
+两个健壮性细节：配置此时可能**尚未生成或语法有误**，所以只「看一眼」root、
+失败即退回默认值（日志功能不该被配置问题连带拖死）；目录不可写时退到临时
+目录并告警，而不是把日志静默丢进黑洞。
+
+**验收**：`cargo test -p agent-cli -p agent-providers` 新增 6 个单测全过；
+旧的 `config/logs/` 已删除。
+
+## 黑屏与乱码：子进程碰了 TUI 的控制台（2026-10-16）
+
+**症状**：执行任务途中「大部分区域突然变黑」，只剩工具调用列表还在刷新；
+同一次会话里 `dir /a` 的返回是一堆乱码（`������ D �еľ��� Data`）。
+
+### 黑屏：共享控制台 + 差分重绘
+
+`shell_exec` 的子进程与 TUI 共享同一个控制台，而 `chcp 65001` 改的正是
+这个共享控制台的代码页——**屏幕被连带擦掉**。而 TUI 走 ratatui，只发送
+**差分**：被擦掉的静态区域（边框、输入框、页脚）内容未变，永远不会被
+重画，于是看起来就是「大片变黑，只剩还在刷新的那几行」。
+
+**证据链**：
+
+1. 把真实会话（`5fb53ab3`，24 次工具调用全部 ok）重放进 TUI 缓冲：
+   每一帧都完整（非空白字符 585 → 1274 单调增长），**App 绘制本身没问题**；
+2. 截图里可见的 9 行，正好等于重放帧的第 5–13 行（自 `shell_exec` 起）：
+   它上面的 `list_dir .`、任务起始行、边框全黑，而输入框/页脚在启动后
+   再未变化过——**清屏恰好发生在第一次 `shell_exec` 那一刻**；
+3. 时间上也吻合：这是 `shell_exec` 第一次真正跑通，也是第一次出现黑屏。
+
+### 乱码：`chcp` 管不了管道
+
+实测（字节级）：
+
+```text
+echo 中文ABC               → D6 D0 CE C4 41 42 43   （GBK）
+chcp 65001 >nul && echo …  → D6 D0 CE C4 41 42 43   （一模一样）
+```
+
+`chcp` 只改控制台**显示**用的代码页，对管道里的字节毫无影响。子进程按
+**OEM 代码页**输出，之前硬按 UTF-8 解就是满屏 `U+FFFD`。
+
+### 改动
+
+| 项 | 位置 |
+|---|---|
+| 子进程 `CREATE_NO_WINDOW`：起在自己的控制台里，改代码页/清屏都碰不到 TUI | `agent-tools/src/shell.rs` |
+| 去掉 `chcp 65001` 装饰（无效，且是黑屏元凶） | 同上 |
+| `decode_output`：UTF-8 严格解码 → 失败按 OEM 代码页（`MultiByteToWideChar(CP_OEMCP)`） | 同上 |
+| 整屏重绘请求 + `Ctrl+L` 手动触发 | `agent-tui/src/app.rs` |
+| `draw_frame()`：重绘走 `terminal.clear()`，`Resize` 同样清屏 | `agent-tui/src/render.rs` |
+
+> 上面那条「整屏重绘」最初的实现用了 `swap_buffers()`（以为能不闪地整屏重画），
+> 是错的，代价见下一节——已改成 `clear()`。
+
+## 缺陷修复：旧帧字尾留在屏幕上（2026-10-16）
+
+**症状**：任务收尾前后，对话区出现两帧文字叠在一起，例如
+`✔ list_dir e. 0msng the project to understand its current state.`，右侧还散着
+`字增量`、`ws 缺` 这类旧帧片段。
+
+**根因**：黑屏修复里用了 `Terminal::swap_buffers()` 来「强制整屏重绘」。
+ratatui 的缓冲配对是 `previous = 屏幕上那一帧`、`current = 待渲染的空缓冲`，
+`flush()` 做 `previous.diff(current)`。而 `swap_buffers()`
+**只重置缓冲、不擦屏**：
+
+```rust
+// ratatui-0.29.0/src/terminal/terminal.rs
+pub fn swap_buffers(&mut self) { self.buffers[1 - self.current].reset(); self.current = 1 - self.current; }
+```
+
+它把「代表屏幕」的那个缓冲重置成空白，于是下一帧的差分变成「空白 vs 新帧」，
+**新帧留空的单元格不会被写**——屏幕上那些位置保留着旧帧的内容，正是字尾残留。
+工具每调用一次就触发一次，所以工具行最明显。
+
+**反向验证**（把 `clear()` 换回 `swap_buffers()` 跑新用例）：
+
+```text
+│  BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA                        │
+    ↑ 新帧的 B        ↑ 旧帧残留的字尾
+```
+
+**改动**：
+
+| 项 | 位置 |
+|---|---|
+| `draw_frame()`：重绘用 `terminal.clear()`（擦屏 + 重置缓冲，两者同步） | `agent-tui/src/render.rs` |
+| 工具结束 / 任务收尾**不再**自动重绘：正确重绘要擦屏、会闪，而黑屏根因已在源头修掉（`CREATE_NO_WINDOW`）；要救有 `Ctrl+L` | `agent-tui/src/app.rs` |
+
+**验收**：新增 `forced_repaint_erases_stale_cells`（`TestBackend` 双缓冲，断言
+旧帧字尾被擦掉，且旧实现下确实失败）；`cargo xtask check` 通过，
+`cargo test --workspace` **159 passed / 0 failed**（自动重绘的两条用例随功能
+移除）。
+
+编码不能「一律按 GBK 解」：`type` / `cat` / `git` / `rg` 本身吐 UTF-8，
+再按 GBK 解会把它们弄坏。所以先严格试 UTF-8，失败才退回 OEM 代码页。
+
+**验收**：`dir /a` 输出恢复为「驱动器 D 中的卷是 Data」；`cargo xtask check`
+通过，`cargo test --workspace` **156 passed / 0 failed**（新增 7 个：2 个真实
+进程用例 + 5 个 TUI 用例）。
+
+## 缺陷修复：任务收尾把最后一段回答又输出一遍（2026-10-16）
+
+**症状**：任务完成后，「✔ 任务完成」下面又整段冒出刚回答过的内容，而且是暗色
+（截图里那份 2000+ 字的项目介绍）。
+
+**根因**：`TaskFinished` 的 `summary` **就是最后一轮模型的原文**——`runner.rs`
+直接 `out.text.clone()`。而这份原文早已通过 `Event::TextDelta` 流式渲染成
+`Line::Assistant`（亮色正文，`runner.rs` 每段增量都往总线发一份）。TUI 收尾时
+又把 `summary` 拼进一个 `Line::System` 推了第二次，于是同一段话显示两遍，且
+第二遍落在灰显的系统行里——原 `Line::System` 是给「系统提示」用的。
+
+实测（会话 `4863457a`）：`task_finished.summary` 与最后一次 `assistant_turn.text`
+长度同为 2122，`-eq` 判等为真。
+
+**改动**（`agent-tui/src/app.rs`）：
+
+| 收尾分支 | 现在 |
+|---|---|
+| `Success` | 只推「✔ 任务完成。」；`summary` 与已有 `Line::Assistant` **内容相同就不再显示**；对不上时才补（模型未流式输出、断流重放，以及「连续多轮没有产出」的合成摘要），且按正文亮色渲染；产物另起一行 |
+| `Failed` | 改用 `Line::Error`（红）：失败原先也是灰显系统行，和普通记录混在一起 |
+
+关键是**按内容判重，而不是无条件跳过**：`summary` 是模型没有流式输出时唯一的
+正文来源，无条件跳过会直接把内容弄丢。
+
+**验收**：新增 4 个单测（含一个 `TestBackend` 帧快照，断言答案在整帧里只出现
+一次）；`cargo xtask check` 通过，`cargo test --workspace` **160 passed / 0 failed**。
 
 ## 已知限制（一期）
 

@@ -11,7 +11,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line as RtLine, Span, Text};
@@ -93,7 +93,7 @@ async fn event_loop(
         // 当前终端尺寸（鼠标事件需要靠它判断指针落在哪个区域）
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
-        terminal.draw(|f| draw(f, app))?;
+        draw_frame(terminal, app)?;
 
         // 非阻塞地抽干事件队列。
         //
@@ -120,47 +120,53 @@ async fn event_loop(
                     // Windows 的 crossterm 会对每次输入同时上报 Press 与 Release；
                     // 中文 IME 尤其明显（每个字符两条事件）。只处理 Press，
                     // 否则字符会被插入两次（“你好” → “你你好好”）。
-                    if !should_handle_key(&key) {
-                        continue;
-                    }
-                    match handle_key(app, key) {
-                        UiAction::Quit => {
-                            let _ = cmd_tx.send(Command::Quit).await;
-                            return Ok(());
-                        }
-                        UiAction::Submit(text) => {
-                            let mut spec =
-                                agent_core::task::TaskSpec::new(text.clone(), String::new());
-                            spec.title = text.chars().take(24).collect();
-                            // 工作区由编排层填入；这里发送带 prompt 的任务
-                            if cmd_tx.send(Command::SubmitTask(spec)).await.is_err() {
-                                app.backend_disconnected();
+                    //
+                    // 别写成 `if !… { continue; }`——那会落在外层主循环上：
+                    // 白画一帧不说，还跳过本轮末尾的退出检查。
+                    if should_handle_key(&key) {
+                        match handle_key(app, key) {
+                            UiAction::Quit => {
+                                let _ = cmd_tx.send(Command::Quit).await;
+                                return Ok(());
                             }
-                        }
-                        UiAction::Cancel => {
-                            if let Some(c) = app.cancel_command() {
-                                if cmd_tx.send(c).await.is_err() {
+                            UiAction::Submit(text) => {
+                                let mut spec =
+                                    agent_core::task::TaskSpec::new(text.clone(), String::new());
+                                spec.title = text.chars().take(24).collect();
+                                // 工作区由编排层填入；这里发送带 prompt 的任务
+                                if cmd_tx.send(Command::SubmitTask(spec)).await.is_err() {
                                     app.backend_disconnected();
                                 }
                             }
-                        }
-                        UiAction::Approve { remember } => {
-                            if let Some(c) = app.take_approval(true, remember) {
-                                if cmd_tx.send(c).await.is_err() {
-                                    app.backend_disconnected();
+                            UiAction::Cancel => {
+                                if let Some(c) = app.cancel_command() {
+                                    if cmd_tx.send(c).await.is_err() {
+                                        app.backend_disconnected();
+                                    }
                                 }
                             }
-                        }
-                        UiAction::Reject => {
-                            if let Some(c) = app.take_approval(false, false) {
-                                if cmd_tx.send(c).await.is_err() {
-                                    app.backend_disconnected();
+                            UiAction::Approve { remember } => {
+                                if let Some(c) = app.take_approval(true, remember) {
+                                    if cmd_tx.send(c).await.is_err() {
+                                        app.backend_disconnected();
+                                    }
                                 }
                             }
+                            UiAction::Reject => {
+                                if let Some(c) = app.take_approval(false, false) {
+                                    if cmd_tx.send(c).await.is_err() {
+                                        app.backend_disconnected();
+                                    }
+                                }
+                            }
+                            UiAction::None => {}
                         }
-                        UiAction::None => {}
                     }
                 }
+                // 终端缩放：物理屏幕会被终端重排，而 ratatui 只在「尺寸确实
+                // 变了」时才自己 clear（窗口动画 / DPI 变化可能查不到差异）。
+                // 这里直接清屏 + 重置后台缓冲，保证下一帧是干净的整屏重画。
+                CtEvent::Resize(_, _) => terminal.clear()?,
                 // 鼠标滚轮：按指针所在区域分流——对话区上下滚，输入区左右滚。
                 CtEvent::Mouse(m) => handle_mouse(app, m, area),
                 _ => {}
@@ -303,12 +309,31 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
             app.scroll_down(5);
             UiAction::None
         }
+        // Ctrl+L：整屏重绘。约定俗成的「刷新屏幕」键，屏幕被外部弄脏时手动救回。
+        (KeyCode::Char('l'), m) if m.contains(KeyModifiers::CONTROL) => {
+            app.request_repaint();
+            UiAction::None
+        }
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
             app.on_char(c);
             UiAction::None
         }
         _ => UiAction::None,
     }
+}
+
+/// 画一帧；App 请求了整屏重绘时，先擦屏。
+///
+/// 必须用 `Terminal::clear()`——它**同时**擦掉物理屏幕并重置后台缓冲，两者保持
+/// 同步。别用 `swap_buffers()`：它只重置缓冲、不擦屏，于是下一帧的差分变成
+/// 「空白 vs 新帧」，新帧留空的单元格不会被写——屏幕上那些位置仍是旧帧的字尾，
+/// 表现为 `list_dir e. 0msng the project…` 这种两帧文字叠在一起。
+fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
+    if app.take_repaint() {
+        terminal.clear()?;
+    }
+    terminal.draw(|f| draw(f, app))?;
+    Ok(())
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -776,6 +801,7 @@ fn truncate_json(v: &serde_json::Value, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::buffer::Buffer;
 
     fn key_with_kind(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
         KeyEvent {
@@ -1044,15 +1070,19 @@ mod tests {
     // ---- 渲染快照（TestBackend，验证 P0 视觉验收项） ----
 
     /// 把整个界面渲染到内存缓冲并转成文本，用于断言实际输出。
-    ///
-    /// 宽字符（中文）会占用额外的「续行」cell，逐 cell 拼接会得到
-    /// 「输 入」这种被撑开的文本；这里按显示宽度跳过续行 cell。
     fn render_to_string(app: &App, w: u16, h: u16) -> String {
         use ratatui::backend::TestBackend;
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| draw(f, app)).expect("draw");
-        let buf = terminal.backend().buffer();
+        buffer_text(terminal.backend().buffer(), w, h)
+    }
+
+    /// 缓冲 → 文本。
+    ///
+    /// 宽字符（中文）会占用额外的「续行」cell，逐 cell 拼接会得到
+    /// 「输 入」这种被撑开的文本；这里按显示宽度跳过续行 cell。
+    fn buffer_text(buf: &Buffer, w: u16, h: u16) -> String {
         (0..h)
             .map(|y| {
                 let mut row = String::new();
@@ -1474,5 +1504,87 @@ mod tests {
             3,
             "footer 区滚轮不应移动光标"
         );
+    }
+
+    /// 回归：任务收尾时，最后一段回答不该在帧里出现两次。
+    ///
+    /// `task_finished.summary` 与最后一轮 `assistant_turn.text` 字节相同
+    /// （runner 直接 clone 的 `out.text`），TUI 曾把它整段再塞进一个灰显的
+    /// 系统行——「任务完成之后还会输出这么多暗色内容」即此。
+    #[test]
+    fn task_finished_frame_shows_the_answer_once() {
+        use agent_core::event::{Event, Outcome};
+        use agent_core::ids::TaskId;
+
+        let mut app = App::default();
+        let id = TaskId::new();
+        let text = "项目介绍：一个个人独占的 Agent。";
+        app.apply_event(Event::TextDelta {
+            id: id.clone(),
+            text: text.into(),
+        });
+        app.apply_event(Event::TaskFinished {
+            id,
+            outcome: Outcome::Success {
+                summary: text.into(),
+                artifacts: vec![],
+            },
+        });
+
+        let dump = render_to_string(&app, 80, 22);
+        assert_eq!(
+            dump.matches("一个个人独占").count(),
+            1,
+            "帧里只应出现一次：\n{dump}"
+        );
+    }
+
+    // ---- 整屏重绘必须真的擦屏（旧帧字尾不能留在屏幕上）----
+
+    /// 回归：`swap_buffers()` 只重置后台缓冲、不擦屏，于是下一帧的差分变成
+    /// 「空白 vs 新帧」——新帧留空的单元格不写，屏幕上那些位置仍是旧帧的字尾，
+    /// 表现为 `list_dir e. 0msng the project…` 这种两帧文字叠在一起。
+    /// 整屏重绘必须走 `Terminal::clear()`：擦屏 + 重置缓冲，两者同步。
+    #[test]
+    fn forced_repaint_erases_stale_cells() {
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).expect("terminal");
+        let mut app = App::default();
+        app.lines = vec![Line::Assistant("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into())];
+        draw_frame(&mut terminal, &mut app).expect("draw");
+
+        // 新帧比旧帧短：旧帧的字尾必须被擦掉，而不是留在屏幕上。
+        app.lines = vec![Line::Assistant("B".into())];
+        app.request_repaint();
+        draw_frame(&mut terminal, &mut app).expect("draw");
+
+        let dump = buffer_text(terminal.backend().buffer(), 60, 8);
+        assert!(!dump.contains("AAAA"), "旧帧的字尾没被擦掉：\n{dump}");
+        assert!(dump.contains('B'), "新帧要画出来：\n{dump}");
+    }
+
+    // ---- 整屏重绘（Ctrl+L 手动救回黑屏）----
+
+    #[test]
+    fn ctrl_l_requests_repaint() {
+        let mut app = App::default();
+        let _ = app.take_repaint();
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(matches!(handle_key(&mut app, key), UiAction::None));
+        assert!(app.take_repaint(), "Ctrl+L 应请求整屏重绘");
+    }
+
+    #[test]
+    fn plain_l_is_still_a_normal_character() {
+        // Ctrl+L 不能把普通输入吃掉。
+        let mut app = App::default();
+        let _ = app.take_repaint();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.input.buffer, "l");
+        assert!(!app.take_repaint());
     }
 }

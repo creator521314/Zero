@@ -136,6 +136,16 @@ pub struct App {
     cursor_last_blink: std::time::Instant,
     /// 编排层事件流是否已断开（用于只提示一次，避免每帧刷屏）。
     backend_down: bool,
+    /// 请求下一帧整屏重绘（实现为 `Terminal::clear()`，见 render.rs）。
+    ///
+    /// ratatui 只发送**差分**：物理屏幕一旦被外部改动（终端重排、别的进程
+    /// 碰过它），未变化的单元格就再也不会被重画。但整屏重绘要擦屏、会闪，
+    /// 所以只在**用户主动要求**时用：`Ctrl+L`。
+    ///
+    /// 工具执行完不再自动重绘——黑屏的根因（子进程共享控制台、`chcp` 连带
+    /// 擦屏）已在 `agent-tools/src/shell.rs` 从源头修掉（`CREATE_NO_WINDOW`），
+    /// 没必要让每次工具调用都闪一下。
+    needs_repaint: bool,
     /// 日志文件路径：断连提示里直接给出，省得用户翻配置目录。
     log_path: Option<String>,
 }
@@ -169,6 +179,7 @@ impl Default for App {
             cursor_visible: true,
             cursor_last_blink: std::time::Instant::now(),
             backend_down: false,
+            needs_repaint: false,
             log_path: None,
         }
     }
@@ -249,6 +260,11 @@ impl App {
                     ToolOutcome::Denied => "被权限规则拒绝".into(),
                     ToolOutcome::Rejected => "已拒绝".into(),
                 };
+                // 这里**不**请求整屏重绘：正确的整屏重绘要擦屏（`Terminal::clear`），
+                // 每次工具调用都擦一下就是每调一次闪一次。黑屏的根因已在源头修掉
+                // ——子进程带 `CREATE_NO_WINDOW` 起在自己的控制台里，改代码页、
+                // 清屏都碰不到我们的屏幕（见 `agent-tools/src/shell.rs`）。
+                // 屏幕万一还是脏了，Ctrl+L 手动救。
                 self.auto_scroll();
             }
             // 上下文快照与整轮回复只服务审计复盘，不进对话流。
@@ -263,22 +279,40 @@ impl App {
                 });
             }
             Event::TaskFinished { outcome, .. } => {
-                let msg = match &outcome {
+                match &outcome {
                     Outcome::Success { summary, artifacts } => {
-                        let mut s = format!("✔ 任务完成。\n{summary}");
+                        self.lines.push(Line::System("✔ 任务完成。".into()));
+                        // summary 就是最后一轮模型的原文（runner 直接 clone 的
+                        // `out.text`），而原文已经作为 Line::Assistant 流式渲染
+                        // 过一遍了。再整段塞一次，同一段话就显示两遍——而且还落
+                        // 进灰显的系统行，读起来更费劲。
+                        //
+                        // 只有对不上时才补，两种情况：模型没有流式输出（重放、
+                        // 断流），以及「连续多轮没有产出」那条合成摘要。补的时
+                        // 候按正文渲染，别用系统提示的灰。
+                        let shown = self
+                            .lines
+                            .iter()
+                            .any(|l| matches!(l, Line::Assistant(t) if t.trim() == summary.trim()));
+                        if !shown && !summary.trim().is_empty() {
+                            self.lines.push(Line::Assistant(summary.clone()));
+                        }
                         if !artifacts.is_empty() {
-                            s.push_str("\n产物：");
+                            let mut s = String::from("产物：");
                             for a in artifacts {
                                 s.push_str(&format!("\n  - {a}"));
                             }
+                            self.lines.push(Line::System(s));
                         }
-                        s
                     }
-                    Outcome::Failed { reason } => format!("✘ 任务失败: {reason}"),
-                    Outcome::Cancelled => "⊘ 任务已取消".into(),
-                    Outcome::Paused => "⏸ 任务已暂停".into(),
-                };
-                self.lines.push(Line::System(msg));
+                    // 失败要看得见：灰显的系统提示会被当成一条普通记录划过去。
+                    Outcome::Failed { reason } => {
+                        self.lines
+                            .push(Line::Error(format!("✘ 任务失败: {reason}")));
+                    }
+                    Outcome::Cancelled => self.lines.push(Line::System("⊘ 任务已取消".into())),
+                    Outcome::Paused => self.lines.push(Line::System("⏸ 任务已暂停".into())),
+                }
                 self.active_task = None;
                 self.status = "就绪".into();
                 self.auto_scroll();
@@ -295,6 +329,16 @@ impl App {
         if self.follow {
             self.scroll_from_bottom = 0;
         }
+    }
+
+    /// 请求下一帧整屏重绘（用于从外部改动过的屏幕上自愈）。
+    pub fn request_repaint(&mut self) {
+        self.needs_repaint = true;
+    }
+
+    /// 取走重绘请求（取走即清零，避免每帧都整屏重画）。
+    pub fn take_repaint(&mut self) -> bool {
+        std::mem::take(&mut self.needs_repaint)
     }
 
     fn scroll_to_bottom(&mut self) {
@@ -577,6 +621,101 @@ mod tests {
         end_tool(&mut app, ToolOutcome::Ok, 1, None);
         end_tool(&mut app, ToolOutcome::Failed, 2, Some("迟到的事件"));
         assert_eq!(last_tool_status(&app), &ToolStatus::Ok { ms: 1 });
+    }
+
+    // ---- 任务收尾：不要把最后一段回答显示两遍 ----
+
+    /// 回归：`task_finished.summary` 就是最后一轮模型的原文（runner 直接
+    /// clone 的 `out.text`，实测与 `assistant_turn.text` 字节相同），而原文
+    /// 已经流式渲染过一遍。收尾时再整段塞一遍，同一段话就出现两次，且第二次
+    /// 是灰显的系统行——「任务完成之后还会输出这么多暗色内容」即此。
+    #[test]
+    fn task_finished_does_not_duplicate_streamed_text() {
+        let mut app = App::default();
+        let id = TaskId::new();
+        let text = "## 项目介绍\n\n一个个人独占、跑在自有设备上的 Agent。";
+        app.apply_event(Event::TextDelta {
+            id: id.clone(),
+            text: text.into(),
+        });
+        app.apply_event(Event::TaskFinished {
+            id,
+            outcome: Outcome::Success {
+                summary: text.into(),
+                artifacts: vec![],
+            },
+        });
+
+        let shown = app
+            .lines
+            .iter()
+            .filter(|l| match l {
+                Line::Assistant(s) | Line::System(s) => s.contains("一个个人独占"),
+                _ => false,
+            })
+            .count();
+        assert_eq!(shown, 1, "同一段回答只应显示一次：{:?}", app.lines);
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, Line::System(s) if s.contains("✔ 任务完成"))),
+            "完成标记仍要显示"
+        );
+    }
+
+    /// 反面：模型没有流式输出（重放、断流），或收尾摘要是「连续多轮没有产出」
+    /// 那条合成文本时——summary 是唯一来源，必须补上，且按正文渲染。
+    #[test]
+    fn task_finished_shows_summary_that_was_never_streamed() {
+        let mut app = App::default();
+        app.apply_event(Event::TaskFinished {
+            id: TaskId::new(),
+            outcome: Outcome::Success {
+                summary: "连续 4 轮没有产生新的文件或有效输出，任务可能已停滞。".into(),
+                artifacts: vec!["artifacts/report.md".into()],
+            },
+        });
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, Line::Assistant(s) if s.contains("任务可能已停滞"))),
+            "没流式过的摘要要补上，且是正文（亮色）行：{:?}",
+            app.lines
+        );
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, Line::System(s) if s.contains("report.md"))),
+            "产物仍要列出"
+        );
+    }
+
+    #[test]
+    fn task_failed_is_rendered_as_error() {
+        // 失败不该和普通系统提示一样灰着划过去。
+        let mut app = App::default();
+        app.apply_event(Event::TaskFinished {
+            id: TaskId::new(),
+            outcome: Outcome::Failed {
+                reason: "provider 超时".into(),
+            },
+        });
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, Line::Error(s) if s.contains("provider 超时"))),
+            "失败应以错误样式显示：{:?}",
+            app.lines
+        );
+    }
+
+    #[test]
+    fn repaint_request_is_one_shot() {
+        // 取走即清零：否则每帧都整屏重画（擦屏会闪），白费带宽。
+        let mut app = App::default();
+        app.request_repaint();
+        assert!(app.take_repaint());
+        assert!(!app.take_repaint(), "第二次取应为空");
     }
 
     // ---- 后端断开 ----

@@ -136,6 +136,9 @@ save_stream_deltas = false   # 逐字增量（开着日志会大一数量级）
   你启动 agent 时的当前目录（`agent.project_root`），这样「介绍当前项目」
   才有东西可看；每任务的私有数据仍单独存放，不污染项目。
 - `shell_exec` 用平台原生解释器：Windows 上 `cmd /C`、Unix 上 `/bin/sh -c`。
+  子进程带 `CREATE_NO_WINDOW` 起在自己的控制台里，它改代码页 / 清屏都不会
+  碰到 TUI 的屏幕。输出先按 UTF-8 严格解，失败再按系统 OEM 代码页解
+  （`dir` 这类是 GBK，`git` 这类是 UTF-8，两者都要活下来）。
 - `web_fetch` 有 SSRF 防护（禁内网/非 http(s)）；
 - 超大工具输出自动外置到 `ctx/`。
 
@@ -147,9 +150,15 @@ save_stream_deltas = false   # 逐字增量（开着日志会大一数量级）
 │   ├── artifacts/   # 交付物（持久化）
 │   ├── ctx/         # 外置大输出（临时，超期清理）
 │   └── snapshots/   # 写前备份
-├── logs/<session>.jsonl   # 事件流（唯一真相源，带 schema_version + 逻辑时钟）
+├── logs/
+│   ├── agent.log          # 运行期 tracing 日志（TUI 下 stdout 被占用，只能写文件）
+│   └── <session>.jsonl    # 事件流（唯一真相源，带 schema_version + 逻辑时钟）
 └── tasks/<task-id>.json
 ```
+
+> 日志目录由 `agent.root` 推导（`<root>/logs`），可用 `AGENT_LOG_DIR` 覆盖。
+> **不放在 `config/` 下**：那是代码仓库里的配置目录，运行期产物混进去既脏又
+> 容易被误提交。
 
 > 两个目录要分清：
 >
@@ -182,6 +191,15 @@ cargo xtask log <task-id> --full     # 展开完整上下文与工具返回原�
 落盘规则集中在 `crates/agent-store/src/recorder.rs`：逐字增量默认不落
 （内容已由 `assistant_turn` 完整覆盖，开着会让日志大一数量级——同一段
 对话实测从 687 条事件降到约 20 条）。
+
+### 屏幕花了 / 大面积变黑
+
+按 **`Ctrl+L`** 整屏重绘即可恢复。
+
+TUI 只发送差分（ratatui 的机制），物理屏幕一旦被外部改动，没变化的区域
+就不会被重画。整屏重绘必须**擦屏**（`Terminal::clear()`），而擦屏会闪，
+所以只在 `Ctrl+L` 与终端缩放时做——工具执行完不自动重绘，因为子进程已经
+起在自己的控制台里（`CREATE_NO_WINDOW`），碰不到我们的屏幕。
 
 ## 测试
 
