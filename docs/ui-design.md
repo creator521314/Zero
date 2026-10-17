@@ -434,7 +434,7 @@ crates/agent-tui/src/
 | 阶段 | 内容 | 改动范围 | 风险 | 状态 |
 |---|---|---|---|---|
 | **P0** | `theme.rs` 主题化；6 类消息样式；工具三态配色；输入框圆角 + pill；header + footer；滚动条；审批弹层升级 | `render.rs`、新增 `theme.rs` | 低（纯渲染层） | ✅ 2026-10-14 |
-| **P1** | 工具卡片耗时/错误原因（扩展 `Line::Tool`）；Toast；`Ctrl+R` 历史；`/` 命令与补全 ✅；`Ctrl+H` 隐藏 footer | `render.rs`、`app.rs`、`agent-core`（事件扩字段） | 中（需扩 `App` 状态） | 🔶 部分完成：工具四态 2026-10-15、`/` 命令补全 2026-10-17，其余待实施 |
+| **P1** | 工具卡片耗时/错误原因（扩展 `Line::Tool`）；Toast ✅；`Ctrl+R` 历史 ✅；`/` 命令与补全 ✅；`Ctrl+H` 隐藏 footer ✅ | `render.rs`、`app.rs`、`agent-core`（事件扩字段） | 中（需扩 `App` 状态） | ✅ 完成：工具四态 2026-10-15、`/` 命令补全 2026-10-17、Toast/历史/footer 2026-10-17 |
 | **P2** | 侧边栏（会话 / TODO 树）；`@` 文件补全；Markdown 渲染 ✅ 提前完成（2026-10-16）；diff 视图；主题换肤 | 新增 `widgets/` 模块（Markdown 落在 `markdown.rs`） | 高（M4） | 部分完成：Markdown 已落地，其余待实施 |
 
 ### P0 验收标准
@@ -463,7 +463,8 @@ crates/agent-tui/src/
 
 ### P1 剩余项
 
-Toast 通知、`Ctrl+R` 输入历史、`Ctrl+H` 隐藏 footer。
+无 —— Toast 通知、`Ctrl+R` 输入历史、`Ctrl+H` 隐藏 footer 已于 2026-10-17 一并落地，
+P1 阶段全部完成。
 
 ---
 

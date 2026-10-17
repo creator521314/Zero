@@ -33,9 +33,9 @@
 | `agent-tools::fs_tools` | 相对路径落到项目根；无项目根时退回私有工作区；空目录明说；读目录给出替代工具 |
 | `agent-providers` | tool 消息转换；assistant tool_call 转换（arguments 必须为字符串） |
 | `agent-runtime::context` | 上下文压缩保留固定区并生成摘要 |
-| `agent-tui::app` | 多字节字符编辑；流式增量合并为一行；空输入不提交；工具四态流转（含迟到事件不覆盖已终结行）；重绘请求取走即清零；任务收尾不重复渲染已流式输出的原文（对不上时仍补），失败按错误样式显示；工作中/等审批的判定；spinner 帧随 tick 转动；`/` 命令补全状态（候选过滤、选中、执行 `/clear` `/help` `/tier`） |
+| `agent-tui::app` | 多字节字符编辑；流式增量合并为一行；空输入不提交；工具四态流转（含迟到事件不覆盖已终结行）；重绘请求取走即清零；任务收尾不重复渲染已流式输出的原文（对不上时仍补），失败按错误样式显示；工作中/等审批的判定；spinner 帧随 tick 转动；`/` 命令补全状态（候选过滤、选中、执行 `/clear` `/help` `/tier`）；输入历史记录/去重/`Ctrl+R` 循环召回；Toast 创建与到期清除；footer 显隐 |
 | `agent-tui::theme` | 权限档位 → 徽章色/文案映射（三态、大小写不敏感） |
-| `agent-tui::render` | 六类消息符号与缩进；工具四态符号/耗时/原因（多行压单行、超长截断）；工具名固定列对齐（含中文宽度）；软换行不丢字符、不超宽、样式跟随；滚到底能看到最后一行；鼠标交互（滚轮区段分流、点击定位光标、滚动条点击/拖拽、徽章切档、审批按钮点击）；`/` 命令补全浮层（前缀过滤、键盘选中、鼠标点击候选）；`TestBackend` 渲染快照（任务收尾只出现一次、整屏重绘擦掉旧帧字尾） |
+| `agent-tui::render` | 六类消息符号与缩进；工具四态符号/耗时/原因（多行压单行、超长截断）；工具名固定列对齐（含中文宽度）；软换行不丢字符、不超宽、样式跟随；滚到底能看到最后一行；鼠标交互（滚轮区段分流、点击定位光标、滚动条点击/拖拽、徽章切档、审批按钮点击）；`/` 命令补全浮层（前缀过滤、键盘选中、鼠标点击候选）；Toast 右上角反色覆盖渲染；footer 隐藏时布局收回该行；`Ctrl+H`/`Ctrl+R` 按键；`TestBackend` 渲染快照（任务收尾只出现一次、整屏重绘擦掉旧帧字尾） |
 | `agent-tui::markdown` | 助手回答的 Markdown 渲染：标题/粗斜体/删除线/行内码/围栏代码块/有序无序列表/任务列表/引用/分隔线/链接；表格 HTML 降级不丢内容；流式残缺不崩不吞字符；软换行 + 列表悬挂缩进 |
 | `agent-store` | 追加 + 重载；逻辑时钟单调；durability 保留 |
 | `agent-store::recorder` | 落盘分类（持久/临时/不落）；总线滞后跳过而不退出；每条事件只落一次；增量默认不落 |
@@ -530,6 +530,26 @@ footer 是纯快捷键提示条，没有可点击目标，故不参与命中分�
 **验收**：新增 10 个单测（前缀过滤、审批弹层不补全、三命令执行语义、激活/过滤、
 Enter 精确执行 vs 前缀补全、上下选与 Esc、Tab 补全、菜单坐标、鼠标点击、渲染
 快照）；`cargo test --workspace` **205 passed / 0 failed**。
+
+## 改动：P1 交互收尾（Toast / `Ctrl+R` 历史 / `Ctrl+H` 隐藏 footer）（2026-10-17）
+
+P1 剩余三项交互一次落地：Toast 通知、`Ctrl+R` 输入历史、`Ctrl+H` 隐藏 footer。
+
+| 项 | 说明 |
+|---|---|
+| Toast 通知 | `App::toast(text)` 创建 2 秒过期提示，`on_tick` 到期清除；右上角反色块覆盖渲染，叠在审批弹层之上，任意状态都看得见 |
+| `Ctrl+R` 输入历史 | `submit` 记录历史并去重；`recall_history` 循环回溯；手动编辑（打字/退格/Delete/Tab/补全/提交）后 `leave_history` 归零，下次从最新开始 |
+| `Ctrl+H` 隐藏 footer | `toggle_footer` 翻转显隐；`layout_chunks` 按 footer 高 1/0 收回该行还给对话区 |
+| 切档反馈 | `cycle_tier` 由改写状态改为发 Toast，不再覆盖「运行状态」 |
+
+**实现要点**：Toast 用 `Instant + Duration` 单调时钟到期，不依赖系统时间；`Ctrl+H`
+在 crossterm 0.28 Windows 下解析为 `Char('h')+CONTROL`，与 Backspace 可区分；
+带 `CONTROL` 的字符在普通输入分支之前单独拦截，不会误入正文。
+
+**验收**：新增 12 个单测（app：提交去重/循环回溯/空历史 Toast/编辑后重开回溯/
+footer 翻转/Toast 到期/切档 Toast；render：`Ctrl+H` 切 footer/`Ctrl+R` 召回历史/
+隐藏布局收行/footer 不渲染/Toast 右上角渲染）；`cargo xtask check` 通过，
+`cargo test --workspace` **217 passed / 0 failed**。
 
 ## 已知限制（一期）
 

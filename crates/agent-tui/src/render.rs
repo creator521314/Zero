@@ -67,18 +67,19 @@ pub async fn run_tui(
     result
 }
 
-/// 四行布局：header(1) / 对话流(弹性) / 输入区(3) / footer(1)。
+/// 四行布局：header(1) / 对话流(弹性) / 输入区(3) / footer(1，可隐藏)。
 ///
 /// 索引约定（`handle_mouse` 依赖）：0=header，1=对话区，2=输入区，3=footer。
 /// 终端高度过小时 ratatui 会自动压缩，但索引始终存在。
-fn layout_chunks(area: Rect) -> [Rect; 4] {
+fn layout_chunks(area: Rect, footer_visible: bool) -> [Rect; 4] {
+    let footer_h = if footer_visible { 1 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Min(3),    // 对话流
-            Constraint::Length(3), // 输入区
-            Constraint::Length(1), // footer
+            Constraint::Length(1),        // header
+            Constraint::Min(3),           // 对话流
+            Constraint::Length(3),        // 输入区
+            Constraint::Length(footer_h), // footer
         ])
         .split(area);
     [chunks[0], chunks[1], chunks[2], chunks[3]]
@@ -231,7 +232,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
         return handle_approval_mouse(m, area);
     }
 
-    let chunks = layout_chunks(area);
+    let chunks = layout_chunks(area, app.footer_visible);
     let header = chunks[0];
     let conv = chunks[1];
     let input = chunks[2];
@@ -485,6 +486,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
                 app.input.buffer = c.to_string();
                 app.input.move_end();
                 app.wake_cursor();
+                app.leave_history();
                 return UiAction::None;
             }
             KeyCode::Enter => {
@@ -498,6 +500,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
                     app.input.buffer = c.to_string();
                     app.input.move_end();
                     app.wake_cursor();
+                    app.leave_history();
                 }
                 return UiAction::None;
             }
@@ -531,6 +534,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
         (KeyCode::Delete, _) => {
             app.input.delete();
             app.wake_cursor();
+            app.leave_history();
             app.refresh_completion();
             UiAction::None
         }
@@ -575,6 +579,17 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
             app.request_repaint();
             UiAction::None
         }
+        // Ctrl+H：切换 footer 显隐（crossterm 0.28 会把 Ctrl+H 解析成
+        // `Char('h')+CONTROL`，与 Backspace 可区分）。
+        (KeyCode::Char('h'), m) if m.contains(KeyModifiers::CONTROL) => {
+            app.toggle_footer();
+            UiAction::None
+        }
+        // Ctrl+R：循环回溯输入历史。
+        (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
+            app.recall_history();
+            UiAction::None
+        }
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
             app.on_char(c);
             // 输入 `/` 后按前缀实时过滤；退化成普通文本时菜单自动收起。
@@ -601,17 +616,22 @@ fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Resu
 
 fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
-    let chunks = layout_chunks(area);
+    let chunks = layout_chunks(area, app.footer_visible);
 
     draw_header(f, app, chunks[0]);
     draw_conversation(f, app, chunks[1]);
     draw_input(f, app, chunks[2]);
     draw_completion(f, app, chunks[2]);
-    draw_footer(f, chunks[3]);
+    if app.footer_visible {
+        draw_footer(f, chunks[3]);
+    }
 
     if let Some(p) = &app.pending {
         draw_approval(f, app, p, area);
     }
+
+    // Toast 叠在最上层（含审批弹层之上），保证任何状态下反馈都可见。
+    draw_toast(f, app, area);
 }
 
 /// 顶部信息栏：左「品牌 + 任务模式」，中「provider · 状态」，右「权限徽章」。
@@ -657,6 +677,27 @@ fn draw_footer(f: &mut Frame, area: Rect) {
         Paragraph::new(Span::styled(text, Style::default().fg(ink::FG_MUTED))),
         area,
     );
+}
+
+/// 右上角 Toast：瞬态反馈色块，叠在其它元素之上（含审批弹层）。
+///
+/// 无边框、纯背景反色，宽度按文本显示宽度（中文 2 列）加 2 列 padding 算，
+/// 极窄屏下压到屏宽避免越界。
+fn draw_toast(f: &mut Frame, app: &App, area: Rect) {
+    let Some(toast) = &app.toast else { return };
+    let w = (UnicodeWidthStr::width(toast.text.as_str()) + 2) as u16;
+    let w = w.min(area.width);
+    let x = area.x + area.width.saturating_sub(w);
+    let popup = Rect::new(x, area.y, w, 1);
+    f.render_widget(Clear, popup);
+    let line = RtLine::from(Span::styled(
+        format!(" {} ", toast.text),
+        Style::default()
+            .bg(ink::PRIMARY)
+            .fg(BG)
+            .add_modifier(Modifier::BOLD),
+    ));
+    f.render_widget(Paragraph::new(line), popup);
 }
 
 /// 构建对话区的渲染行（纯函数，便于单测）。
@@ -1605,7 +1646,7 @@ mod tests {
         let mut app = App::default();
         app.tier = "L2".into();
         let area = rect(80, 30);
-        let header = layout_chunks(area)[0];
+        let header = layout_chunks(area, true)[0];
         let badge = header_badge_rect(header, &app.tier);
         let m = mouse(MouseEventKind::Down(MouseButton::Left), badge.x, badge.y);
         let action = handle_mouse(&mut app, m, area);
@@ -1664,7 +1705,7 @@ mod tests {
             });
         }
         let area = rect(80, 30);
-        let conv = layout_chunks(area)[1];
+        let conv = layout_chunks(area, true)[1];
         let (sx, sy, sh) = scrollbar_track(conv).expect("有滚动条");
         let (total, view) = conversation_scroll_params(&app, conv);
         let max_scroll = total.saturating_sub(view);
@@ -2096,7 +2137,7 @@ mod tests {
 
     #[test]
     fn layout_has_four_regions_in_order() {
-        let chunks = layout_chunks(rect(80, 30));
+        let chunks = layout_chunks(rect(80, 30), true);
         assert_eq!(chunks[0].height, 1, "header 应为 1 行");
         assert_eq!(chunks[3].height, 1, "footer 应为 1 行");
         assert_eq!(chunks[2].height, 3, "输入区应为 3 行");
@@ -2391,6 +2432,72 @@ mod tests {
         let s = squash(&out);
         assert!(s.contains("输入任务"), "空输入应显示占位文字:\n{out}");
         assert!(s.contains("⏎"), "空输入应显示 Enter pill:\n{out}");
+    }
+
+    // ---- Ctrl+H / Ctrl+R / Toast ----
+
+    /// 构造带 Ctrl 修饰的按键（`Ctrl+H`、`Ctrl+R` 等）。
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: event::KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn ctrl_h_toggles_footer() {
+        let mut app = App::default();
+        assert!(app.footer_visible);
+        let _ = handle_key(&mut app, ctrl('h'));
+        assert!(!app.footer_visible);
+        assert_eq!(app.toast.as_ref().unwrap().text, "footer 已隐藏");
+    }
+
+    #[test]
+    fn ctrl_r_recalls_history() {
+        let mut app = App::default();
+        app.input.buffer = "first".into();
+        app.submit();
+        app.input.buffer = "second".into();
+        app.submit();
+        let _ = handle_key(&mut app, ctrl('r'));
+        assert_eq!(app.input.buffer, "second", "首次回溯到最新");
+    }
+
+    #[test]
+    fn layout_hides_footer_when_toggled() {
+        let shown = layout_chunks(rect(80, 30), true);
+        let hidden = layout_chunks(rect(80, 30), false);
+        assert_eq!(shown[3].height, 1, "footer 可见时高 1");
+        assert_eq!(hidden[3].height, 0, "footer 隐藏时高 0");
+        assert_eq!(hidden[1].height, shown[1].height + 1, "省下的行还给对话区");
+    }
+
+    #[test]
+    fn footer_hidden_not_rendered() {
+        let mut app = App::default();
+        app.footer_visible = false;
+        let out = render_to_string(&app, 80, 30);
+        // 「PgUp/Dn」只在 footer 出现（启动消息里也有 Ctrl+C，不能拿它当标记）。
+        assert!(
+            !squash(&out).contains("PgUp/Dn"),
+            "隐藏 footer 后不该出现快捷键提示:\n{out}"
+        );
+        let out2 = render_to_string(&App::default(), 80, 30);
+        assert!(squash(&out2).contains("PgUp/Dn"));
+    }
+
+    #[test]
+    fn toast_renders_top_right() {
+        let mut app = App::default();
+        app.toast("权限档位 L2");
+        let out = render_to_string(&app, 80, 30);
+        assert!(
+            squash(&out).contains("权限档位L2"),
+            "右上角应显示 Toast:\n{out}"
+        );
     }
 
     // ---- 审批弹层按键 ----

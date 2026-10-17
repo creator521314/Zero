@@ -1,5 +1,7 @@
 //! UI 状态与事件处理（不含渲染，便于单测）。
 
+use std::time::{Duration, Instant};
+
 use agent_core::event::{Command, Event, Outcome, ToolOutcome};
 use agent_core::ids::{ApprovalId, TaskId};
 use agent_core::perm::{ApprovalRequest, PermissionTier};
@@ -15,6 +17,13 @@ use crate::theme::{glyph, tier_label};
 /// `/compact`（手动压缩上下文）依赖后端能力，尚未落地，故不列入——遵循
 /// 「只提示已实现功能」的原则，避免补出执行不了的入口。
 pub const SLASH_COMMANDS: &[&str] = &["/clear", "/help", "/tier"];
+
+/// 右上角瞬态通知：`on_tick` 里到期自动清除，`text` 供渲染读取。
+pub struct Toast {
+    pub text: String,
+    /// 到期时刻（`Instant` 单调时钟，不受系统改时间影响）。
+    until: Instant,
+}
 
 /// 一条对话行。
 #[derive(Debug, Clone)]
@@ -180,6 +189,14 @@ pub struct App {
     pub completion_active: bool,
     /// `/` 命令补全菜单当前高亮的候选索引。
     pub completion_sel: usize,
+    /// 已提交的输入历史（时间正序，末尾最新；连续重复只记一条）。
+    history: Vec<String>,
+    /// 历史回溯游标：`Some(i)` 表示正在查看 `history[i]`；用户编辑后置回 None。
+    history_cursor: Option<usize>,
+    /// footer 是否可见（`Ctrl+H` 切换）。
+    pub footer_visible: bool,
+    /// 右上角瞬态通知；None 表示当前没有。
+    pub toast: Option<Toast>,
 }
 
 impl App {
@@ -216,6 +233,10 @@ impl Default for App {
             log_path: None,
             completion_active: false,
             completion_sel: 0,
+            history: Vec::new(),
+            history_cursor: None,
+            footer_visible: true,
+            toast: None,
         }
     }
 }
@@ -384,24 +405,31 @@ impl App {
     /// 处理普通字符输入。
     pub fn on_char(&mut self, c: char) {
         self.input.insert_char(c);
+        self.leave_history();
         self.wake_cursor();
     }
 
     pub fn on_backspace(&mut self) {
         self.input.backspace();
+        self.leave_history();
         self.wake_cursor();
     }
 
     /// 软光标闪烁周期。
     const CURSOR_BLINK_MS: u64 = 530;
 
-    /// 每个渲染 tick 调用一次：到点则翻转软光标可见性。
+    /// 每个渲染 tick 调用一次：到点则翻转软光标可见性、清除过期 Toast。
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         let elapsed = self.cursor_last_blink.elapsed().as_millis() as u64;
         if elapsed >= Self::CURSOR_BLINK_MS {
             self.cursor_visible = !self.cursor_visible;
-            self.cursor_last_blink = std::time::Instant::now();
+            self.cursor_last_blink = Instant::now();
+        }
+        if let Some(t) = &self.toast {
+            if t.until <= Instant::now() {
+                self.toast = None;
+            }
         }
     }
 
@@ -433,7 +461,9 @@ impl App {
             "L2" => "L3".into(),
             _ => "L1".into(),
         };
-        self.status = format!("权限档位 {}", tier_label(&self.tier));
+        // 切档是瞬态反馈，走右上角 Toast；`status` 语义是「运行状态」，
+        // 不该被切档占用（否则会把「就绪 / 执行中」盖掉）。
+        self.toast(format!("权限档位 {}", tier_label(&self.tier)));
         self.wake_cursor();
     }
 
@@ -469,6 +499,51 @@ impl App {
     pub fn refresh_completion(&mut self) {
         self.completion_active = !self.slash_candidates().is_empty();
         self.completion_sel = 0;
+    }
+
+    /// 弹出右上角 Toast（默认 2 秒后自动消失）。
+    pub fn toast(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            until: Instant::now() + Duration::from_secs(2),
+        });
+    }
+
+    /// 切换 footer 显隐（`Ctrl+H`）。
+    pub fn toggle_footer(&mut self) {
+        self.footer_visible = !self.footer_visible;
+        self.toast(if self.footer_visible {
+            "footer 已显示"
+        } else {
+            "footer 已隐藏"
+        });
+        self.wake_cursor();
+    }
+
+    /// `Ctrl+R`：循环回溯输入历史（从最新往回，到最早后回到最新）。
+    pub fn recall_history(&mut self) {
+        if self.history.is_empty() {
+            self.toast("没有历史记录");
+            return;
+        }
+        let next = match self.history_cursor {
+            None => self.history.len() - 1,    // 首次：最新一条
+            Some(0) => self.history.len() - 1, // 已到最早，循环回最新
+            Some(i) => i - 1,                  // 上一条更早的
+        };
+        self.history_cursor = Some(next);
+        self.input.buffer = self.history[next].clone();
+        self.input.move_end();
+        self.wake_cursor();
+    }
+
+    /// 用户手动编辑了输入：退出历史回溯状态。
+    ///
+    /// 回溯游标只在 `recall_history` 里前进；一旦用户自己改了 buffer
+    /// （打字、退格、Delete、补全、执行命令），继续按 `Ctrl+R` 就应从
+    /// 最新历史重新开始，而不是接着上次的游标。
+    pub fn leave_history(&mut self) {
+        self.history_cursor = None;
     }
 
     /// 执行一条 `/` 命令；成功执行后清空输入并关闭补全菜单。
@@ -513,6 +588,11 @@ impl App {
         if trimmed.is_empty() {
             return None;
         }
+        // 记入历史（连续重复只记一条，避免连按回车刷出一串相同的）。
+        if self.history.last().map(String::as_str) != Some(trimmed) {
+            self.history.push(trimmed.to_string());
+        }
+        self.history_cursor = None;
         self.lines.push(Line::User(trimmed.to_string()));
         self.scroll_to_bottom();
         let mut spec = TaskSpec::new(trimmed.to_string(), String::new());
@@ -634,6 +714,100 @@ mod tests {
         s.backspace();
         assert_eq!(s.buffer, "写个脚");
         assert!(s.buffer.is_char_boundary(s.cursor));
+    }
+
+    // ---- Ctrl+R 历史 / Ctrl+H footer / Toast ----
+
+    #[test]
+    fn submit_records_history_and_dedups() {
+        let mut app = App::default();
+        app.input.buffer = "hello".into();
+        assert!(app.submit().is_some());
+        app.input.buffer = "hello".into();
+        assert!(app.submit().is_some(), "连续重复应只记一条");
+        app.input.buffer = "world".into();
+        assert!(app.submit().is_some());
+        assert_eq!(app.history, vec!["hello".to_string(), "world".to_string()]);
+    }
+
+    #[test]
+    fn recall_history_cycles_newest_to_oldest() {
+        let mut app = App::default();
+        for t in ["one", "two", "three"] {
+            app.input.buffer = t.into();
+            app.submit();
+        }
+        app.recall_history();
+        assert_eq!(app.input.buffer, "three", "首次回溯到最新");
+        app.recall_history();
+        assert_eq!(app.input.buffer, "two");
+        app.recall_history();
+        assert_eq!(app.input.buffer, "one");
+        app.recall_history();
+        assert_eq!(app.input.buffer, "three", "到最早后循环回最新");
+    }
+
+    #[test]
+    fn recall_history_empty_toasts() {
+        let mut app = App::default();
+        app.recall_history();
+        assert_eq!(app.toast.as_ref().unwrap().text, "没有历史记录");
+    }
+
+    #[test]
+    fn editing_after_recall_restarts_from_newest() {
+        let mut app = App::default();
+        for t in ["one", "two"] {
+            app.input.buffer = t.into();
+            app.submit();
+        }
+        app.recall_history(); // -> "two"
+        app.recall_history(); // -> "one"
+        assert_eq!(app.input.buffer, "one");
+        app.on_char('x'); // 用户编辑，退出回溯
+        app.recall_history();
+        assert_eq!(app.input.buffer, "two", "编辑后应从最新重新开始");
+    }
+
+    #[test]
+    fn toggle_footer_flips_and_toasts() {
+        let mut app = App::default();
+        assert!(app.footer_visible);
+        app.toggle_footer();
+        assert!(!app.footer_visible);
+        assert_eq!(app.toast.as_ref().unwrap().text, "footer 已隐藏");
+        app.toggle_footer();
+        assert!(app.footer_visible);
+        assert_eq!(app.toast.as_ref().unwrap().text, "footer 已显示");
+    }
+
+    #[test]
+    fn toast_expires_on_tick() {
+        let mut app = App {
+            toast: Some(Toast {
+                text: "x".into(),
+                until: Instant::now(), // 已到期
+            }),
+            ..Default::default()
+        };
+        app.on_tick();
+        assert!(app.toast.is_none(), "到期 Toast 应被清除");
+
+        app.toast("still here");
+        app.on_tick();
+        assert!(app.toast.is_some(), "未到期 Toast 应保留");
+    }
+
+    #[test]
+    fn cycle_tier_toasts_instead_of_status() {
+        let mut app = App::default();
+        let status_before = app.status.clone();
+        app.tier = "L1".into();
+        app.cycle_tier();
+        assert_eq!(app.tier, "L2");
+        assert_eq!(app.status, status_before, "切档不应覆盖运行状态");
+        // L2 的显示标签是「AUTO」（AI 审视）。
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("AUTO")));
     }
 
     #[test]
