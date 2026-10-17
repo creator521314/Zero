@@ -78,7 +78,7 @@ fn layout_chunks(area: Rect, footer_visible: bool) -> [Rect; 4] {
         .constraints([
             Constraint::Length(1),        // header
             Constraint::Min(3),           // 对话流
-            Constraint::Length(3),        // 输入区
+            Constraint::Length(5),        // 输入区（3 行可视内容，支持 Shift+Enter 换行）
             Constraint::Length(footer_h), // footer
         ])
         .split(area);
@@ -519,6 +519,17 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
             UiAction::Quit
         }
         (KeyCode::Esc, _) => UiAction::Cancel,
+        // Shift+Enter：插入换行（多行输入）。必须排在普通 Enter 之前，否则会被
+        // `(KeyCode::Enter, _)` 抢先匹配。Windows 上 crossterm 上报 `Enter + SHIFT`；
+        // 部分 Unix 终端把 Shift+Enter 与 Enter 上报成同一字节 `\r`，无法区分，
+        // 属终端限制，应用层无从判断。
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
+            app.input.insert_newline();
+            app.leave_history();
+            app.wake_cursor();
+            app.refresh_completion();
+            UiAction::None
+        }
         (KeyCode::Enter, _) => {
             // 提交
             match app.submit() {
@@ -929,47 +940,20 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let indicator = send_indicator(app);
     // 宽度固定：两种文案长度不同，若跟着变，内容区宽度就会来回抖。
     let ind_w = SEND_COL as u16;
-    let content_w = inner.width.saturating_sub(ind_w);
+    let content_w = inner.width.saturating_sub(ind_w) as usize;
+    let view_h = inner.height as usize;
 
-    // 软光标：把 buffer 按光标切成 前 / 光标处 / 后 三段，光标处用反显。
-    // 不依赖 f.set_cursor_position()——alternate screen 下 Windows Terminal
-    // 的原生光标常不闪烁，软光标在任何终端都有一致的闪烁行为。
-    let buf = &app.input.buffer;
-    let cursor_idx = app.input.cursor_char_index();
-    let before: String = buf.chars().take(cursor_idx).collect();
-    let mut rest = buf.chars().skip(cursor_idx);
-    let at_char = rest.next().unwrap_or(' ');
-    let after: String = rest.collect();
-
-    // 输入框是单行且不 wrap：内容超过框宽时靠**横向滚动**保证光标可见，
-    // 否则超长输入直接被裁掉、光标也跑出视野（之前正是如此）。
-    let cursor_col = UnicodeWidthStr::width(before.as_str());
-
-    let mut spans: Vec<Span> = Vec::new();
-    if buf.is_empty() {
-        // 空输入：软光标 + 占位文字（Enter 的提示在右侧指示器上）。
-        spans.push(cursor_cell(app.cursor_visible, ' '));
-        spans.extend(placeholder_spans());
-    } else {
-        spans.push(Span::raw(before.as_str()));
-        spans.push(cursor_cell(app.cursor_visible, at_char));
-        spans.push(Span::raw(after.as_str()));
-    }
-    // 光标 + 光标块占 cursor_col+1 列；放不下就往右滚，让光标贴右沿。
-    let hscroll = (cursor_col + 1).saturating_sub(content_w as usize) as u16;
-
+    // 多行输入：硬换行 + 垂直滚动 + 软光标 + 光标行横向滚动（见 `input_lines`）。
+    let lines = input_lines(app, content_w, view_h);
     let content = Rect {
-        width: content_w,
+        width: content_w as u16,
         ..inner
     };
-    f.render_widget(
-        Paragraph::new(RtLine::from(spans)).scroll((0, hscroll)),
-        content,
-    );
+    f.render_widget(Paragraph::new(Text::from(lines)), content);
 
     // 指示器贴右沿，固定不动。
     let ind_area = Rect {
-        x: inner.x.saturating_add(content_w),
+        x: inner.x.saturating_add(content_w as u16),
         width: ind_w,
         ..inner
     };
@@ -977,6 +961,81 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(indicator).alignment(Alignment::Right),
         ind_area,
     );
+}
+
+/// 把输入 buffer 渲染成可视行：硬换行 + 垂直滚动 + 软光标 + 光标行横向滚动。
+///
+/// 软光标不依赖 `f.set_cursor_position()`——alternate screen 下 Windows Terminal
+/// 的原生光标常不闪烁，软光标在任何终端都有一致的闪烁行为。
+fn input_lines(app: &App, content_w: usize, view_h: usize) -> Vec<RtLine<'static>> {
+    let buf = &app.input.buffer;
+    let (cur_line, cur_col) = app.input.cursor_line_col();
+    // `split('\n')` 保留末尾空行，空 buffer 得到 `[""]`。
+    let hard: Vec<&str> = buf.split('\n').collect();
+
+    if buf.is_empty() {
+        // 空输入：软光标 + 占位文字（Enter 的提示在右侧指示器上）。
+        let mut spans = vec![cursor_cell(app.cursor_visible, ' ')];
+        spans.extend(placeholder_spans());
+        return vec![RtLine::from(spans)];
+    }
+
+    // 垂直滚动：光标行始终落在可视区内（贴底优先）。
+    let vscroll = if hard.len() <= view_h || view_h == 0 {
+        0
+    } else {
+        cur_line
+            .saturating_sub(view_h.saturating_sub(1))
+            .min(hard.len() - view_h)
+    };
+
+    let mut lines: Vec<RtLine<'static>> = Vec::new();
+    for (i, seg) in hard.iter().copied().enumerate().skip(vscroll).take(view_h) {
+        if i == cur_line {
+            // 光标行：反显光标 + 横向滚动窗口跟随光标（CJK 按 2 列计）。
+            let before: String = seg.chars().take(cur_col).collect();
+            let cursor_col_w = UnicodeWidthStr::width(before.as_str());
+            let hscroll = (cursor_col_w + 1).saturating_sub(content_w);
+            let (disp, cut) = trim_left_by_width(seg, hscroll);
+            let disp_col = cur_col.saturating_sub(cut);
+            let disp_before: String = disp.chars().take(disp_col).collect();
+            let mut rest = disp.chars().skip(disp_col);
+            let at = rest.next().unwrap_or(' ');
+            let after: String = rest.collect();
+            lines.push(RtLine::from(vec![
+                Span::raw(disp_before),
+                cursor_cell(app.cursor_visible, at),
+                Span::raw(after),
+            ]));
+        } else {
+            // 非光标行：从头显示，超宽由 Paragraph 自动裁剪。
+            lines.push(RtLine::from(seg.to_string()));
+        }
+    }
+    lines
+}
+
+/// 按显示宽度从左侧裁剪 `cols` 列，返回（裁剪后文本, 被裁掉的 char 数）。
+///
+/// CJK 占 2 列；`\n` 已在上层拆行、这里不会再遇到。裁剪点只落在字符边界上，
+/// 因此「裁掉 cols 列」可能实际少裁（不会切碎一个字符）。
+fn trim_left_by_width(seg: &str, cols: usize) -> (String, usize) {
+    if cols == 0 {
+        return (seg.to_string(), 0);
+    }
+    let mut used = 0usize;
+    let mut byte = 0usize;
+    let mut cut = 0usize;
+    for (b, c) in seg.char_indices() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw > cols {
+            break;
+        }
+        used += cw;
+        byte = b + c.len_utf8();
+        cut += 1;
+    }
+    (seg[byte..].to_string(), cut)
 }
 
 /// 输入框右侧指示器的固定显示宽度（列）。
@@ -1802,6 +1861,26 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_inserts_newline_not_submit() {
+        let mut app = App::default();
+        for c in "ab".chars() {
+            let _ = handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        // 光标在末尾；Shift+Enter 换行，不提交任务。
+        let lines_before = app.lines.len();
+        let mut k = key(KeyCode::Enter);
+        k.modifiers = KeyModifiers::SHIFT;
+        let action = handle_key(&mut app, k);
+        assert_eq!(action, UiAction::None, "换行不应提交任务");
+        assert_eq!(app.input.buffer, "ab\n");
+        assert_eq!(app.lines.len(), lines_before, "不应产生用户消息");
+
+        // 普通 Enter 才提交。
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(matches!(action, UiAction::Submit(_)));
+    }
+
+    #[test]
     fn enter_executes_exact_or_completes_prefix() {
         // 精确匹配：直接执行 /clear
         let mut app = App::default();
@@ -1897,6 +1976,48 @@ mod tests {
         assert!(s.contains("/help"), "应显示 /help 候选:\n{out}");
         assert!(s.contains("/tier"), "应显示 /tier 候选:\n{out}");
         assert!(s.contains("命令"), "应显示菜单标题:\n{out}");
+    }
+
+    // ---- 多行输入渲染（Shift+Enter） ----
+
+    #[test]
+    fn input_lines_splits_hard_newlines() {
+        let mut app = App::default();
+        app.input.buffer = "abc\ndef".into();
+        app.input.cursor = app.input.buffer.len();
+        let text: Vec<String> = input_lines(&app, 80, 3)
+            .iter()
+            .map(|l| line_as_str(l).trim_end().to_string())
+            .collect();
+        assert_eq!(text, vec!["abc".to_string(), "def".to_string()]);
+    }
+
+    #[test]
+    fn input_lines_vertical_scroll_follows_cursor() {
+        let mut app = App::default();
+        // 4 行、可视 3 行：光标在第 3 行，应滚动到显示 l1/l2/l3。
+        app.input.buffer = "l0\nl1\nl2\nl3".into();
+        app.input.cursor = app.input.buffer.len();
+        let text: Vec<String> = input_lines(&app, 80, 3)
+            .iter()
+            .map(|l| line_as_str(l).trim_end().to_string())
+            .collect();
+        assert_eq!(
+            text,
+            vec!["l1".to_string(), "l2".to_string(), "l3".to_string()]
+        );
+    }
+
+    #[test]
+    fn trim_left_by_width_respects_cjk() {
+        // 「你」宽 2、「好」宽 2、「a」宽 1：裁 3 列不切碎字符，只裁掉「你」。
+        let (t, cut) = trim_left_by_width("你好a", 3);
+        assert_eq!(t, "好a");
+        assert_eq!(cut, 1);
+
+        let (t, cut) = trim_left_by_width("你好a", 0);
+        assert_eq!(t, "你好a");
+        assert_eq!(cut, 0);
     }
 
     // ---- 工具名固定列（pad_display） ----
@@ -2140,7 +2261,10 @@ mod tests {
         let chunks = layout_chunks(rect(80, 30), true);
         assert_eq!(chunks[0].height, 1, "header 应为 1 行");
         assert_eq!(chunks[3].height, 1, "footer 应为 1 行");
-        assert_eq!(chunks[2].height, 3, "输入区应为 3 行");
+        assert_eq!(
+            chunks[2].height, 5,
+            "输入区应为 5 行（3 行内容 + 边框，支持换行）"
+        );
         assert!(chunks[1].height >= 3, "对话区至少 3 行");
         // 顺序校验：header < 对话 < 输入 < footer
         assert!(chunks[0].y < chunks[1].y);

@@ -130,6 +130,23 @@ impl InputState {
     pub fn cursor_char_index(&self) -> usize {
         self.buffer[..self.cursor].chars().count()
     }
+    /// Shift+Enter：在光标处插入换行，支持多行输入。
+    pub fn insert_newline(&mut self) {
+        self.buffer.insert(self.cursor, '\n');
+        self.cursor += 1;
+    }
+    /// 光标所在的硬行号（0 起）与该行内字符列（按 char 计）。
+    ///
+    /// 供多行渲染定位软光标用：行号用于垂直滚动，列号用于横向滚动与反显。
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        let before = &self.buffer[..self.cursor];
+        let line = before.matches('\n').count();
+        let col = before
+            .rfind('\n')
+            .map(|i| before[i + 1..].chars().count())
+            .unwrap_or_else(|| before.chars().count());
+        (line, col)
+    }
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         std::mem::take(&mut self.buffer)
@@ -1151,6 +1168,35 @@ mod tests {
         s.move_left(); // cursor between a and c
         s.insert_char('b');
         assert_eq!(s.buffer, "abc");
+    }
+
+    #[test]
+    fn insert_newline_at_cursor() {
+        let mut s = InputState::default();
+        for c in "ab".chars() {
+            s.insert_char(c);
+        }
+        s.move_left(); // cursor between a and b
+        s.insert_newline();
+        assert_eq!(s.buffer, "a\nb");
+        assert_eq!(s.cursor, 2, "光标应落在换行符之后");
+    }
+
+    #[test]
+    fn cursor_line_col_tracks_multiline() {
+        let mut s = InputState::default();
+        for c in "ab\ncd\n".chars() {
+            s.insert_char(c);
+        }
+        // 光标在末尾：第 2 行（空行）第 0 列。
+        assert_eq!(s.cursor_line_col(), (2, 0));
+
+        s.move_left(); // 第二行 "cd" 末尾
+        assert_eq!(s.cursor_line_col(), (1, 2));
+        s.move_left(); // "c" 与 "d" 之间
+        assert_eq!(s.cursor_line_col(), (1, 1));
+        s.move_home();
+        assert_eq!(s.cursor_line_col(), (0, 0));
     }
 
     #[test]
