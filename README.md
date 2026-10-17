@@ -2,8 +2,9 @@
 
 一个由个人独占使用的、运行在自有设备上的、能实际动手干活的通用 AI Agent。
 
-> 一期（M1 骨架）：Rust 单机 Agent，TUI 交互，接入多云端 LLM（预留本地接口），
-> 能读写文件 / 执行命令 / 联网，完成任务级三档权限管控。
+> 一期（MVP）：Rust 单机 Agent，TUI 交互，接入多云端 LLM（预留本地接口），
+> 能读写文件 / 执行命令 / 联网，完成任务级三档权限管控，
+> 并支持「写文件 → 执行脚本 → 报告结果」的端到端任务闭环。
 
 ## 快速开始
 
@@ -28,7 +29,7 @@ agent-workspace/
 ├── crates/
 │   ├── agent-core/      # 领域核心：Event + 7 大 trait，零 IO 依赖（枢纽）
 │   ├── agent-runtime/   # 执行循环 + 上下文管理
-│   ├── agent-tools/     # file/shell/web 工具
+│   ├── agent-tools/     # file/shell/web/finish 工具 + 写前快照
 │   ├── agent-perm/      # 权限引擎（静态规则 + AI 审视）
 │   ├── agent-providers/ # LLM 适配（OpenAI 兼容 + 路由）
 │   ├── agent-tui/       # ratatui 界面
@@ -53,6 +54,30 @@ agent-workspace/
 
 静态高危规则（不可绕过，命中即人工确认）包括：`rm -rf /`、提权、磁盘写入、
 fork bomb、`curl | sh`、写 `/etc`、`~/.ssh` 等。
+
+## TUI 操作
+
+界面四区布局：header（档位徽章 + 运行状态）、对话区（Markdown 渲染）、
+输入区、footer（快捷键提示，可 `Ctrl+H` 隐藏）。右上角 Toast 负责瞬态反馈
+（切档、无历史、footer 显隐等，2 秒自动消失），叠在审批弹层之上。
+
+| 快捷键 | 功能 |
+|---|---|
+| `Enter` | 提交输入 |
+| `Shift+Enter` | 输入区换行（多行输入，最多 3 行可视） |
+| `Ctrl+R` | 循环回溯输入历史（连续重复提交只记一条） |
+| `Ctrl+H` | 显示 / 隐藏底部 footer |
+| `Ctrl+L` | 整屏重绘（屏幕被外部改动弄花时救回） |
+| `PageUp` / `PageDown` / 鼠标滚轮 | 对话区滚动 |
+| `Ctrl+A` / `Home`、`Ctrl+E` / `End` | 光标行首 / 行尾 |
+| `/` | 触发命令补全（`/clear` 清空对话、`/help` 帮助、`/tier` 切档） |
+| `Tab` / `↑` `↓` / `Esc` | 补全菜单：补全选中 / 选候选 / 关闭 |
+| `Ctrl+C` | 退出（审批弹层期间也可退出） |
+| 点击 header 档位徽章 | 循环切换权限档 L1 → L2 → L3 |
+
+审批弹层：`y` 或 `Enter` 批准本次；`a` 批准本任务同类操作；`n` 或 `Esc` 拒绝；
+`Ctrl+C` 退出。弹层按钮与补全候选也支持鼠标点击。档位切换（`/tier` 或点徽章）
+只影响**之后**提交的任务。
 
 ## 配置
 
@@ -130,11 +155,24 @@ save_stream_deltas = false   # 逐字增量（开着日志会大一数量级）
 
 ## 工具
 
-`file_read` / `file_write` / `file_edit` / `list_dir` / `shell_exec` / `web_fetch` / `web_search`
+内置 8 个工具：
+
+| 工具 | 用途 |
+|---|---|
+| `file_read` / `file_write` / `file_edit` | 读写/编辑文件；覆写前自动快照 |
+| `list_dir` | 列目录（读目录时提示改用此工具） |
+| `shell_exec` | 执行命令 |
+| `web_fetch` / `web_search` | 联网抓取 / 搜索 |
+| `finish` | 显式终止信号：总结 + 登记交付物路径，触发任务收尾 |
 
 - 所有文件操作限制在**项目目录**内（防 `../` 逃逸）。项目目录默认就是
   你启动 agent 时的当前目录（`agent.project_root`），这样「介绍当前项目」
   才有东西可看；每任务的私有数据仍单独存放，不污染项目。
+- `file_write` / `file_edit` 覆写前把旧内容备份到私有工作区 `snapshots/`
+  （`<文件名>.<毫秒>`），误写可回滚；新建文件不产生空快照。
+- `finish` 是显式终止信号：模型在 `summary` 里给总结、在 `artifacts` 里登记
+  交付物路径。它无副作用，调用后跳过权限裁决直接执行，并立即结束本轮任务
+  —— 任务完成不会被 L3 的审批弹窗打断。
 - `shell_exec` 用平台原生解释器：Windows 上 `cmd /C`、Unix 上 `/bin/sh -c`。
   子进程带 `CREATE_NO_WINDOW` 起在自己的控制台里，它改代码页 / 清屏都不会
   碰到 TUI 的屏幕。输出先按 UTF-8 严格解，失败再按系统 OEM 代码页解
@@ -204,7 +242,8 @@ TUI 只发送差分（ratatui 的机制），物理屏幕一旦被外部改动�
 ## 测试
 
 ```bash
-cargo test
+cargo test           # 全量测试
+cargo xtask check    # fmt + clippy + test 一站式检查
 ```
 
 ## 路线图
