@@ -312,7 +312,7 @@ P1 已落地为显式四态：`Line::Tool { name, summary, status: ToolStatus }`
 
 | pill | 含义 | 落地阶段 |
 |---|---|---|
-| `/` | 命令：`/clear` `/help` `/model` `/compact` | P1 |
+| `/` | 命令：一期落地 `/clear` `/help` `/tier`（`/model` `/compact` 待后端能力） | P1 ✅ 2026-10-17 |
 | `@` | 文件路径补全 | P2 |
 | `!` | Shell 直通 | P2 |
 | `#` | 切换智能体 | 二期 |
@@ -321,6 +321,13 @@ P1 已落地为显式四态：`Line::Tool { name, summary, status: ToolStatus }`
 **仅当输入为空时显示**。pill 字符设为 `Style::default().add_modifier(Modifier::REVERSED)`，后接灰字说明。
 
 > 一期只需实现 `/`，其余 pill 待对应功能落地后再显示（避免提示了做不到的功能）。
+>
+> `/` 命令补全（2026-10-17 落地）：输入 `/` 弹出候选浮层（贴输入框左上角往上长），
+> `↑/↓` 选候选、`Tab` 补全、`Enter` 执行（精确匹配才执行，前缀不完整时先补全让用户
+> 再确认一次）、`Esc` 关闭；鼠标点候选直接执行、点菜单外关闭。候选只列**能真正
+> 落地**的命令：`/clear`（清空对话）、`/help`（打印帮助）、`/tier`（切权限档）。
+> `/model`、`/compact` 依赖后端模型切换与手动压缩，尚未实现故不列入——宁可少列，
+> 也不补出执行不了的入口。
 
 ### 6.3 横向滚动
 
@@ -427,7 +434,7 @@ crates/agent-tui/src/
 | 阶段 | 内容 | 改动范围 | 风险 | 状态 |
 |---|---|---|---|---|
 | **P0** | `theme.rs` 主题化；6 类消息样式；工具三态配色；输入框圆角 + pill；header + footer；滚动条；审批弹层升级 | `render.rs`、新增 `theme.rs` | 低（纯渲染层） | ✅ 2026-10-14 |
-| **P1** | 工具卡片耗时/错误原因（扩展 `Line::Tool`）；Toast；`Ctrl+R` 历史；`/` 命令与补全；`Ctrl+H` 隐藏 footer | `render.rs`、`app.rs`、`agent-core`（事件扩字段） | 中（需扩 `App` 状态） | 🔶 部分完成：工具四态 2026-10-15，其余待实施 |
+| **P1** | 工具卡片耗时/错误原因（扩展 `Line::Tool`）；Toast；`Ctrl+R` 历史；`/` 命令与补全 ✅；`Ctrl+H` 隐藏 footer | `render.rs`、`app.rs`、`agent-core`（事件扩字段） | 中（需扩 `App` 状态） | 🔶 部分完成：工具四态 2026-10-15、`/` 命令补全 2026-10-17，其余待实施 |
 | **P2** | 侧边栏（会话 / TODO 树）；`@` 文件补全；Markdown 渲染 ✅ 提前完成（2026-10-16）；diff 视图；主题换肤 | 新增 `widgets/` 模块（Markdown 落在 `markdown.rs`） | 高（M4） | 部分完成：Markdown 已落地，其余待实施 |
 
 ### P0 验收标准
@@ -456,7 +463,7 @@ crates/agent-tui/src/
 
 ### P1 剩余项
 
-Toast 通知、`Ctrl+R` 输入历史、`/` 命令与补全、`Ctrl+H` 隐藏 footer。
+Toast 通知、`Ctrl+R` 输入历史、`Ctrl+H` 隐藏 footer。
 
 ---
 

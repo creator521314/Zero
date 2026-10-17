@@ -8,6 +8,14 @@ use tokio::sync::mpsc;
 
 use crate::theme::{glyph, tier_label};
 
+/// 一期可执行的 `/` 命令（顺序即补全菜单的展示顺序）。
+///
+/// 只列**真正能落地**的命令：`/clear` 清空对话、`/help` 显示帮助、`/tier`
+/// 切换权限档，三者都只改本地 UI 状态。设计稿里的 `/model`（切模型）、
+/// `/compact`（手动压缩上下文）依赖后端能力，尚未落地，故不列入——遵循
+/// 「只提示已实现功能」的原则，避免补出执行不了的入口。
+pub const SLASH_COMMANDS: &[&str] = &["/clear", "/help", "/tier"];
+
 /// 一条对话行。
 #[derive(Debug, Clone)]
 pub enum Line {
@@ -168,6 +176,10 @@ pub struct App {
     needs_repaint: bool,
     /// 日志文件路径：断连提示里直接给出，省得用户翻配置目录。
     log_path: Option<String>,
+    /// `/` 命令补全菜单是否激活（输入 `/` 时打开，`Esc` / 执行后关闭）。
+    pub completion_active: bool,
+    /// `/` 命令补全菜单当前高亮的候选索引。
+    pub completion_sel: usize,
 }
 
 impl App {
@@ -202,6 +214,8 @@ impl Default for App {
             backend_down: false,
             needs_repaint: false,
             log_path: None,
+            completion_active: false,
+            completion_sel: 0,
         }
     }
 }
@@ -430,6 +444,66 @@ impl App {
             "L3" => PermissionTier::L3,
             _ => PermissionTier::L2,
         }
+    }
+
+    /// 当前输入匹配到的 `/` 命令候选（按前缀过滤）。
+    ///
+    /// 只有 buffer 以 `/` 开头（且不在审批弹层）才有候选；返回空即未激活。
+    pub fn slash_candidates(&self) -> Vec<&'static str> {
+        if self.pending.is_some() {
+            return Vec::new();
+        }
+        let buf = self.input.buffer.trim_start();
+        if !buf.starts_with('/') {
+            return Vec::new();
+        }
+        let query = &buf[1..];
+        SLASH_COMMANDS
+            .iter()
+            .filter(|c| c[1..].starts_with(query))
+            .copied()
+            .collect()
+    }
+
+    /// 输入 / 删除后刷新补全状态：有候选则激活并重置高亮，否则关闭。
+    pub fn refresh_completion(&mut self) {
+        self.completion_active = !self.slash_candidates().is_empty();
+        self.completion_sel = 0;
+    }
+
+    /// 执行一条 `/` 命令；成功执行后清空输入并关闭补全菜单。
+    pub fn run_slash_command(&mut self, cmd: &str) -> bool {
+        match cmd {
+            "/clear" => self.clear_conversation(),
+            "/help" => self.show_help(),
+            "/tier" => self.cycle_tier(),
+            _ => return false,
+        }
+        self.input.take();
+        self.completion_active = false;
+        self.completion_sel = 0;
+        self.wake_cursor();
+        true
+    }
+
+    /// 清空对话，只留一条系统提示。
+    pub fn clear_conversation(&mut self) {
+        self.lines.clear();
+        self.lines.push(Line::System("对话已清空。".into()));
+        self.scroll_to_bottom();
+    }
+
+    /// 在对话区打印 `/` 命令帮助。
+    pub fn show_help(&mut self) {
+        for l in [
+            "/ 命令：",
+            "  /clear  清空对话",
+            "  /help   显示本帮助",
+            "  /tier   切换权限档 L1→L2→L3",
+        ] {
+            self.lines.push(Line::System(l.into()));
+        }
+        self.scroll_to_bottom();
     }
 
     /// 提交当前输入；空输入返回 None。

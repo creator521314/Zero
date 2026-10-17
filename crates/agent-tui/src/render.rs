@@ -24,7 +24,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use agent_core::event::{Command, Event};
 
-use crate::app::{App, Line, ToolStatus, UiAction};
+use crate::app::{App, Line, ToolStatus, UiAction, SLASH_COMMANDS};
 use crate::markdown;
 use crate::theme::{glyph, ink, surface, tier_badge_color, tier_label, BG};
 
@@ -262,6 +262,15 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
         MouseEventKind::Down(button) | MouseEventKind::Drag(button)
             if button == MouseButton::Left =>
         {
+            // 补全菜单优先：点候选执行命令；点菜单外关闭菜单（都吞掉本次点击，
+            // 避免误触背后的对话区 / 滚动条）。
+            if app.completion_active {
+                if click_completion(app, m.row, m.column, input) {
+                    return None;
+                }
+                app.completion_active = false;
+                return None;
+            }
             // 命中优先级：header 徽章 > 输入框 > 滚动条。
             if m.row >= header.y && m.row < header.y.saturating_add(header.height) {
                 if point_in(header_badge_rect(header, &app.tier), m.row, m.column) {
@@ -278,6 +287,24 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
         _ => {}
     }
     None
+}
+
+/// 点击补全菜单候选：命中则执行命令并返回 true；未命中返回 false。
+fn click_completion(app: &mut App, row: u16, column: u16, input_area: Rect) -> bool {
+    let cands = app.slash_candidates();
+    if !app.completion_active || cands.is_empty() {
+        return false;
+    }
+    let (_popup, inner) = completion_menu_rect(input_area, &cands);
+    if !point_in(inner, row, column) {
+        return false;
+    }
+    let idx = row.saturating_sub(inner.y) as usize;
+    if let Some(&c) = cands.get(idx) {
+        app.run_slash_command(c);
+        return true;
+    }
+    false
 }
 
 /// 审批弹层期间的鼠标：只认底部两个按钮。
@@ -440,6 +467,48 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
         };
     }
 
+    // `/` 命令补全：菜单激活时，方向键选候选、Tab 补全、Enter 执行、Esc 关闭。
+    let cands = app.slash_candidates();
+    if app.completion_active && !cands.is_empty() {
+        let last = cands.len() - 1;
+        match key.code {
+            KeyCode::Up => {
+                app.completion_sel = app.completion_sel.saturating_sub(1);
+                return UiAction::None;
+            }
+            KeyCode::Down => {
+                app.completion_sel = (app.completion_sel + 1).min(last);
+                return UiAction::None;
+            }
+            KeyCode::Tab => {
+                let c = cands[app.completion_sel.min(last)];
+                app.input.buffer = c.to_string();
+                app.input.move_end();
+                app.wake_cursor();
+                return UiAction::None;
+            }
+            KeyCode::Enter => {
+                // 精确匹配才执行；否则先补全，让用户再确认一次（避免只输 `/`
+                // 就误执行默认高亮的第一个命令）。
+                let cmd = app.input.buffer.trim_start().to_string();
+                if SLASH_COMMANDS.contains(&cmd.as_str()) {
+                    app.run_slash_command(&cmd);
+                } else {
+                    let c = cands[app.completion_sel.min(last)];
+                    app.input.buffer = c.to_string();
+                    app.input.move_end();
+                    app.wake_cursor();
+                }
+                return UiAction::None;
+            }
+            KeyCode::Esc => {
+                app.completion_active = false;
+                return UiAction::None;
+            }
+            _ => {}
+        }
+    }
+
     match (key.code, key.modifiers) {
         // Ctrl+C：用 contains 而非精确匹配——Windows 上 Ctrl 事件可能
         // 附带 NumLock/CapsLock 等标志，精确相等会漏判。
@@ -456,11 +525,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
         }
         (KeyCode::Backspace, _) => {
             app.on_backspace();
+            app.refresh_completion();
             UiAction::None
         }
         (KeyCode::Delete, _) => {
             app.input.delete();
             app.wake_cursor();
+            app.refresh_completion();
             UiAction::None
         }
         (KeyCode::Left, _) => {
@@ -506,6 +577,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
         }
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
             app.on_char(c);
+            // 输入 `/` 后按前缀实时过滤；退化成普通文本时菜单自动收起。
+            app.refresh_completion();
             UiAction::None
         }
         _ => UiAction::None,
@@ -533,6 +606,7 @@ fn draw(f: &mut Frame, app: &App) {
     draw_header(f, app, chunks[0]);
     draw_conversation(f, app, chunks[1]);
     draw_input(f, app, chunks[2]);
+    draw_completion(f, app, chunks[2]);
     draw_footer(f, chunks[3]);
 
     if let Some(p) = &app.pending {
@@ -887,6 +961,61 @@ fn send_indicator(app: &App) -> Span<'static> {
         Style::default().fg(ink::SUCCESS)
     };
     Span::styled(format!(" {} 发送 ", glyph::SEND), style)
+}
+
+/// `/` 命令补全菜单：浮在输入框上方，高亮当前候选。
+fn draw_completion(f: &mut Frame, app: &App, input_area: Rect) {
+    let cands = app.slash_candidates();
+    if !app.completion_active || cands.is_empty() {
+        return;
+    }
+    let (popup, inner) = completion_menu_rect(input_area, &cands);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(" 命令 ", Style::default().fg(ink::PRIMARY)))
+        .border_style(Style::default().fg(ink::PRIMARY));
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<RtLine> = Vec::with_capacity(cands.len());
+    for (i, c) in cands.iter().enumerate() {
+        let style = if i == app.completion_sel {
+            Style::default()
+                .fg(BG)
+                .bg(ink::PRIMARY)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(ink::FG)
+        };
+        lines.push(RtLine::from(Span::styled(format!(" {c}"), style)));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// 补全菜单的 `(外框, 内区)` 矩形——渲染与鼠标命中共用，保证坐标一致。
+///
+/// 菜单贴着输入框左上角往上长；高度超出屏幕上沿时截断，极端窄屏下个别候选
+/// 可能显示不下（命中测试同样按截断后的内区算，不会点错）。
+fn completion_menu_rect(input_area: Rect, cands: &[&str]) -> (Rect, Rect) {
+    let max_w = cands
+        .iter()
+        .map(|c| UnicodeWidthStr::width(*c))
+        .max()
+        .unwrap_or(0) as u16;
+    // 候选渲染为「空格 + 命令」，最宽的 `/clear` 占 1+6=7 列；外加左右边框 2
+    // 列 → 外框至少 9 列，否则 `/clear` 会被右框裁掉最后一个字符。
+    let w = (max_w + 3).max(9);
+    let h = (cands.len() as u16 + 2).min(input_area.y);
+    let popup = Rect::new(input_area.x, input_area.y.saturating_sub(h), w, h);
+    let inner = Rect {
+        x: popup.x + 1,
+        y: popup.y + 1,
+        width: popup.width.saturating_sub(2),
+        height: popup.height.saturating_sub(2),
+    };
+    (popup, inner)
 }
 
 /// 工具名在列表中的固定显示列宽（超出截断，不足补空格）。
@@ -1550,6 +1679,183 @@ mod tests {
         scroll_to_position(&mut app, sy + sh - 1, conv);
         assert_eq!(app.scroll_from_bottom, 0, "点底部应贴底");
         assert!(app.follow, "贴底应恢复 follow");
+    }
+
+    // ---- / 命令补全 ----
+
+    #[test]
+    fn slash_candidates_filter_by_prefix() {
+        let mut app = App::default();
+        assert!(app.slash_candidates().is_empty(), "空输入无候选");
+
+        app.input.buffer = "/".into();
+        assert_eq!(app.slash_candidates(), vec!["/clear", "/help", "/tier"]);
+
+        app.input.buffer = "/c".into();
+        assert_eq!(app.slash_candidates(), vec!["/clear"]);
+
+        app.input.buffer = "/t".into();
+        assert_eq!(app.slash_candidates(), vec!["/tier"]);
+
+        app.input.buffer = "abc".into();
+        assert!(app.slash_candidates().is_empty(), "非 / 开头无候选");
+    }
+
+    #[test]
+    fn slash_candidates_empty_while_pending() {
+        let mut app = approval_app();
+        app.input.buffer = "/".into();
+        assert!(app.slash_candidates().is_empty(), "审批弹层期间不补全");
+    }
+
+    #[test]
+    fn run_slash_command_executes_all() {
+        // /clear：清空对话只留系统提示
+        let mut app = App::default();
+        app.lines.push(Line::User("x".into()));
+        assert!(app.run_slash_command("/clear"));
+        assert_eq!(app.lines.len(), 1);
+        assert!(matches!(&app.lines[0], Line::System(s) if s.contains("清空")));
+
+        // /help：打印命令帮助
+        let mut app = App::default();
+        assert!(app.run_slash_command("/help"));
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| matches!(l, Line::System(s) if s.contains("/clear"))));
+
+        // /tier：切换档位
+        let mut app = App::default();
+        app.tier = "L1".into();
+        assert!(app.run_slash_command("/tier"));
+        assert_eq!(app.tier, "L2");
+
+        // 未知命令：拒绝
+        let mut app = App::default();
+        assert!(!app.run_slash_command("/nope"));
+
+        // 执行后清空输入并关闭补全
+        let mut app = App::default();
+        app.input.buffer = "/clear".into();
+        app.completion_active = true;
+        assert!(app.run_slash_command("/clear"));
+        assert!(app.input.buffer.is_empty());
+        assert!(!app.completion_active);
+    }
+
+    #[test]
+    fn typing_slash_activates_completion() {
+        let mut app = App::default();
+        let _ = handle_key(&mut app, key(KeyCode::Char('/')));
+        assert!(app.completion_active);
+        assert_eq!(app.slash_candidates().len(), 3);
+
+        let _ = handle_key(&mut app, key(KeyCode::Char('c')));
+        assert_eq!(app.slash_candidates(), vec!["/clear"]);
+        assert!(app.completion_active);
+
+        // 输入到无匹配时自动收起
+        let _ = handle_key(&mut app, key(KeyCode::Char('x')));
+        assert!(!app.completion_active);
+    }
+
+    #[test]
+    fn enter_executes_exact_or_completes_prefix() {
+        // 精确匹配：直接执行 /clear
+        let mut app = App::default();
+        app.input.buffer = "/clear".into();
+        app.refresh_completion();
+        let _ = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.input.buffer.is_empty());
+        assert!(!app.completion_active);
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| matches!(l, Line::System(s) if s.contains("清空"))));
+
+        // 前缀匹配：先补全为 /clear，不执行
+        let mut app = App::default();
+        let before = app.lines.len();
+        app.input.buffer = "/c".into();
+        app.refresh_completion();
+        let _ = handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.input.buffer, "/clear", "前缀应补全而非执行");
+        assert!(app.completion_active);
+        assert_eq!(app.lines.len(), before, "补全不该执行命令");
+
+        // 再按 Enter 才执行
+        let _ = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.input.buffer.is_empty());
+    }
+
+    #[test]
+    fn up_down_move_selection_and_esc_closes() {
+        let mut app = App::default();
+        app.input.buffer = "/".into();
+        app.refresh_completion();
+        assert_eq!(app.completion_sel, 0);
+
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 1);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 2);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 2, "到底后 clamp");
+        let _ = handle_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.completion_sel, 1);
+
+        let _ = handle_key(&mut app, key(KeyCode::Esc));
+        assert!(!app.completion_active, "Esc 关闭补全");
+    }
+
+    #[test]
+    fn tab_completes_current_selection() {
+        let mut app = App::default();
+        app.input.buffer = "/".into();
+        app.refresh_completion();
+        app.completion_sel = 1; // /help
+        let _ = handle_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.input.buffer, "/help");
+    }
+
+    #[test]
+    fn completion_menu_rect_layout() {
+        let input = Rect::new(0, 27, 80, 3);
+        let cands = vec!["/clear", "/help", "/tier"];
+        let (popup, inner) = completion_menu_rect(input, &cands);
+        // max_w=6（/clear）→ 外宽 6+3=9；3 个候选 → 高 5；贴输入框上沿 → y=22。
+        assert_eq!(popup, Rect::new(0, 22, 9, 5));
+        assert_eq!(inner, Rect::new(1, 23, 7, 3));
+    }
+
+    #[test]
+    fn click_completion_executes() {
+        let mut app = App::default();
+        app.input.buffer = "/".into();
+        app.refresh_completion();
+        let input_area = Rect::new(0, 27, 80, 3);
+        let (_popup, inner) = completion_menu_rect(input_area, &app.slash_candidates());
+        // 点第一行候选 → /clear
+        assert!(click_completion(&mut app, inner.y, inner.x, input_area));
+        assert!(app.input.buffer.is_empty());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| matches!(l, Line::System(s) if s.contains("清空"))));
+    }
+
+    #[test]
+    fn completion_menu_renders() {
+        let mut app = App::default();
+        app.input.buffer = "/".into();
+        app.refresh_completion();
+        let out = render_to_string(&app, 80, 30);
+        let s = squash(&out);
+        assert!(s.contains("/clear"), "应显示 /clear 候选:\n{out}");
+        assert!(s.contains("/help"), "应显示 /help 候选:\n{out}");
+        assert!(s.contains("/tier"), "应显示 /tier 候选:\n{out}");
+        assert!(s.contains("命令"), "应显示菜单标题:\n{out}");
     }
 
     // ---- 工具名固定列（pad_display） ----
