@@ -78,7 +78,7 @@ fn layout_chunks(area: Rect, footer_visible: bool) -> [Rect; 4] {
         .constraints([
             Constraint::Length(1),        // header
             Constraint::Min(3),           // 对话流
-            Constraint::Length(5),        // 输入区（3 行可视内容，支持 Shift+Enter 换行）
+            Constraint::Length(5),        // 输入区（3 行可视内容，支持 Ctrl+Enter 换行）
             Constraint::Length(footer_h), // footer
         ])
         .split(area);
@@ -519,11 +519,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
             UiAction::Quit
         }
         (KeyCode::Esc, _) => UiAction::Cancel,
-        // Shift+Enter：插入换行（多行输入）。必须排在普通 Enter 之前，否则会被
-        // `(KeyCode::Enter, _)` 抢先匹配。Windows 上 crossterm 上报 `Enter + SHIFT`；
-        // 部分 Unix 终端把 Shift+Enter 与 Enter 上报成同一字节 `\r`，无法区分，
+        // Ctrl+Enter：插入换行（多行输入）。必须排在普通 Enter 之前，否则会被
+        // `(KeyCode::Enter, _)` 抢先匹配。Windows 上 crossterm 上报 `Enter + CONTROL`；
+        // 部分终端把 Ctrl+Enter 与 Enter 上报成同一字节 `\r`，无法区分，
         // 属终端限制，应用层无从判断。
-        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
             app.input.insert_newline();
             app.leave_history();
             app.wake_cursor();
@@ -683,7 +683,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 /// 底部快捷键提示条（灰字，溢出时由 ratatui 自动裁剪）。
 fn draw_footer(f: &mut Frame, area: Rect) {
-    let text = " ⏎ 发送  ⇧⏎ 换行  Esc 中断  PgUp/Dn 滚动  Ctrl+C 退出 ";
+    let text = " ⏎ 发送  ^⏎ 换行  Esc 中断  PgUp/Dn 滚动  Ctrl+C 退出 ";
     f.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(ink::FG_MUTED))),
         area,
@@ -1861,15 +1861,15 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_inserts_newline_not_submit() {
+    fn ctrl_enter_inserts_newline_not_submit() {
         let mut app = App::default();
         for c in "ab".chars() {
             let _ = handle_key(&mut app, key(KeyCode::Char(c)));
         }
-        // 光标在末尾；Shift+Enter 换行，不提交任务。
+        // 光标在末尾；Ctrl+Enter 换行，不提交任务。
         let lines_before = app.lines.len();
         let mut k = key(KeyCode::Enter);
-        k.modifiers = KeyModifiers::SHIFT;
+        k.modifiers = KeyModifiers::CONTROL;
         let action = handle_key(&mut app, k);
         assert_eq!(action, UiAction::None, "换行不应提交任务");
         assert_eq!(app.input.buffer, "ab\n");
@@ -1978,7 +1978,7 @@ mod tests {
         assert!(s.contains("命令"), "应显示菜单标题:\n{out}");
     }
 
-    // ---- 多行输入渲染（Shift+Enter） ----
+    // ---- 多行输入渲染（Ctrl+Enter） ----
 
     #[test]
     fn input_lines_splits_hard_newlines() {

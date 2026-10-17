@@ -130,7 +130,7 @@ impl InputState {
     pub fn cursor_char_index(&self) -> usize {
         self.buffer[..self.cursor].chars().count()
     }
-    /// Shift+Enter：在光标处插入换行，支持多行输入。
+    /// Ctrl+Enter：在光标处插入换行，支持多行输入。
     pub fn insert_newline(&mut self) {
         self.buffer.insert(self.cursor, '\n');
         self.cursor += 1;
