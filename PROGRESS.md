@@ -12,7 +12,7 @@
 | `agent-store`：jsonl append-only + 内存索引 | ✅ | `crates/agent-store/src/lib.rs` |
 | `agent-net`：reqwest 封装 + SSRF 防护 | ✅ | `crates/agent-net/src/lib.rs` |
 | `agent-perm`：静态规则 + 三档权限决策流 | ✅ | `crates/agent-perm/src/` |
-| `agent-tools`：7 个工具 + 路径逃逸防护 | ✅ | `crates/agent-tools/src/` |
+| `agent-tools`：8 个工具（含 finish）+ 写前快照 + 路径逃逸防护 | ✅ | `crates/agent-tools/src/` |
 | `agent-providers`：OpenAI 兼容适配器 + 路由 + 预算 | ✅ | `crates/agent-providers/src/` |
 | `agent-runtime`：执行循环 + 上下文三层 + 防护 | ✅ | `crates/agent-runtime/src/` |
 | `agent-tui`：ratatui 界面 + 审批弹层 + 事件解耦 | ✅ | `crates/agent-tui/src/` |
@@ -30,7 +30,8 @@
 | `agent-tools::paths` | `../` 逃逸拒绝；工作区内路径接受；项目根为基准；私有工作区仍可达；Windows 盘符大小写/斜杠方向不误判 |
 | `agent-tools::web` | HTML 标签与 script 剥离 |
 | `agent-tools::shell` | 本平台解释器能起命令；非 0 退出码标为错误；描述串与平台一致；中文按 OEM 代码页解出可读文本；UTF-8 输出不被二次损坏 |
-| `agent-tools::fs_tools` | 相对路径落到项目根；无项目根时退回私有工作区；空目录明说；读目录给出替代工具 |
+| `agent-tools::fs_tools` | 相对路径落到项目根；无项目根时退回私有工作区；空目录明说；读目录给出替代工具；覆写前快照到私有工作区 `snapshots/` |
+| `agent-tools::finish` | 显式终止信号：总结 + 登记交付物路径；非法/逃逸路径跳过不掀翻任务 |
 | `agent-providers` | tool 消息转换；assistant tool_call 转换（arguments 必须为字符串） |
 | `agent-runtime::context` | 上下文压缩保留固定区并生成摘要 |
 | `agent-tui::app` | 多字节字符编辑；流式增量合并为一行；空输入不提交；工具四态流转（含迟到事件不覆盖已终结行）；重绘请求取走即清零；任务收尾不重复渲染已流式输出的原文（对不上时仍补），失败按错误样式显示；工作中/等审批的判定；spinner 帧随 tick 转动；`/` 命令补全状态（候选过滤、选中、执行 `/clear` `/help` `/tier`）；输入历史记录/去重/`Ctrl+R` 循环召回；Toast 创建与到期清除；footer 显隐 |
@@ -40,7 +41,7 @@
 | `agent-store` | 追加 + 重载；逻辑时钟单调；durability 保留 |
 | `agent-store::recorder` | 落盘分类（持久/临时/不落）；总线滞后跳过而不退出；每条事件只落一次；增量默认不落 |
 | `agent-core::event` | 上下文快照与整轮回复往返；工具输出留存；旧日志缺字段时兜底 |
-| `agent-runtime::runner` | 每轮记录上下文快照与整轮回复；工具原文 + 自报失败 → Failed；关闭时不记录快照；项目根传到工具；提示词指向项目根且约束盲目重试 |
+| `agent-runtime::runner` | 每轮记录上下文快照与整轮回复；工具原文 + 自报失败 → Failed；关闭时不记录快照；项目根传到工具；提示词指向项目根且约束盲目重试；终止信号工具跳过权限并提前收尾、产物去重 |
 
 ## M1 验收标准
 
@@ -551,6 +552,21 @@ footer 翻转/Toast 到期/切档 Toast；render：`Ctrl+H` 切 footer/`Ctrl+R` 
 隐藏布局收行/footer 不渲染/Toast 右上角渲染）；`cargo xtask check` 通过，
 `cargo test --workspace` **217 passed / 0 failed**。
 
+## 改动：M2 能力收尾（finish 工具 + 写前快照 + 端到端验收）（2026-10-17）
+
+补齐 M2「一次对话内写文件 → 执行脚本 → 报告结果」的最后两块拼图，并跑通端到端验收。
+
+| 项 | 说明 |
+|---|---|
+| `finish` 工具 | 显式终止信号：`summary` 给用户总结、`artifacts` 登记交付物路径；`Tool` trait 新增 `is_terminating()` 标记 |
+| 执行循环收尾 | runner 遇到 `is_terminating` 工具：跳过权限裁决直接执行，执行完立即结束循环，汇总总结与产物（去重），不再多跑一轮 |
+| 写前快照 | `file_write` / `file_edit` 覆写前把旧内容备份到私有工作区 `snapshots/`（`<文件名>.<毫秒>`）；新建文件不产生空快照 |
+| 提示词引导 | system prompt 引导模型：产出写入 `artifacts/`，任务完成调用 `finish` 登记交付物 |
+
+**实现要点**：`finish` 是纯收尾、无副作用，因此在权限引擎之前就放行（L3 也不会弹层打断收尾）；快照落在私有工作区而非项目根，避免污染用户仓库。
+
+**验收**：新增 8 个单测（finish：登记总结/产物、缺省兜底、逃逸路径跳过；快照：write/edit 覆写备份、新建不备份；runner：终止信号跳过权限并提前收尾、真实工具端到端「写文件→执行脚本→报告」）；`cargo xtask check` 通过，`cargo test --workspace` **225 passed / 0 failed**。
+
 ## 已知限制（一期）
 
 | 限制 | 说明 |
@@ -561,11 +577,10 @@ footer 翻转/Toast 到期/切档 Toast；render：`Ctrl+H` 切 footer/`Ctrl+R` 
 | 批量批准未接 UI | `a` 键回传 `remember`，编排层登记逻辑待 M3 补齐 |
 | TUI 任务面板未实现 | 单任务流，多任务切换在 M4 |
 
-## 待办（M2 起）
+## 待办（M3 起）
 
 | 里程碑 | 内容 |
 |---|---|
-| M2 | 工具链打磨、"写文件→执行脚本→汇报"链路打通 |
 | M3 | L2 AI 审视实测调优、审计日志完善、预算熔断验证 |
 | M4 | 任务面板/切换/恢复、Markdown 渲染增强、新闻收集模板 |
 | 二期 | 分级同步、AI 合并 + 回滚、设备注册中心 |

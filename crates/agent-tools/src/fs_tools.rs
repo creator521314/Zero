@@ -120,6 +120,11 @@ impl Tool for FileWrite {
             .ok_or_else(|| ToolError::InvalidArgs("missing 'content'".into()))?;
         let full = resolve_in_ctx(ctx, path)?;
 
+        // 覆写前快照：目标已存在则备份旧内容，供误写后回滚。
+        if let Ok(old) = tokio::fs::read(&full).await {
+            snapshot_before_write(ctx, &full, &old).await?;
+        }
+
         if let Some(parent) = full.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -193,6 +198,8 @@ impl Tool for FileEdit {
             )));
         }
         let updated = content.replacen(old, new, 1);
+        // 覆写前快照（file_edit 读到的就是旧内容）。
+        snapshot_before_write(ctx, &full, content.as_bytes()).await?;
         tokio::fs::write(&full, &updated).await?;
         Ok(
             ToolOutput::ok(format!("edited {path}")).with_artifacts(vec![Artifact {
@@ -249,6 +256,29 @@ impl Tool for ListDir {
         }
         Ok(ToolOutput::ok(format!("[{path}]\n{}", items.join("\n"))))
     }
+}
+
+/// 覆写前把旧内容备份到私有工作区的 `snapshots/`（临时，支持回滚）。
+///
+/// 快照落在 `ctx.workspace/snapshots/` 而非项目根，避免污染用户仓库。
+async fn snapshot_before_write(
+    ctx: &ToolCtx,
+    target: &std::path::Path,
+    old: &[u8],
+) -> Result<(), ToolError> {
+    let dir = ctx.workspace.join("snapshots");
+    tokio::fs::create_dir_all(&dir).await?;
+    let base = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let snap = dir.join(format!("{base}.{ts}"));
+    tokio::fs::write(&snap, old).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -334,6 +364,126 @@ mod tests {
             out.content.contains("list_dir"),
             "应给出替代工具: {}",
             out.content
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// M2：file_write 覆写前把旧内容快照到私有工作区的 snapshots/。
+    #[tokio::test]
+    async fn file_write_snapshots_before_overwrite() {
+        let base = std::env::temp_dir().join("agent-tools-fs-snap-write-test");
+        let proj = base.join("proj");
+        let ws = base.join("workspace").join("t1");
+        tokio::fs::create_dir_all(&proj).await.unwrap();
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::write(proj.join("note.txt"), "v1").await.unwrap();
+
+        let out = FileWrite
+            .execute(
+                json!({ "path": "note.txt", "content": "v2" }),
+                &ctx(Some(&proj), &ws),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "实际: {}", out.content);
+        assert_eq!(
+            tokio::fs::read_to_string(proj.join("note.txt"))
+                .await
+                .unwrap(),
+            "v2"
+        );
+
+        // 快照目录里应有旧版本 v1（命名 note.txt.<毫秒>）。
+        let snap_dir = ws.join("snapshots");
+        let mut found = false;
+        let mut entries = tokio::fs::read_dir(&snap_dir).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            let p = e.path();
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            if name.starts_with("note.txt.") {
+                assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "v1");
+                found = true;
+            }
+        }
+        assert!(found, "快照目录应包含 note.txt 的旧版本");
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// M2：file_edit 覆写前同样快照。
+    #[tokio::test]
+    async fn file_edit_snapshots_before_overwrite() {
+        let base = std::env::temp_dir().join("agent-tools-fs-snap-edit-test");
+        let proj = base.join("proj");
+        let ws = base.join("workspace").join("t1");
+        tokio::fs::create_dir_all(&proj).await.unwrap();
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::write(proj.join("src.txt"), "a-b-c")
+            .await
+            .unwrap();
+
+        let out = FileEdit
+            .execute(
+                json!({ "path": "src.txt", "old_str": "b", "new_str": "B" }),
+                &ctx(Some(&proj), &ws),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "实际: {}", out.content);
+        assert_eq!(
+            tokio::fs::read_to_string(proj.join("src.txt"))
+                .await
+                .unwrap(),
+            "a-B-c"
+        );
+
+        let snap_dir = ws.join("snapshots");
+        let mut found = false;
+        let mut entries = tokio::fs::read_dir(&snap_dir).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            let p = e.path();
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            if name.starts_with("src.txt.") {
+                assert_eq!(tokio::fs::read_to_string(&p).await.unwrap(), "a-b-c");
+                found = true;
+            }
+        }
+        assert!(found, "快照目录应包含 src.txt 的旧版本");
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// M2：新建文件（不存在）不应产生空快照。
+    #[tokio::test]
+    async fn file_write_creates_no_snapshot_for_new_file() {
+        let base = std::env::temp_dir().join("agent-tools-fs-snap-new-test");
+        let proj = base.join("proj");
+        let ws = base.join("workspace").join("t1");
+        tokio::fs::create_dir_all(&proj).await.unwrap();
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        FileWrite
+            .execute(
+                json!({ "path": "fresh.txt", "content": "new" }),
+                &ctx(Some(&proj), &ws),
+            )
+            .await
+            .unwrap();
+
+        let snap_dir = ws.join("snapshots");
+        assert!(
+            !snap_dir.exists(),
+            "新建文件不应产生快照目录: {:?}",
+            snap_dir
         );
 
         let _ = tokio::fs::remove_dir_all(&base).await;

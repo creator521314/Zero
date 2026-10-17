@@ -91,8 +91,8 @@ impl AgentRuntime {
              \n\
              规则：\n\
              1. 先思考再行动；能一次调用多个工具就并行调用。\n\
-             2. 产出文件时写入工作目录，并在最终回复中列出产物路径。\n\
-             3. 任务完成时给出简洁总结，不要啰嗦。\n\
+             2. 产出文件时写入工作目录（推荐放到 artifacts/ 下），并在 finish 的 artifacts 里登记交付物路径。\n\
+             3. 任务完成时调用 finish 工具结束：在 summary 里给用户一段简洁总结。\n\
              4. 如果某个操作被拒绝，换一种策略，不要重复同样的调用。\n\
              5. 目标文件/目录不存在或目录为空时，**不要继续猜路径**；\n\
                 直接说明缺什么，向用户索要材料或改用其他思路。",
@@ -358,6 +358,8 @@ impl AgentRunner for AgentRuntime {
             // 逐个执行工具
             let mut tool_messages = Vec::new();
             let mut progressed = false;
+            // 终止信号（finish）的结果：一旦出现即提前收尾。
+            let mut finish_summary: Option<String> = None;
             for call in &out.calls {
                 let call_id = call.id.clone();
                 let _ = bus.send(Event::ToolCallStart {
@@ -373,8 +375,17 @@ impl AgentRunner for AgentRuntime {
                 *cnt += 1;
                 let repeat_count = *cnt;
 
+                // 终止信号工具（如 finish）无副作用，跳过权限裁决直接执行。
+                let terminating = (self.deps.tools)(&call.name)
+                    .map(|t| t.is_terminating())
+                    .unwrap_or(false);
+
                 // ---- 权限裁决 ----
-                let mut decision = self.deps.perm.check(call, &task).await;
+                let mut decision = if terminating {
+                    Decision::Allow
+                } else {
+                    self.deps.perm.check(call, &task).await
+                };
                 if repeat_count >= 3 && matches!(decision, Decision::Allow) {
                     decision =
                         Decision::Deny("相同操作已重复 3 次，请更换策略或结束任务".to_string());
@@ -463,6 +474,13 @@ impl AgentRunner for AgentRuntime {
 
                 match result {
                     Ok(r) => {
+                        if terminating {
+                            finish_summary = Some(if r.content.is_empty() {
+                                "（无文本输出）".to_string()
+                            } else {
+                                r.content.clone()
+                            });
+                        }
                         if !r.artifacts.is_empty() {
                             progressed = true;
                             for a in &r.artifacts {
@@ -520,10 +538,27 @@ impl AgentRunner for AgentRuntime {
                         });
                     }
                 }
+
+                // 遇到终止信号立即结束工具循环。
+                if finish_summary.is_some() {
+                    break;
+                }
             }
 
             for m in tool_messages {
                 cm.push(m);
+            }
+
+            // 终止信号：finish 已把总结与产物登记好，直接收尾。
+            if let Some(summary) = finish_summary {
+                let _ = bus.send(Event::TaskFinished {
+                    id: task_id.clone(),
+                    outcome: Outcome::Success {
+                        summary: summary.clone(),
+                        artifacts: artifacts.clone(),
+                    },
+                });
+                return Ok(Outcome::Success { summary, artifacts });
             }
 
             // 无进展检测
@@ -803,6 +838,55 @@ mod tests {
         }
     }
 
+    /// 一律询问的权限引擎：验证终止信号工具会跳过它。
+    struct AskAll;
+
+    #[async_trait]
+    impl PermissionEngine for AskAll {
+        async fn check(&self, _call: &ToolCall, _task: &TaskSpec) -> Decision {
+            Decision::AskUser
+        }
+    }
+
+    /// 终止信号工具：验证 `is_terminating` 触发提前收尾。
+    struct TerminatingTool;
+
+    #[async_trait]
+    impl Tool for TerminatingTool {
+        fn name(&self) -> &str {
+            "finish_mock"
+        }
+        fn description(&self) -> &str {
+            "测试用终止信号工具"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn risk_level(&self) -> Risk {
+            Risk::Low
+        }
+        fn is_terminating(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            let summary = args
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("done")
+                .to_string();
+            Ok(
+                ToolOutput::ok(summary).with_artifacts(vec![agent_core::tool::Artifact {
+                    path: "/tmp/out.txt".into(),
+                    bytes: 3,
+                }]),
+            )
+        }
+    }
+
     /// 装配一个「脚本化 provider + 固定输出工具」的运行时。
     ///
     /// 返回 (运行时, store, 临时根目录)；工作区固定为 `<临时根>/workspace`。
@@ -869,6 +953,70 @@ mod tests {
         (runtime, store, tmp)
     }
 
+    /// 装配真实工具（file_write / file_read / shell_exec / finish）的运行时，
+    /// 用于 M2「写文件 → 执行脚本 → 报告」端到端验收。
+    fn make_runtime_real_tools(
+        turns: Vec<Vec<StreamEvent>>,
+    ) -> (AgentRuntime, Arc<JsonlStore>, PathBuf) {
+        use agent_tools::finish::Finish;
+        use agent_tools::fs_tools::{FileRead, FileWrite};
+        use agent_tools::shell::ShellExec;
+
+        let tmp = std::env::temp_dir().join(format!("agent-rt-m2-{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(FileWrite),
+            Arc::new(FileRead),
+            Arc::new(ShellExec),
+            Arc::new(Finish),
+        ];
+        let defs: Vec<ToolDef> = tools
+            .iter()
+            .map(|t| ToolDef {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters(),
+            })
+            .collect();
+        let lookup: ToolLookup = Arc::new(move |name: &str| match name {
+            "file_write" => Some(Arc::new(FileWrite) as Arc<dyn Tool>),
+            "file_read" => Some(Arc::new(FileRead) as Arc<dyn Tool>),
+            "shell_exec" => Some(Arc::new(ShellExec) as Arc<dyn Tool>),
+            "finish" => Some(Arc::new(Finish) as Arc<dyn Tool>),
+            _ => None,
+        });
+        let (_ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(1);
+
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: Arc::new(ScriptedProvider {
+                turns: Mutex::new(turns),
+            }),
+            provider_name: "scripted".into(),
+            tools: lookup,
+            tool_defs: defs,
+            perm: Arc::new(AllowAll),
+            store: store.clone(),
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(Mutex::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            batch_approve: None,
+            per_task_budget: 0.0,
+        });
+        (runtime, store, tmp)
+    }
+
+    /// 跨平台的「读取文件内容」命令：Windows 用 type，Unix 用 cat。
+    fn read_cmd(path: &str) -> String {
+        if cfg!(windows) {
+            format!("type {path}")
+        } else {
+            format!("cat {path}")
+        }
+    }
+
     /// 跑一次任务，返回总线上收到的全部事件。
     async fn run_scripted(turns: Vec<Vec<StreamEvent>>) -> (Vec<Event>, Outcome) {
         let (runtime, _store, tmp) = make_runtime(turns, LogConfig::default());
@@ -887,11 +1035,16 @@ mod tests {
     }
 
     fn tool_call(index: usize, id: &str, name: &str) -> StreamEvent {
+        tool_call_args(index, id, name, "{}")
+    }
+
+    /// 带完整参数的工具调用（args 为一段合法 JSON）。
+    fn tool_call_args(index: usize, id: &str, name: &str, args: &str) -> StreamEvent {
         StreamEvent::ToolCallDelta {
             index,
             id: Some(agent_core::ids::ToolCallId(id.to_string())),
             name: Some(name.to_string()),
-            args_delta: "{}".into(),
+            args_delta: args.into(),
         }
     }
 
@@ -1159,6 +1312,172 @@ mod tests {
             Some(project.display().to_string().as_str()),
             "工具的沙箱根必须是项目根，而不是私有工作区"
         );
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// finish 语义：终止信号工具跳过权限、提前结束、汇总总结与产物。
+    #[tokio::test]
+    async fn finish_terminates_and_skips_permission() {
+        let tmp = std::env::temp_dir().join(format!("agent-rt-finish-{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(TerminatingTool)];
+        let defs: Vec<ToolDef> = tools
+            .iter()
+            .map(|t| ToolDef {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters(),
+            })
+            .collect();
+        let lookup: ToolLookup = Arc::new(move |name: &str| {
+            if name == "finish_mock" {
+                Some(Arc::new(TerminatingTool) as Arc<dyn Tool>)
+            } else {
+                None
+            }
+        });
+        let (_ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(1);
+
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: Arc::new(ScriptedProvider {
+                turns: Mutex::new(vec![vec![
+                    tool_call_args(0, "c1", "finish_mock", r#"{"summary":"完成"}"#),
+                    StreamEvent::Usage(Usage::default()),
+                    StreamEvent::Done(FinishReason::ToolCalls),
+                ]]),
+            }),
+            provider_name: "scripted".into(),
+            tools: lookup,
+            tool_defs: defs,
+            // 即使权限引擎「一律询问」，终止信号也应跳过裁决直接执行。
+            perm: Arc::new(AskAll),
+            store: store.clone(),
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(Mutex::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            batch_approve: None,
+            per_task_budget: 0.0,
+        });
+
+        let bus = event_bus();
+        let mut sub = bus.subscribe();
+        let mut spec = TaskSpec::new("收尾", ws.display().to_string());
+        spec.max_iterations = 4;
+        let outcome = runtime.run(spec, bus, RunControl::new()).await.unwrap();
+
+        match outcome {
+            Outcome::Success { summary, artifacts } => {
+                assert_eq!(summary, "完成");
+                assert_eq!(artifacts.len(), 1);
+                assert!(artifacts[0].ends_with("out.txt"), "实际: {}", artifacts[0]);
+            }
+            other => panic!("应为 Success: {other:?}"),
+        }
+
+        // 终止信号不应触发审批。
+        let mut asked = false;
+        while let Ok(ev) = sub.try_recv() {
+            if matches!(ev, Event::AwaitingApproval { .. }) {
+                asked = true;
+            }
+        }
+        assert!(!asked, "终止信号工具不应进入审批流程");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// M2 验收：一次对话内「写文件 → 执行脚本 → 报告结果」。
+    #[tokio::test]
+    async fn m2_write_script_execute_report() {
+        let (runtime, _store, tmp) = make_runtime_real_tools(vec![
+            // 第 1 轮：写脚本
+            vec![
+                tool_call_args(
+                    0,
+                    "c1",
+                    "file_write",
+                    r#"{"path":"run_me.txt","content":"from-script\n"}"#,
+                ),
+                StreamEvent::Usage(Usage::default()),
+                StreamEvent::Done(FinishReason::ToolCalls),
+            ],
+            // 第 2 轮：执行脚本（跨平台读文件命令）
+            vec![
+                tool_call_args(
+                    0,
+                    "c2",
+                    "shell_exec",
+                    &format!(r#"{{"cmd":"{}"}}"#, read_cmd("run_me.txt")),
+                ),
+                StreamEvent::Usage(Usage::default()),
+                StreamEvent::Done(FinishReason::ToolCalls),
+            ],
+            // 第 3 轮：finish 报告并登记产物
+            vec![
+                tool_call_args(
+                    0,
+                    "c3",
+                    "finish",
+                    r#"{"summary":"脚本输出正常","artifacts":["run_me.txt"]}"#,
+                ),
+                StreamEvent::Usage(Usage::default()),
+                StreamEvent::Done(FinishReason::ToolCalls),
+            ],
+        ]);
+
+        let project = tmp.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let bus = event_bus();
+        let mut sub = bus.subscribe();
+        let mut spec = TaskSpec::new(
+            "写个脚本并跑一下",
+            tmp.join("workspace").display().to_string(),
+        );
+        spec.project_root = Some(project.display().to_string());
+        spec.max_iterations = 6;
+        let outcome = runtime.run(spec, bus, RunControl::new()).await.unwrap();
+
+        match outcome {
+            Outcome::Success { summary, artifacts } => {
+                assert_eq!(summary, "脚本输出正常");
+                assert_eq!(
+                    artifacts.len(),
+                    1,
+                    "file_write 与 finish 登记同一个文件应去重: {artifacts:?}"
+                );
+                assert!(
+                    artifacts[0].ends_with("run_me.txt"),
+                    "实际: {}",
+                    artifacts[0]
+                );
+            }
+            other => panic!("应为 Success: {other:?}"),
+        }
+
+        // 脚本文件确实落到项目根。
+        let content = tokio::fs::read_to_string(project.join("run_me.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "from-script\n");
+
+        // shell_exec 的输出应读到脚本内容（只有它会包含这段文本）。
+        let mut saw_output = false;
+        while let Ok(ev) = sub.try_recv() {
+            if let Event::ToolCallEnd {
+                output: Some(o), ..
+            } = ev
+            {
+                if o.contains("from-script") {
+                    saw_output = true;
+                }
+            }
+        }
+        assert!(saw_output, "shell_exec 应读到脚本输出");
+
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 

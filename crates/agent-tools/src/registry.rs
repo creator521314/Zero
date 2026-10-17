@@ -6,6 +6,7 @@ use std::sync::Arc;
 use agent_core::provider::ToolDef;
 use agent_core::tool::Tool;
 
+use crate::finish::Finish;
 use crate::fs_tools::{FileEdit, FileRead, FileWrite, ListDir};
 use crate::shell::ShellExec;
 use crate::web::{WebFetch, WebSearch};
@@ -61,5 +62,6 @@ pub fn default_tools(client: reqwest::Client, search_endpoint: Option<String>) -
     reg.register(Arc::new(ShellExec));
     reg.register(Arc::new(WebFetch::new(client.clone())));
     reg.register(Arc::new(WebSearch::new(client, search_endpoint)));
+    reg.register(Arc::new(Finish));
     reg
 }
