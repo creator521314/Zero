@@ -567,6 +567,79 @@ footer 翻转/Toast 到期/切档 Toast；render：`Ctrl+H` 切 footer/`Ctrl+R` 
 
 **验收**：新增 8 个单测（finish：登记总结/产物、缺省兜底、逃逸路径跳过；快照：write/edit 覆写备份、新建不备份；runner：终止信号跳过权限并提前收尾、真实工具端到端「写文件→执行脚本→报告」）；`cargo xtask check` 通过，`cargo test --workspace` **225 passed / 0 failed**。
 
+## 改动：输入区支持 `Ctrl+Enter` 多行换行（2026-10-18）
+
+输入框原先只有一行：footer 早就提示过换行，但 `handle_key` 里并没有换行分支，
+属于「提示了却做不到」。
+
+| 项 | 位置 |
+|---|---|
+| `Ctrl+Enter` 换行、`Enter` 提交（带 CONTROL 的 Enter 分支排在普通 Enter 之前） | `render.rs::handle_key` |
+| 输入区高度 3 → 5（3 行可视内容） | `render.rs::layout_chunks` |
+| 多行渲染：硬换行 + 垂直滚动跟随光标 + 光标行横向滚动 | `render.rs::input_lines` |
+| 横向滚动按显示宽度裁剪（CJK 占 2 列），裁剪点不碎字符 | `render.rs::trim_left_by_width` |
+| `insert_newline` / `cursor_line_col`（行号 + 行内列，供渲染定位软光标） | `agent-tui/src/app.rs` |
+
+footer 提示同步为 `^⏎ 换行`（`^` 为 Ctrl 的传统记法，长度不变不影响布局）。
+
+**已知限制**：部分 Unix 终端把 `Ctrl+Enter` 与 `Enter` 上报成同一字节 `\r`，
+无法区分，属终端限制，应用层无从判断。
+
+**验收**：新增 6 个单测；`cargo xtask check` 通过。
+
+## 缺陷修复：`web_fetch` 处理含中文网页 panic（2026-10-18）
+
+**症状**：抓取含中文的页面时工具线程 panic——
+`start byte index 29135 is not a char boundary; it is inside '解'`。
+
+**根因**：`strip_html` 按**字节**推进（`i += 1`、`bytes[i] as char`），却对 `&str`
+做 `lower[i..]` 切片。`i` 落在多字节 UTF-8 字符中间时必然 panic；把字节当
+Latin-1 输出还会让中文 / emoji 变乱码（「解」= `E8 A7 A3` 被拆成 `è § £`）。
+
+**改动**：改为按 `char` 迭代（`i += c.len_utf8()`）；标签名是 ASCII，改用字节前缀
+做大小写不敏感匹配（`starts_with_ignore_ascii_case`），不再对整篇文档
+`to_lowercase()`——后者可能改变字节长度，与原 `input` 的索引错位。`i += 7`
+一并修正为 `i += b"</script".len()`（8 字节）。
+
+**回归保护**：新增 `strips_tags_with_multibyte_text`（中文 + emoji 不丢不乱码）；
+顺带排查全仓同类「按字节索引切 `&str`」的位置，其余（`app.rs` 的 cursor、
+`render.rs` 测试用 `find()`、`urlencoding` 的 ASCII 分支）索引均落在 char 边界。
+
+**验收**：`agent-tools` 23 passed；`cargo xtask check` 通过。
+
+## 改动：接通「批准本任务同类操作」（2026-10-18）
+
+**症状**：L3 下在审批弹层按 `a`（批准本任务同类操作），后续同类工具调用**照旧弹窗**
+——看起来生效了，实际没有。
+
+**根因**：能力都在，最后一米没接线，链路断在三处：
+
+```text
+UI `a` → UiAction::Approve{remember}   ─┐
+                                         ├─ take_approval 里 `let _ = remember` 吞掉意图
+PermissionEngineImpl::approve_for_task  ┤   └─ 不在 trait 上，Arc<dyn PermissionEngine> 拿不到
+runner deps.batch_approve              ┴─ apps 装配恒为 None，且转发硬编码 remember:false
+```
+
+**改动**：
+
+| 项 | 位置 |
+|---|---|
+| `Command::Approve` 携带 `remember`（改结构体变体） | `agent-core/src/event.rs` |
+| `take_approval` 不再吞掉 `remember` | `agent-tui/src/app.rs` |
+| `PermissionEngine` trait 新增 `approve_for_task`（默认空实现，不破坏替身） | `agent-core/src/perm.rs` |
+| trait 实现转发到固有方法，登记逻辑保持单点 | `agent-perm/src/lib.rs` |
+| 转发透传 `remember`（原硬编码 `false`） | `apps/agent-cli/src/main.rs` |
+| 装配 `batch_approve` 回调：`tokio::spawn` 调 `approve_for_task` | 同上 |
+
+`agent-server` 是 headless 单次执行、没有审批交互（`_ap_tx` 未使用），故仍为 `None`。
+
+**回归保护**：新增 2 个单测——UI 侧断言 `remember` 没被吞
+（`take_approval_carries_remember_intent`）；runtime 侧端到端断言按 `a` 后回调
+确实收到 `(task_id, tool)`（`approve_with_remember_registers_batch_approval`）。
+
+**验收**：`cargo xtask check` 通过。
+
 ## 已知限制（一期）
 
 | 限制 | 说明 |
@@ -574,7 +647,6 @@ footer 翻转/Toast 到期/切档 Toast；render：`Ctrl+H` 切 footer/`Ctrl+R` 
 | 上下文压缩为轻量摘录 | 非 LLM 摘要，二期可增强 |
 | 工具调用为串行执行 | 设计上支持并行，一期按顺序执行 |
 | `web_search` 需自备 SearXNG | 未配置时返回明确提示，不静默失败 |
-| 批量批准未接 UI | `a` 键回传 `remember`，编排层登记逻辑待 M3 补齐 |
 | TUI 任务面板未实现 | 单任务流，多任务切换在 M4 |
 
 ## 待办（M3 起）
