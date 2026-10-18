@@ -6,6 +6,9 @@
 /tmp/
 /agent-workspace.bundle
 
+# 任务交付物：finish 工具引导模型把产物写到 artifacts/，属运行期生成
+/artifacts/
+
 # 运行时数据（防止 agent.root 未展开时误入版本库）
 /~/
 
