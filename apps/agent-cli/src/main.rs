@@ -294,6 +294,10 @@ async fn main() -> anyhow::Result<()> {
                         let task_id = spec.id.0.clone();
                         let provider_name = provider.name().to_string();
 
+                        // 「批准本任务同类操作」的登记回调：让权限引擎记住
+                        // (task, tool)，该任务后续同类调用在 L3 下直接放行，
+                        // 不再逐一打扰用户。
+                        let engine = perm2.clone();
                         let runtime =
                             agent_runtime::AgentRuntime::new(agent_runtime::RuntimeDeps {
                                 provider: provider.clone(),
@@ -305,7 +309,16 @@ async fn main() -> anyhow::Result<()> {
                                 log_cfg: log_cfg2.clone(),
                                 approvals: approvals2.clone(),
                                 context_cfg: Default::default(),
-                                batch_approve: None,
+                                batch_approve: Some(Arc::new(
+                                    move |task_id: String, tool: String| {
+                                        let eng = engine.clone();
+                                        // 回调签名是同步 `Fn`，登记内部却是 async：
+                                        // spawn 一个短任务执行，不阻塞审批分支。
+                                        tokio::spawn(async move {
+                                            eng.approve_for_task(&task_id, &tool).await;
+                                        });
+                                    },
+                                )),
                                 per_task_budget: router.per_task_limit(),
                             });
 
@@ -320,12 +333,15 @@ async fn main() -> anyhow::Result<()> {
                         });
                         current = Some((cancel, handle));
                     }
-                    Command::Approve(id) => {
-                        tracing::info!(approval = %id.0, "approve forwarded to runner");
+                    Command::Approve {
+                        approval_id: id,
+                        remember,
+                    } => {
+                        tracing::info!(approval = %id.0, remember, "approve forwarded to runner");
                         if ap_tx
                             .send((
                                 id,
-                                agent_runtime::runner::ApprovalReply::Approve { remember: false },
+                                agent_runtime::runner::ApprovalReply::Approve { remember },
                             ))
                             .await
                             .is_err()

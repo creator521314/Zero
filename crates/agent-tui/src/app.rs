@@ -635,8 +635,12 @@ impl App {
         let p = self.pending.take()?;
         self.status = "就绪".into();
         Some(if approve {
-            let _ = remember; // 由编排层根据 remember 登记批量批准
-            Command::Approve(p.id)
+            // remember 必须一路带到编排层：否则 UI 的「批准本任务同类操作」
+            // 只是看起来生效，后续同类调用照旧弹窗。
+            Command::Approve {
+                approval_id: p.id,
+                remember,
+            }
         } else {
             Command::Reject {
                 approval_id: p.id,
@@ -1081,6 +1085,33 @@ mod tests {
         };
         app.backend_disconnected();
         assert!(app.pending.is_none(), "断连后应撤下审批弹层");
+    }
+
+    #[test]
+    fn take_approval_carries_remember_intent() {
+        // 弹层 `a` = 批准并记住本任务同类操作；`y` = 只批准本次。
+        let mut app = App {
+            pending: Some(pending_approval()),
+            ..Default::default()
+        };
+        let remember = match app.take_approval(true, true).expect("应有待审批项") {
+            Command::Approve { remember, .. } => remember,
+            _ => panic!("批准应返回 Command::Approve"),
+        };
+        assert!(
+            remember,
+            "remember 必须带到编排层，否则「批准本任务同类」只是看上去生效"
+        );
+
+        let mut app = App {
+            pending: Some(pending_approval()),
+            ..Default::default()
+        };
+        let remember = match app.take_approval(true, false).expect("应有待审批项") {
+            Command::Approve { remember, .. } => remember,
+            _ => panic!("批准应返回 Command::Approve"),
+        };
+        assert!(!remember, "只批准本次不应带上 remember");
     }
 
     #[test]

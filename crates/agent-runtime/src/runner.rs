@@ -1494,4 +1494,85 @@ mod tests {
         // 提示词与工具行为一致：目标不存在时别再猜路径。
         assert!(p.contains("不要继续猜路径"), "提示词应约束盲目重试: {p}");
     }
+
+    /// 「批准本任务同类操作」的最后一米：`remember` 必须一路走到权限引擎。
+    ///
+    /// 回调此前从未装配过（`batch_approve` 恒为 `None`），用户在审批弹层按 `a`
+    /// 只是「看起来生效」，后续同类调用照旧弹窗。
+    #[tokio::test]
+    async fn approve_with_remember_registers_batch_approval() {
+        let tmp = std::env::temp_dir().join(format!("agent-rt-batch-{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+
+        let defs: Vec<ToolDef> = vec![ToolDef {
+            name: "ok_tool".into(),
+            description: "总是成功".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let lookup: ToolLookup = Arc::new(|name: &str| {
+            if name == "ok_tool" {
+                Some(Arc::new(FixedTool {
+                    name: "ok_tool",
+                    fail: false,
+                }) as Arc<dyn Tool>)
+            } else {
+                None
+            }
+        });
+
+        // 回调是同步 `Fn`，用 std 的互斥量记录（文件顶部导入的 Mutex 是 tokio 的）。
+        let registered = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let sink = registered.clone();
+        let (ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(4);
+
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: Arc::new(ScriptedProvider {
+                turns: Mutex::new(vec![vec![
+                    tool_call_args(0, "c1", "ok_tool", "{}"),
+                    StreamEvent::Usage(Usage::default()),
+                    StreamEvent::Done(FinishReason::ToolCalls),
+                ]]),
+            }),
+            provider_name: "scripted".into(),
+            tools: lookup,
+            tool_defs: defs,
+            // 一律询问：确保走到人工审批分支。
+            perm: Arc::new(AskAll),
+            store: store.clone(),
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(Mutex::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            batch_approve: Some(Arc::new(move |task_id: String, tool: String| {
+                sink.lock().unwrap().push((task_id, tool));
+            })),
+            per_task_budget: 0.0,
+        });
+
+        let bus = event_bus();
+        let mut sub = bus.subscribe();
+        // 模拟用户在弹层按 `a`：收到待审批就回「批准并记住同类」。
+        tokio::spawn(async move {
+            while let Ok(ev) = sub.recv().await {
+                if let Event::AwaitingApproval { approval_id, .. } = ev {
+                    let _ = ap_tx
+                        .send((approval_id, ApprovalReply::Approve { remember: true }))
+                        .await;
+                }
+            }
+        });
+
+        let mut spec = TaskSpec::new("批量批准", ws.display().to_string());
+        spec.max_iterations = 3;
+        // 断言目标是「登记有没有发生」，不强求任务最终结局。
+        let _ = runtime.run(spec, bus, RunControl::new()).await;
+
+        let got = registered.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "remember 应触发一次登记: {got:?}");
+        assert_eq!(got[0].1, "ok_tool", "登记的工具名应与被审批的一致");
+        assert!(!got[0].0.is_empty(), "登记需要带 task_id: {got:?}");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
 }

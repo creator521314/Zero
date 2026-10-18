@@ -74,4 +74,10 @@ pub enum ApprovalSource {
 pub trait PermissionEngine: Send + Sync {
     /// 对一次工具调用做裁决。实现见 `agent-perm`。
     async fn check(&self, call: &ToolCall, task: &TaskSpec) -> Decision;
+
+    /// 登记「本任务此类操作全部通过」，之后同类调用免询问。
+    ///
+    /// L3 下用户在审批弹层按「批准本任务同类操作」时，由编排层回调。
+    /// 默认空操作：不关心批量批准的引擎（headless / 测试替身）无需关心。
+    async fn approve_for_task(&self, _task_id: &str, _tool: &str) {}
 }

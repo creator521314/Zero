@@ -149,6 +149,11 @@ impl PermissionEngine for PermissionEngineImpl {
             }
         }
     }
+
+    async fn approve_for_task(&self, task_id: &str, tool: &str) {
+        // 转发到同名固有方法：登记逻辑保持单点，单测也可直接打到它上面。
+        PermissionEngineImpl::approve_for_task(self, task_id, tool).await;
+    }
 }
 
 #[cfg(test)]

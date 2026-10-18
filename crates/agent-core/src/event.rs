@@ -127,7 +127,12 @@ pub enum Outcome {
 #[derive(Debug, Clone)]
 pub enum Command {
     SubmitTask(TaskSpec),
-    Approve(ApprovalId),
+    /// 批准一次工具调用。`remember` 为 true 表示「本任务同类操作一并批准」
+    /// —— 对应审批弹层的「批准本任务同类操作」（`a` 键）。
+    Approve {
+        approval_id: ApprovalId,
+        remember: bool,
+    },
     /// 拒绝，并可附带给模型的原因说明。
     Reject {
         approval_id: ApprovalId,
