@@ -100,25 +100,34 @@ impl Tool for WebFetch {
 }
 
 /// 简易标签剥离（一期不引入完整 HTML 解析器）。
+///
+/// 按 **char** 迭代而非字节：网页正文大量含中文、emoji 等多字节字符，
+/// 按字节推进 `i` 再对 `&str` 做 `[i..]` 切片会切在字符中间 panic
+/// （`start byte index ... is not a char boundary`）；把字节当 Latin-1
+/// 输出还会让非 ASCII 文本变成乱码。
 fn strip_html(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut in_tag = false;
     let mut in_script = false;
-    let lower = input.to_lowercase();
-    let bytes = input.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        // 跳过 script/style 内容
-        if !in_tag && lower[i..].starts_with("<script") {
+
+    while i < input.len() {
+        // `i` 始终是 char 边界：推进只走 `len_utf8()` 与 ASCII 标签长度。
+        let rest = &input[i..];
+
+        // 标签名是 ASCII，用字节前缀做大小写不敏感匹配即可；
+        // 剩余不足或开头是多字节字符时自然不匹配。
+        if !in_tag && starts_with_ignore_ascii_case(rest, b"<script") {
             in_script = true;
         }
-        if in_script && lower[i..].starts_with("</script") {
+        if in_script && starts_with_ignore_ascii_case(rest, b"</script") {
             in_script = false;
             in_tag = true;
-            i += 7;
+            i += b"</script".len();
             continue;
         }
+
+        let c = rest.chars().next().expect("i < input.len() 保证有字符");
         if c == '<' {
             in_tag = true;
         } else if c == '>' {
@@ -129,14 +138,21 @@ fn strip_html(input: &str) -> String {
         } else if !in_tag && !in_script {
             out.push(c);
         }
-        i += 1;
+        i += c.len_utf8();
     }
+
     // 压缩空白行
     out.lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// ASCII 大小写不敏感的前缀匹配；长度不足或不匹配返回 false。
+fn starts_with_ignore_ascii_case(haystack: &str, needle: &[u8]) -> bool {
+    let h = haystack.as_bytes();
+    h.len() >= needle.len() && h[..needle.len()].eq_ignore_ascii_case(needle)
 }
 
 /// 搜索工具（一期为可插拔接口；未配置后端时返回明确提示，不静默失败）。
@@ -247,5 +263,17 @@ mod tests {
         assert!(t.contains("Hi"));
         assert!(t.contains("Text"));
         assert!(!t.contains("var x"));
+    }
+
+    #[test]
+    fn strips_tags_with_multibyte_text() {
+        // 回归：按字节推进再对 &str 切片会切在「解」中间 panic
+        // （start byte index ... is not a char boundary），
+        // 按字节当 Latin-1 输出还会把中文变成乱码。
+        let html = "<p>这是一段中文解析测试</p><p>emoji 😀</p>";
+        let t = strip_html(html);
+        assert!(t.contains("这是一段中文解析测试"), "中文不能丢/乱码: {t:?}");
+        assert!(t.contains("😀"), "emoji 不能丢: {t:?}");
+        assert!(!t.contains('<'), "标签应被剥离: {t:?}");
     }
 }
