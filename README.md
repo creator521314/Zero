@@ -278,3 +278,5 @@ cargo xtask smoke    # 工具端到端冒烟：真实跑一遍 8 个工具
 | **一期（当前）** | 单机通用 Agent：Rust + TUI + 多模型 + 三档权限 |
 | 二期 | 跨设备同步：手机权威节点、四级频率分级同步、AI 辅助合并 + 回滚、设备注册中心 |
 | 三期 | 手机端 App、单片机哑终端接入 |
+
+细分里程碑与验收方式见 [docs/milestones.md](docs/milestones.md)。
