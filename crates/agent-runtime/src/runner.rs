@@ -38,8 +38,12 @@ pub enum ApprovalReply {
 /// 工具查找函数：按名取工具。
 pub type ToolLookup = Arc<dyn Fn(&str) -> Option<Arc<dyn Tool>> + Send + Sync>;
 
-/// 批量批准回调：(task_id, tool_name)。
-pub type BatchApproveFn = Arc<dyn Fn(String, String) + Send + Sync>;
+/// 成本上报回调：本次调用花了多少 USD。
+///
+/// 接 `ProviderRouter::record_spend`。之所以要这条：执行循环是流式直连 provider
+/// 的（`provider.chat_stream`），不经过路由，月度用量一度因此**永远累计为 0**——
+/// 熔断配了却等于没配。
+pub type CostSinkFn = Arc<dyn Fn(f64) + Send + Sync>;
 
 /// 审批消息：(审批 ID, 应答)。
 pub type ApprovalMsg = (ApprovalId, ApprovalReply);
@@ -61,10 +65,10 @@ pub struct RuntimeDeps {
     /// 审批应答接收端（一次一个，由前端回填）。
     pub approvals: Arc<Mutex<mpsc::Receiver<ApprovalMsg>>>,
     pub context_cfg: ContextConfig,
-    /// 供权限引擎登记「本任务此类全批准」的回调。
-    pub batch_approve: Option<BatchApproveFn>,
-    /// 单任务预算（USD）。
+    /// 单任务预算（USD）；`<= 0` 表示不限。
     pub per_task_budget: f64,
+    /// 把成本报给账本，用于月度熔断。
+    pub cost_sink: Option<CostSinkFn>,
 }
 
 /// Agent 运行时。
@@ -309,8 +313,14 @@ impl AgentRunner for AgentRuntime {
 
             // 成本累计（简化：按 provider 单价）
             if let Some(price) = self.deps.provider.price("") {
-                spent += (out.usage.input_tokens as f64 / 1000.0) * price.input_per_1k
+                let cost = (out.usage.input_tokens as f64 / 1000.0) * price.input_per_1k
                     + (out.usage.output_tokens as f64 / 1000.0) * price.output_per_1k;
+                spent += cost;
+                // 报到账本：月度熔断要用。不在这里记的话，配好的月度预算永远
+                // 花了也看不出来（这条路径不经过 ProviderRouter）。
+                if let Some(sink) = self.deps.cost_sink.as_ref() {
+                    sink(cost);
+                }
                 if self.deps.per_task_budget > 0.0 && spent > self.deps.per_task_budget {
                     let _ = bus.send(Event::Error {
                         id: task_id.clone(),
@@ -434,9 +444,16 @@ impl AgentRunner for AgentRuntime {
                         match self.wait_approval(&approval_id, &cancel).await {
                             Ok(ApprovalReply::Approve { remember }) => {
                                 if remember {
-                                    if let Some(cb) = &self.deps.batch_approve {
-                                        cb(task.id.0.clone(), call.name.clone());
-                                    }
+                                    // 直接 await 引擎的登记：曾经这里走一个同步回调、
+                                    // 回调内部再 `tokio::spawn` 去登记，于是**下一次同类
+                                    // 调用可能在登记落定前就查过了**——用户按了 `a`
+                                    // 却还被再问一次（实测复现，见
+                                    // batch_approval_silences_repeat_calls_end_to_end）。
+                                    // 执行循环本身就是 async，没有理由绕这一圈。
+                                    self.deps
+                                        .perm
+                                        .approve_for_task(task.id.0.as_str(), &call.name)
+                                        .await;
                                 }
                             }
                             Ok(ApprovalReply::Reject { reason }) => {
@@ -770,6 +787,39 @@ mod tests {
         }
     }
 
+    /// 给 `ScriptedProvider` 加个单价：算成本要用。
+    ///
+    /// 包一层而不是改 `ScriptedProvider`：后者被一堆既有用例共用，改默认行为
+    /// 会连带影响它们。
+    struct PricedProvider {
+        inner: ScriptedProvider,
+    }
+
+    #[async_trait]
+    impl LlmProvider for PricedProvider {
+        fn name(&self) -> &str {
+            "priced"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
+            self.inner.chat(req).await
+        }
+        async fn chat_stream(
+            &self,
+            req: ChatRequest,
+        ) -> Result<BoxStream<Result<StreamEvent, LlmError>>, LlmError> {
+            self.inner.chat_stream(req).await
+        }
+        fn price(&self, _model: &str) -> Option<ModelPrice> {
+            Some(ModelPrice {
+                input_per_1k: 0.002,
+                output_per_1k: 0.004,
+            })
+        }
+    }
+
     /// 固定返回的工具：`fail` 为真时自报失败。
     struct FixedTool {
         name: &'static str,
@@ -947,8 +997,8 @@ mod tests {
             log_cfg,
             approvals: Arc::new(Mutex::new(ap_rx)),
             context_cfg: ContextConfig::default(),
-            batch_approve: None,
             per_task_budget: 0.0,
+            cost_sink: None,
         });
         (runtime, store, tmp)
     }
@@ -1002,8 +1052,8 @@ mod tests {
             log_cfg: LogConfig::default(),
             approvals: Arc::new(Mutex::new(ap_rx)),
             context_cfg: ContextConfig::default(),
-            batch_approve: None,
             per_task_budget: 0.0,
+            cost_sink: None,
         });
         (runtime, store, tmp)
     }
@@ -1358,8 +1408,8 @@ mod tests {
             log_cfg: LogConfig::default(),
             approvals: Arc::new(Mutex::new(ap_rx)),
             context_cfg: ContextConfig::default(),
-            batch_approve: None,
             per_task_budget: 0.0,
+            cost_sink: None,
         });
 
         let bus = event_bus();
@@ -1495,84 +1545,144 @@ mod tests {
         assert!(p.contains("不要继续猜路径"), "提示词应约束盲目重试: {p}");
     }
 
-    /// 「批准本任务同类操作」的最后一米：`remember` 必须一路走到权限引擎。
+    /// 系统级验证「批准本任务同类操作」：按过 `a` 之后，同类调用不再弹窗。
     ///
-    /// 回调此前从未装配过（`batch_approve` 恒为 `None`），用户在审批弹层按 `a`
-    /// 只是「看起来生效」，后续同类调用照旧弹窗。
+    /// 跑完整链路——真实引擎 + 两轮同样的工具调用，断言**只发出一次审批请求**。
+    /// 只有这条通过，L3 下才真的不会被同一个操作反复打扰。
+    ///
+    /// 它同时锁住一个实测抓到的竞态：早期实现在审批通过后走同步回调、
+    /// 回调内部再 `tokio::spawn` 去登记，于是下一次同类调用可能在登记落定前
+    /// 就查过了——用户按了 `a` 却还被再问一次。
     #[tokio::test]
-    async fn approve_with_remember_registers_batch_approval() {
-        let tmp = std::env::temp_dir().join(format!("agent-rt-batch-{}", uuid::Uuid::new_v4()));
-        let ws = tmp.join("workspace");
-        std::fs::create_dir_all(&ws).unwrap();
+    async fn batch_approval_silences_repeat_calls_end_to_end() {
+        let tmp = std::env::temp_dir().join(format!("agent-runner-batch-{}", std::process::id()));
+        let ws = tmp.join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
         let store = Arc::new(JsonlStore::new(&tmp));
 
-        let defs: Vec<ToolDef> = vec![ToolDef {
-            name: "ok_tool".into(),
-            description: "总是成功".into(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
-        let lookup: ToolLookup = Arc::new(|name: &str| {
-            if name == "ok_tool" {
-                Some(Arc::new(FixedTool {
-                    name: "ok_tool",
-                    fail: false,
-                }) as Arc<dyn Tool>)
-            } else {
-                None
-            }
-        });
+        // 真实权限引擎（L3 档），不是「一律询问」的替身——否则批量批准无从生效。
+        let engine: Arc<agent_perm::PermissionEngineImpl> =
+            Arc::new(agent_perm::PermissionEngineImpl::new(
+                agent_perm::rules::StaticRules::new(),
+                agent_perm::PermConfig::default(),
+            ));
+        let (ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(8);
 
-        // 回调是同步 `Fn`，用 std 的互斥量记录（文件顶部导入的 Mutex 是 tokio 的）。
-        let registered = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
-        let sink = registered.clone();
-        let (ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(4);
-
+        let lookup: ToolLookup = Arc::new(|_| None);
         let runtime = AgentRuntime::new(RuntimeDeps {
             provider: Arc::new(ScriptedProvider {
-                turns: Mutex::new(vec![vec![
-                    tool_call_args(0, "c1", "ok_tool", "{}"),
-                    StreamEvent::Usage(Usage::default()),
-                    StreamEvent::Done(FinishReason::ToolCalls),
-                ]]),
+                // 两轮都调用同一个工具：第二轮若还弹窗就是回归。
+                turns: Mutex::new(vec![
+                    vec![
+                        tool_call_args(0, "c1", "ok_tool", "{}"),
+                        StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                    ],
+                    vec![
+                        tool_call_args(0, "c2", "ok_tool", "{}"),
+                        StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                    ],
+                ]),
             }),
             provider_name: "scripted".into(),
             tools: lookup,
-            tool_defs: defs,
-            // 一律询问：确保走到人工审批分支。
-            perm: Arc::new(AskAll),
-            store: store.clone(),
+            tool_defs: vec![],
+            perm: engine,
+            store,
             log_cfg: LogConfig::default(),
             approvals: Arc::new(Mutex::new(ap_rx)),
             context_cfg: ContextConfig::default(),
-            batch_approve: Some(Arc::new(move |task_id: String, tool: String| {
-                sink.lock().unwrap().push((task_id, tool));
-            })),
             per_task_budget: 0.0,
+            cost_sink: None,
         });
 
         let bus = event_bus();
         let mut sub = bus.subscribe();
-        // 模拟用户在弹层按 `a`：收到待审批就回「批准并记住同类」。
+        // 数一数到底弹了几次窗。
+        let approvals_seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_for_watcher = approvals_seen.clone();
+        // 模拟用户每次都按「批准并记住同类」。
         tokio::spawn(async move {
             while let Ok(ev) = sub.recv().await {
-                if let Event::AwaitingApproval { approval_id, .. } = ev {
+                if let Event::AwaitingApproval { req, .. } = ev {
+                    seen_for_watcher.lock().unwrap().push(req.tool.clone());
                     let _ = ap_tx
-                        .send((approval_id, ApprovalReply::Approve { remember: true }))
+                        .send((req.id, ApprovalReply::Approve { remember: true }))
                         .await;
                 }
             }
         });
 
-        let mut spec = TaskSpec::new("批量批准", ws.display().to_string());
-        spec.max_iterations = 3;
-        // 断言目标是「登记有没有发生」，不强求任务最终结局。
+        let mut spec = TaskSpec::new("批量批准链路", ws.display().to_string());
+        spec.tier = agent_core::perm::PermissionTier::L3;
+        spec.max_iterations = 6;
         let _ = runtime.run(spec, bus, RunControl::new()).await;
 
-        let got = registered.lock().unwrap().clone();
-        assert_eq!(got.len(), 1, "remember 应触发一次登记: {got:?}");
-        assert_eq!(got[0].1, "ok_tool", "登记的工具名应与被审批的一致");
-        assert!(!got[0].0.is_empty(), "登记需要带 task_id: {got:?}");
+        let asked = approvals_seen.lock().unwrap().len();
+        assert_eq!(
+            asked, 1,
+            "同类工具应只询问一次（登记后放行），实际询问 {asked} 次"
+        );
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
 
+    /// 成本必须真的上报给账本。
+    ///
+    /// 回归：执行循环是流式直连 provider 的，不经过 `ProviderRouter`，月度用量
+    /// 一度**永远累计为 0**——配置里的月度预算形同虚设。此处断言每轮调用都会
+    /// 通过 `cost_sink` 把金额报出去（金额由 provider 单价 × usage 算出）。
+    #[tokio::test]
+    async fn every_turn_reports_cost_to_the_sink() {
+        let tmp = std::env::temp_dir().join(format!("agent-runner-cost-{}", std::process::id()));
+        let ws = tmp.join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+
+        let reported = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let sink = reported.clone();
+        let (ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(1);
+
+        let deps = RuntimeDeps {
+            provider: Arc::new(PricedProvider {
+                inner: ScriptedProvider {
+                    turns: Mutex::new(vec![vec![
+                        StreamEvent::Usage(Usage {
+                            input_tokens: 1_000,
+                            output_tokens: 100,
+                            reasoning_tokens: None,
+                            cached_tokens: None,
+                        }),
+                        StreamEvent::Done(agent_core::provider::FinishReason::Stop),
+                    ]]),
+                },
+            }),
+            provider_name: "priced".into(),
+            tools: Arc::new(|_| None),
+            tool_defs: vec![],
+            perm: Arc::new(AskAll),
+            store,
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(Mutex::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            per_task_budget: 0.0,
+            cost_sink: Some(Arc::new(move |cost: f64| {
+                sink.lock().unwrap().push(cost);
+            })),
+        };
+        // 让 provider 有单价，否则成本算不出来。
+        let runtime = AgentRuntime::new(deps);
+        let bus = event_bus();
+        let _ = runtime
+            .run(
+                TaskSpec::new("记账", ws.display().to_string()),
+                bus,
+                RunControl::new(),
+            )
+            .await;
+
+        let costs = reported.lock().unwrap().clone();
+        assert_eq!(costs.len(), 1, "每轮应上报一次成本，实际 {costs:?}");
+        assert!(costs[0] > 0.0, "usage 非零时成本应 > 0，实际 {costs:?}");
+        drop(ap_tx);
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }

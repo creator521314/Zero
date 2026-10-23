@@ -688,6 +688,60 @@ Bing 解析（实体解码、多字节不乱码、切片不 panic、`count` 上�
 **验收**：`cargo xtask check` 通过（fmt + clippy 0 warning + 测试）；
 `cargo test --workspace` **257 passed / 0 failed / 2 ignored**（原 225 passed）。
 
+## M3：安全闭环（2026-10-24）
+
+**动机**：M3 的条目全是「代码在位但没验过」——和 `web_search` 出事前同一副样子。
+这一轮把它们拿到真实环境里兑现，结论是**抓出 4 个真问题，其中 2 个是功能其实没生效**。
+
+### 改动
+
+| 项 | 位置 |
+|---|---|
+| 月度用量账本：按 `YYYY-MM` 分账、跨月自动归零、原子写盘 | `agent-providers/src/budget.rs`（新增） |
+| 执行循环把每轮成本报给账本（此前流式路径从不记账） | `agent-runtime/src/runner.rs`（`cost_sink`） |
+| 月度见底先退本地 provider，没有本地才拒绝 | `router.rs::resolve` |
+| 成本可见性：启动打印 `月度预算 $x 已用 $y（n%）`，跨 80%/100% 告警 | `router.rs::budget_line` |
+| L2 审视器从 `agent-cli` 抽到 `agent-providers`，两个入口共用 | `agent-providers/src/review.rs`（新增） |
+| `AiReviewer` trait 移到 `agent-core`（入参出参全是 core 类型） | `agent-core/src/perm.rs` |
+| 批量批准改为执行循环直接 await 引擎（去掉同步回调 + spawn） | `agent-runtime/src/runner.rs` |
+
+### 抓到的 4 个真问题
+
+1. **月度熔断从来没累计过**：`record_cost` 只在 `chat_with_failover` 里被调用，
+   而执行循环是流式直连 provider 的、AI 审视走 `provider.chat`——
+   两条主路径都不经过它。配好的月度预算**永远显示已用 $0**。
+2. **月度用量不落盘**：`spent_month_usd` 是内存 `f64`，注释写着「可持久化」
+   但没人实现，重启即清零。
+3. **批量批准有竞态**：审批通过后走同步回调、回调内部再 `tokio::spawn` 去登记，
+   下一次同类调用可能在登记落定前就查过了——用户按了 `a` 仍被再问一次。
+   系统级测试实跑复现（询问 2 次而非 1 次），改为直接 await 引擎后修复。
+4. **L2 审视的 `max_tokens` 太小**：实测（真实 DeepSeek）发现模型写长中文理由时
+   JSON 断在 `"confidence":` 处，整条判定作废、白降级一次询问。
+
+### 实测结论（真实 DeepSeek，`cargo test --test review_live -- --ignored`）
+
+| 轮次 | 结果 | 调整 |
+|---|---|---|
+| 第 1 轮 | 7 例中 1 例失败：`web_fetch` 报 `no json` | 定位到 `max_tokens: 200` 截断 → 提到 400 + 提示词限制 reason 长度 + 截断时兜底捞 `decision` |
+| 第 2 轮 | 7 例中 1 例失败：`web_fetch` 被拦（「与任务无关」） | 提示词改为「只判断危害，相关性仅作参考，不单独否决」 |
+| 第 3 轮 | 9 例全对 | 判定理由合理（删库/读私钥/外传凭据 → deny；无害命令 → allow） |
+
+顺带一个**策略确认**：误拦只是多问一次，误放行才是不可逆代价——所以审视器
+「拿不准就问人」，`risk=high` 时即便 `allow` 也仍然询问。
+
+### 回归保护
+
+- `budget.rs`：跨月分账、重启后累计仍在、损坏文件不阻塞启动、0/NaN 不计账
+- `router.rs`：超限退本地（并断言选择稳定——修掉了一个 HashMap 迭代顺序导致的不确定性）、
+  无本地兜底时明确报 `BudgetExceeded`、`budget_line` 文案、阈值只报一次
+- `runner.rs`：每轮成本确实上报给 sink；批量批准端到端只询问一次
+- `review.rs`：JSON 解析（含围栏/废话）、思考链兜底、截断兜底、
+  缺 `decision` 必须报错、`risk=high` 仍询问、超时降级、L3 不受审视器影响
+
+**验收**：`cargo xtask check` 通过（fmt + clippy 0 warning）；
+`cargo test --workspace` **297 passed / 0 failed / 3 ignored**（原 271）；
+L2 审视真实模型实测 9/9 通过（连跑两次稳定）。
+
 ## 工具端到端冒烟（2026-10-24）
 
 **动机**：`web_search` 100% 失败的那次，257 个单测是全绿的。复盘发现单元测试

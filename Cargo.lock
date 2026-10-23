@@ -72,6 +72,7 @@ version = "0.1.0"
 dependencies = [
  "agent-core",
  "agent-net",
+ "agent-perm",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -93,6 +94,7 @@ name = "agent-runtime"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-perm",
  "agent-store",
  "agent-tools",
  "async-trait",

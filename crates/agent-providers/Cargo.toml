@@ -21,3 +21,9 @@ tracing.workspace = true
 dialoguer.workspace = true
 directories.workspace = true
 async-stream = "0.3"
+
+# 仅测试用：审视器的单测要驱动真实的权限引擎（AiReviewer 契约在 core，
+# 实现在 agent-perm）。放在 dev-dependencies 里，正式依赖图仍守
+# 「实现 crate 只依赖 agent-core」的铁律。
+[dev-dependencies]
+agent-perm.workspace = true

@@ -9,33 +9,18 @@ pub mod rules;
 
 use std::time::Duration;
 
-use agent_core::perm::{Decision, PermissionEngine, PermissionTier, Risk};
+use agent_core::perm::{Decision, PermissionTier, Risk};
 use agent_core::provider::ToolCall;
 use agent_core::task::TaskSpec;
 use async_trait::async_trait;
 
 pub use rules::{RuleMatch, StaticRules};
 
-/// AI 审视器：把「操作上下文包」交给模型判定。
-#[async_trait]
-pub trait AiReviewer: Send + Sync {
-    /// 返回 (allow, risk, reason, confidence)。超时/失败由实现方返回 Err。
-    async fn review(
-        &self,
-        task: &TaskSpec,
-        call: &ToolCall,
-        static_risk: Risk,
-        timeout: Duration,
-    ) -> Result<Review, String>;
-}
-
-#[derive(Debug, Clone)]
-pub struct Review {
-    pub allow: bool,
-    pub risk: Risk,
-    pub reason: String,
-    pub confidence: f64,
-}
+// AiReviewer 定义在 core：它的入参出参都是 core 类型，放那里实现方
+// （agent-providers）就不必反向依赖 agent-perm。这里转出来，沿用旧路径。
+pub use agent_core::perm::AiReviewer;
+/// 权限引擎 trait 也一并转出：实现细节在 agent-perm，边界在 core。
+pub use agent_core::perm::PermissionEngine;
 
 /// 权限引擎配置。
 #[derive(Debug, Clone)]

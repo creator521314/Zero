@@ -4,89 +4,20 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use agent_core::event::{event_bus, Command, Event};
-use agent_core::perm::{PermissionEngine, PermissionTier, Risk};
-use agent_core::provider::{ChatRequest, LlmProvider, Message, ToolCall};
-use agent_core::task::{RunControl, TaskSpec};
+use agent_core::perm::{PermissionEngine, PermissionTier};
+use agent_core::task::RunControl;
 use agent_core::AgentRunner;
 use agent_perm::rules::StaticRules;
-use agent_perm::{AiReviewer, PermConfig, PermissionEngineImpl, Review};
+use agent_perm::{PermConfig, PermissionEngineImpl};
+use agent_providers::router::budget_line;
 use agent_providers::wizard;
 use agent_providers::ProviderRouter;
 use agent_providers::ProvidersFile;
 use agent_store::JsonlStore;
 use agent_tui::{run_tui, App};
-use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
-
-/// AI 审视器：用低价模型判定操作是否放行。
-struct LlmReviewer {
-    provider: Arc<dyn LlmProvider>,
-}
-
-#[async_trait]
-impl AiReviewer for LlmReviewer {
-    async fn review(
-        &self,
-        task: &TaskSpec,
-        call: &ToolCall,
-        static_risk: Risk,
-        timeout: Duration,
-    ) -> Result<Review, String> {
-        let sys = "你是操作安全审查员。判断给定的工具调用是否服务于用户任务、是否可能造成不可逆危害。\
-                   只输出 JSON：{\"decision\":\"allow|deny\",\"risk\":\"low|medium|high\",\"reason\":\"...\",\"confidence\":0.0}";
-        let ctx = format!(
-            "任务目标: {}\n工作区: {}\n静态风险: {:?}\n当前操作: 工具={} 参数={}",
-            task.prompt, task.workspace, static_risk, call.name, call.arguments
-        );
-        let req = ChatRequest {
-            model: String::new(),
-            messages: vec![Message::system(sys), Message::user(ctx)],
-            tools: vec![],
-            temperature: Some(0.0),
-            max_tokens: Some(200),
-            stream: false,
-            reasoning_effort: None,
-            metadata: Default::default(),
-        };
-        let resp = tokio::time::timeout(timeout, self.provider.chat(req))
-            .await
-            .map_err(|_| "ai review timeout".to_string())?
-            .map_err(|e| e.to_string())?;
-
-        let text = resp.message.text();
-        let start = text.find('{').ok_or("no json in review")?;
-        let end = text.rfind('}').ok_or("no json in review")?;
-        let json: serde_json::Value =
-            serde_json::from_str(&text[start..=end]).map_err(|e| e.to_string())?;
-
-        let allow = json
-            .get("decision")
-            .and_then(|d| d.as_str())
-            .map(|d| d.eq_ignore_ascii_case("allow"))
-            .unwrap_or(false);
-        let risk = match json.get("risk").and_then(|r| r.as_str()) {
-            Some("high") => Risk::High,
-            Some("medium") => Risk::Medium,
-            _ => Risk::Low,
-        };
-        Ok(Review {
-            allow,
-            risk,
-            reason: json
-                .get("reason")
-                .and_then(|r| r.as_str())
-                .unwrap_or("")
-                .to_string(),
-            confidence: json
-                .get("confidence")
-                .and_then(|c| c.as_f64())
-                .unwrap_or(0.5),
-        })
-    }
-}
 
 fn parse_tier(s: &str) -> PermissionTier {
     match s.to_ascii_uppercase().as_str() {
@@ -155,6 +86,11 @@ async fn main() -> anyhow::Result<()> {
 
     let client = agent_net::build_client(&Default::default())?;
     let router = Arc::new(ProviderRouter::from_config(&cfg, client.clone()));
+    // 本月已花多少/还剩多少：成本一眼可见，而不是等预算见底才从报错里猜。
+    tracing::info!(
+        "{}",
+        budget_line(router.spent_month_usd(), router.monthly_limit())
+    );
 
     if router.available().is_empty() {
         anyhow::bail!(
@@ -187,9 +123,7 @@ async fn main() -> anyhow::Result<()> {
     let reviewer_provider = router.resolve(None, None).await?;
     let perm = Arc::new(
         PermissionEngineImpl::new(StaticRules::new(), PermConfig::default()).with_reviewer(
-            Box::new(LlmReviewer {
-                provider: reviewer_provider,
-            }),
+            Box::new(agent_providers::LlmReviewer::new(reviewer_provider)),
         ),
     ) as Arc<dyn PermissionEngine>;
 
@@ -298,10 +232,9 @@ async fn main() -> anyhow::Result<()> {
                         let task_id = spec.id.0.clone();
                         let provider_name = provider.name().to_string();
 
-                        // 「批准本任务同类操作」的登记回调：让权限引擎记住
-                        // (task, tool)，该任务后续同类调用在 L3 下直接放行，
-                        // 不再逐一打扰用户。
-                        let engine = perm2.clone();
+                        // 「批准本任务同类操作」的登记由执行循环直接 await 引擎完成
+                        // （曾经过一个同步回调再 spawn，会在登记落定前就查下一次，
+                        // 用户按了 `a` 仍被再问一次）。
                         let runtime =
                             agent_runtime::AgentRuntime::new(agent_runtime::RuntimeDeps {
                                 provider: provider.clone(),
@@ -313,17 +246,12 @@ async fn main() -> anyhow::Result<()> {
                                 log_cfg: log_cfg2.clone(),
                                 approvals: approvals2.clone(),
                                 context_cfg: Default::default(),
-                                batch_approve: Some(Arc::new(
-                                    move |task_id: String, tool: String| {
-                                        let eng = engine.clone();
-                                        // 回调签名是同步 `Fn`，登记内部却是 async：
-                                        // spawn 一个短任务执行，不阻塞审批分支。
-                                        tokio::spawn(async move {
-                                            eng.approve_for_task(&task_id, &tool).await;
-                                        });
-                                    },
-                                )),
                                 per_task_budget: router.per_task_limit(),
+                                // 每轮成本报到账本，月度熔断才有数据可判。
+                                cost_sink: Some(Arc::new({
+                                    let router = router.clone();
+                                    move |cost: f64| router.record_spend(cost)
+                                })),
                             });
 
                         tracing::info!(task = %task_id, provider = %provider_name, "task started");

@@ -1,5 +1,7 @@
 //! 权限模型与引擎边界。
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +69,25 @@ pub enum ApprovalSource {
     Static,
     Ai,
     User,
+}
+
+/// AI 审视器边界：把「这次操作该不该放行」交给模型判。
+///
+/// 定义在 core 而不是 `agent-perm`：它的入参出参全是 core 类型，放在这里
+/// 让实现方（`agent-providers::LlmReviewer`）**不必依赖 `agent-perm`**——
+/// 「实现 crate 只依赖 agent-core」的依赖铁律才守得住。
+///
+/// 契约：任何失败都以 `Err` 返回，由引擎降级为询问用户。
+/// 实现方**不得**在解析失败时默认放行（误放行的不可逆代价 > 多问一次）。
+#[async_trait]
+pub trait AiReviewer: Send + Sync {
+    async fn review(
+        &self,
+        task: &TaskSpec,
+        call: &ToolCall,
+        static_risk: Risk,
+        timeout: Duration,
+    ) -> Result<ApprovalResult, String>;
 }
 
 /// 权限引擎边界。

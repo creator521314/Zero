@@ -18,4 +18,5 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+agent-perm.workspace = true
 agent-tools.workspace = true

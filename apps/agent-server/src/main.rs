@@ -11,6 +11,7 @@ use agent_core::task::{RunControl, TaskSpec};
 use agent_core::AgentRunner;
 use agent_perm::rules::StaticRules;
 use agent_perm::{PermConfig, PermissionEngineImpl};
+use agent_providers::router::budget_line;
 use agent_providers::wizard;
 use agent_providers::ProviderRouter;
 use agent_providers::ProvidersFile;
@@ -51,6 +52,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     tracing::info!(providers = ?router.available(), "available providers");
+    tracing::info!(
+        "{}",
+        budget_line(router.spent_month_usd(), router.monthly_limit())
+    );
 
     let root = cfg.agent.resolved_root();
     let registry = Arc::new(agent_tools::default_tools(
@@ -64,10 +69,14 @@ async fn main() -> anyhow::Result<()> {
     let lookup: agent_runtime::runner::ToolLookup =
         Arc::new(move |name: &str| reg_for_lookup.get(name));
 
-    let perm = Arc::new(PermissionEngineImpl::new(
-        StaticRules::new(),
-        PermConfig::default(),
-    )) as Arc<dyn PermissionEngine>;
+    // AI 审视器：L2 档在无人值守时不能变成「一律询问」——那会让任务卡死在
+    // 没人点确认的地方。headless 下配一个审视器，它失败时自动降级为询问。
+    let reviewer_provider = router.resolve(None, None).await?;
+    let perm = Arc::new(
+        PermissionEngineImpl::new(StaticRules::new(), PermConfig::default()).with_reviewer(
+            Box::new(agent_providers::LlmReviewer::new(reviewer_provider.clone())),
+        ),
+    ) as Arc<dyn PermissionEngine>;
 
     let store = Arc::new(JsonlStore::new(&root));
     store.init().await?;
@@ -111,8 +120,12 @@ async fn main() -> anyhow::Result<()> {
         log_cfg: cfg.log.clone(),
         approvals: Arc::new(Mutex::new(ap_rx)),
         context_cfg: Default::default(),
-        batch_approve: None,
         per_task_budget: router.per_task_limit(),
+        // 每轮成本报到账本，月度熔断才有数据可判。
+        cost_sink: Some(Arc::new({
+            let router = router.clone();
+            move |cost: f64| router.record_spend(cost)
+        })),
     });
 
     let mut spec = TaskSpec::new(prompt, String::new());
