@@ -248,7 +248,28 @@ TUI 只发送差分（ratatui 的机制），物理屏幕一旦被外部改动�
 ```bash
 cargo test           # 全量测试
 cargo xtask check    # fmt + clippy + test 一站式检查
+cargo xtask smoke    # 工具端到端冒烟：真实跑一遍 8 个工具
 ```
+
+### 工具冒烟
+
+单元测试全绿不等于工具能用——`web_search` 曾 100% 失败而当时 257 个单测全过：
+单测直接构造工具、注入替身参数，既不过 `default_tools()` 这条生产装配路径，
+也不比对「给模型看的 JSON Schema」和「`execute` 真正读的键」。
+
+`crates/agent-tools/tests/smoke.rs` 只补单元测试看不见的部分：
+
+| 检查 | 拦截的问题 |
+|---|---|
+| 注册表内容 | 工具被漏掉/改名没人发现 |
+| `defs()` 完整性 | 描述为空、`parameters` 不合 schema → 模型根本不会用 |
+| 声明参数 ↔ 实际入参 | 只改一侧 → 模型永远拿到 `InvalidArgs`（web_search 那类） |
+| 缺必填参数报 `InvalidArgs` | 校验被顺手删掉后静默按空值跑 |
+| 真实读写/执行/联网 | 「不报错」但输出不对（中文乱码、标签没剥、搜出零条） |
+
+联网用例在**网络不可达或被限流时跳过**（并打印原因），不会让离网环境误红；
+但只要连得上，输出不成立就算失败。冒烟是集成测试，已被 `cargo xtask check`
+带回 CI 门禁。
 
 ## 路线图
 

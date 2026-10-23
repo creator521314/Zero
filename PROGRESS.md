@@ -31,6 +31,7 @@
 | `agent-tools::web` | HTML 标签与 script 剥离；搜索后端解析矩阵；搜索 URL 构造与查询串往返；Bing 结果页解析（实体解码/多字节/条数上限）；SearXNG JSON 解析与 HTML 错误页可读性；HTTP 错误文案与 SearXNG JSON 未启用提示；结果渲染；`backend=off` 与空 query 输入校验（另有 1 个 `--ignored` 真实网络冒烟） |
 | `agent-tools::shell` | 本平台解释器能起命令；非 0 退出码标为错误；描述串与平台一致；中文按 OEM 代码页解出可读文本；UTF-8 输出不被二次损坏 |
 | `agent-tools::fs_tools` | 相对路径落到项目根；无项目根时退回私有工作区；空目录明说；读目录给出替代工具；覆写前快照到私有工作区 `snapshots/` |
+| `agent-tools`（集成，`tests/smoke.rs`） | 端到端冒烟：8 个工具都注册且 `defs()` 可用；声明参数与实际入参一致；缺必填参数报 `InvalidArgs`；真实读写/编辑/列目录/`shell_exec`/`finish` 产物登记；装配路径上的逃逸防护；`web_fetch` 抓到正文且标签剥离；**零配置 `web_search` 能搜出真实结果**；联网「跳过」判定不被放宽（详见 [工具端到端冒烟](#工具端到端冒烟2026-10-24)） |
 | `agent-tools::finish` | 显式终止信号：总结 + 登记交付物路径；非法/逃逸路径跳过不掀翻任务 |
 | `agent-providers` | tool 消息转换；assistant tool_call 转换（arguments 必须为字符串） |
 | `agent-runtime::context` | 上下文压缩保留固定区并生成摘要 |
@@ -687,13 +688,56 @@ Bing 解析（实体解码、多字节不乱码、切片不 panic、`count` 上�
 **验收**：`cargo xtask check` 通过（fmt + clippy 0 warning + 测试）；
 `cargo test --workspace` **257 passed / 0 failed / 2 ignored**（原 225 passed）。
 
+## 工具端到端冒烟（2026-10-24）
+
+**动机**：`web_search` 100% 失败的那次，257 个单测是全绿的。复盘发现单元测试
+天然看不见三类问题：
+
+1. 不过 `default_tools()` 这条生产装配路径——工具漏注册、改名都照样绿；
+2. 不比对「模型看到的 JSON Schema」与「`execute` 真正读的键」——只改一侧，模型
+   永远收到 `InvalidArgs`，表现就是某个工具 100% 失败；
+3. 不对**输出内容**下断言——「不报错」和「真的能用」是两件事。
+
+这套 harness 的用途是让「工具能用」被**持续**验证，而不是等某天偶然撞见。
+
+**改动**：新增 `crates/agent-tools/tests/smoke.rs`（14 个集成测试），
+`cargo xtask smoke` 作为单独入口。它本身就是集成测试，已被 `cargo test --all`
+带上、`cargo xtask check` 自动纳入门禁。
+
+| 用例 | 拦截的问题 |
+|---|---|
+| `every_tool_is_registered` | 8 个工具漏注册/改名 |
+| `llm_sees_a_usable_definition_for_every_tool` | 描述为空、`parameters` 不合 schema（模型不会用） |
+| `tools_accept_exactly_the_args_they_advertise` | 声明参数与实际读取漂移（核心） |
+| `missing_required_arg_is_rejected_not_ignored` | 必填校验被删后静默按空值跑 |
+| `write_then_read_round_trips_content` | 中文/emoji 往返 |
+| `edit_actually_rewrites_the_file` | 编辑没落盘、找不到 `old_str` 却报成功 |
+| `list_dir_shows_what_was_written` | 列目录与写入不一致 |
+| `escape_attempt_is_rejected_through_the_registry` | 装配路径上的逃逸防护 |
+| `finish_reports_summary_and_real_artifacts` | 交付物没登记/字节数为 0 |
+| `shell_exec_runs_a_real_command` | 真实命令执行 + 乱码 |
+| `web_fetch_retrieves_a_real_page` | 抓得到但正文不对/标签没剥 |
+| `web_search_returns_real_hits_without_configuration` | **零配置必须能搜** |
+| `web_search_rejects_blank_query` | 空 query 不被静默接受 |
+| `transport_failures_are_skipped_but_real_breakage_is_not` | 守护跳过判定，防止冒烟变走过场 |
+
+**联网用例的判定**：只有**传输层**失败（DNS/连不上/超时/TLS/proxy/429）才**跳过**
+并打印原因——离网 CI 不该误红，但也不该假装验过了；其余一律算失败。该判定由上面
+最后一条用例 lock 住，避免放宽后整套冒烟变成摆设。已用不可达代理
+（`ALL_PROXY=http://127.0.0.1:9`）实测：联网时 14 passed 且真的拿到结果，
+离线时 14 passed 且两个联网用例打印「跳过」。
+
+**验证**：`cargo xtask check` 通过（fmt + clippy 0 warning + 测试）；
+`cargo test --workspace` **271 passed / 0 failed / 2 ignored**（原 257）。
+8 个工具全部实跑通过，未发现新的产品缺陷。
+
 ## 已知限制（一期）
 
 | 限制 | 说明 |
 |---|---|
 | 上下文压缩为轻量摘录 | 非 LLM 摘要，二期可增强 |
 | 工具调用为串行执行 | 设计上支持并行，一期按顺序执行 |
-| `web_search` 内置后端依赖 Bing 结果页结构 | HTML 结构变了会退化为「无结果」，此时可改用自建 SearXNG（JSON API，稳定契约） |
+| `web_search` 内置后端依赖 Bing 结果页结构 | HTML 结构变了会退化为「无结果」，此时可改用自建 SearXNG（JSON API，稳定契约）；该退化由 `cargo xtask smoke` 拦截 |
 | TUI 任务面板未实现 | 单任务流，多任务切换在 M4 |
 
 ## 待办（M3 起）

@@ -3,6 +3,7 @@
 //! 用法：
 //!   cargo xtask check    # fmt 检查 + clippy + test
 //!   cargo xtask test     # 仅测试
+//!   cargo xtask smoke    # 工具端到端冒烟（真实跑一遍 8 个工具）
 //!   cargo xtask fmt      # 格式化
 //!   cargo xtask gen-cfg  # 生成默认配置文件
 //!   cargo xtask log <id|路径> [--full] [--errors]   # 读会话日志
@@ -20,6 +21,17 @@ fn main() -> anyhow::Result<()> {
             run(&["test", "--all"])?;
         }
         "test" => run(&["test", "--all"])?,
+        // 它也会被 `check` / `test` 带上（集成测试在 --all 里），这里只是单独
+        // 跑一次的入口：想确认「工具现在真的能用」时用这个。
+        "smoke" => run(&[
+            "test",
+            "-p",
+            "agent-tools",
+            "--test",
+            "smoke",
+            "--",
+            "--nocapture",
+        ])?,
         "fmt" => run(&["fmt", "--all"])?,
         "gen-cfg" => {
             let path = agent_providers::ProvidersFile::config_path();
@@ -46,7 +58,7 @@ fn main() -> anyhow::Result<()> {
         }
         other => {
             eprintln!("unknown task: {other}");
-            eprintln!("available: check | test | fmt | gen-cfg | log");
+            eprintln!("available: check | test | smoke | fmt | gen-cfg | log");
             std::process::exit(2);
         }
     }
