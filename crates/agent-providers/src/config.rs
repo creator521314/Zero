@@ -238,9 +238,37 @@ impl Default for Budget {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchConfig {
-    /// SearXNG 端点，如 http://localhost:8080/search
+    /// 后端选择：`auto`（默认）/ `searxng` / `bing` / `off`。
+    ///
+    /// 旧配置没有这个字段（`#[serde(default)]` → None），语义就是 `auto`。
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// 自建 SearXNG 端点，如 http://localhost:8080/search
     #[serde(default)]
     pub searxng_endpoint: Option<String>,
+}
+
+impl SearchConfig {
+    /// `None` 等价于缺省的 `auto`。
+    pub fn backend(&self) -> &str {
+        self.backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("auto")
+    }
+
+    /// 是否要求自建 SearXNG、但并未配置端点（此时 web_search 必然全灭）。
+    pub fn missing_searxng_endpoint(&self) -> bool {
+        let mode = self.backend();
+        mode.eq_ignore_ascii_case("searxng")
+            && self
+                .searxng_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,6 +449,14 @@ impl ProvidersFile {
                  改为 `.` 表示启动目录）",
                 proj.display()
             ));
+        }
+        // 与上面同类：配置看着「配过了」，实际是 100% 失败。
+        if self.search.missing_searxng_endpoint() {
+            out.push(
+                "search.backend = \"searxng\"，但没有 searxng_endpoint：web_search 会直接失败。\
+                 请补上端点，或改回 `auto` 使用内置搜索后端"
+                    .to_string(),
+            );
         }
         out
     }
@@ -713,6 +749,41 @@ mod tests {
         let mut cfg = ProvidersFile::default();
         cfg.providers.get_mut("deepseek").unwrap().base_url = "https://my-proxy.example.com".into();
         assert!(cfg.warnings().is_empty(), "未知域名不应误报");
+    }
+
+    // ---- [search] 后端 ----
+
+    #[test]
+    fn search_backend_defaults_to_auto() {
+        // 关键回归：默认（无 backend 字段）必须是「能用」，而不是 None-prone。
+        assert_eq!(SearchConfig::default().backend(), "auto");
+        assert!(!SearchConfig::default().missing_searxng_endpoint());
+    }
+
+    #[test]
+    fn blank_search_backend_falls_back_to_auto() {
+        let cfg = SearchConfig {
+            backend: Some("  ".into()),
+            searxng_endpoint: None,
+        };
+        assert_eq!(cfg.backend(), "auto", "空白串等同于未配置");
+    }
+
+    #[test]
+    fn warns_when_searxng_required_but_endpoint_missing() {
+        let mut cfg = ProvidersFile::default();
+        cfg.search.backend = Some("searxng".into());
+        let w = cfg.warnings();
+        assert_eq!(w.len(), 1, "应恰好一条警告，实际: {w:?}");
+        assert!(w[0].contains("searxng_endpoint"), "应点名字段: {}", w[0]);
+    }
+
+    #[test]
+    fn no_warning_when_searxng_endpoint_provided() {
+        let mut cfg = ProvidersFile::default();
+        cfg.search.backend = Some("searxng".into());
+        cfg.search.searxng_endpoint = Some("http://localhost:8080/search".into());
+        assert!(cfg.warnings().is_empty(), "配置完整时不应警告");
     }
 
     #[test]

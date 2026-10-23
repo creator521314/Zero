@@ -28,7 +28,7 @@
 | `agent-perm::rules` | 8 类高危命令命中；4 类正常命令放行；受保护路径 |
 | `agent-perm` | L1 高危拦截；L2 无审视器降级；L3 逐个确认 + 批量批准 |
 | `agent-tools::paths` | `../` 逃逸拒绝；工作区内路径接受；项目根为基准；私有工作区仍可达；Windows 盘符大小写/斜杠方向不误判 |
-| `agent-tools::web` | HTML 标签与 script 剥离 |
+| `agent-tools::web` | HTML 标签与 script 剥离；搜索后端解析矩阵；搜索 URL 构造与查询串往返；Bing 结果页解析（实体解码/多字节/条数上限）；SearXNG JSON 解析与 HTML 错误页可读性；HTTP 错误文案与 SearXNG JSON 未启用提示；结果渲染；`backend=off` 与空 query 输入校验（另有 1 个 `--ignored` 真实网络冒烟） |
 | `agent-tools::shell` | 本平台解释器能起命令；非 0 退出码标为错误；描述串与平台一致；中文按 OEM 代码页解出可读文本；UTF-8 输出不被二次损坏 |
 | `agent-tools::fs_tools` | 相对路径落到项目根；无项目根时退回私有工作区；空目录明说；读目录给出替代工具；覆写前快照到私有工作区 `snapshots/` |
 | `agent-tools::finish` | 显式终止信号：总结 + 登记交付物路径；非法/逃逸路径跳过不掀翻任务 |
@@ -603,7 +603,8 @@ Latin-1 输出还会让中文 / emoji 变乱码（「解」= `E8 A7 A3` 被拆�
 
 **回归保护**：新增 `strips_tags_with_multibyte_text`（中文 + emoji 不丢不乱码）；
 顺带排查全仓同类「按字节索引切 `&str`」的位置，其余（`app.rs` 的 cursor、
-`render.rs` 测试用 `find()`、`urlencoding` 的 ASCII 分支）索引均落在 char 边界。
+`render.rs` 测试用 `find()`、`web.rs` 里以 ASCII 标记为锚点的 `attrs()` /
+`first_anchor()` 扫描）索引均落在 char 边界。
 
 **验收**：`agent-tools` 23 passed；`cargo xtask check` 通过。
 
@@ -640,13 +641,59 @@ runner deps.batch_approve              ┴─ apps 装配恒为 None，且转发
 
 **验收**：`cargo xtask check` 通过。
 
+## 修复：`web_search` 总是失败（2026-10-24）
+
+**症状**：无论什么查询，`web_search` 都返回同一句错误——
+「web_search 未配置搜索后端」。工具在 8 个工具里唯一常年不可用。
+
+**根因**：它是**唯一**的后端是自建 SearXNG 的 JSON API，而：
+
+1. 默认配置、配置向导、`config.example.toml` 都不会写 `[search]` 段
+   → `searxng_endpoint` 恒为 `None` → 每次调用直接返回错误；
+2. 就算配置了，也还有三个放大问题的实现缺陷：
+   - 不校验 HTTP 状态码，直接 `resp.json()`：SearXNG 未启用 JSON 输出时返回
+     403 的 HTML 错误页，报错是「bad search response: expected value at line 1
+     column 1」，完全指不出真实原因；
+   - URL 用字符串拼接（`format!("{endpoint}?q=...")`），端点自带查询参数会拼出
+     非法 URL，且手工百分号编码不正确处理多字节；
+   - 不支持取消（对比 `web_fetch` 有 `ctx.cancel`）。
+
+「必须有后端才能用」+「后端几乎没人有」= 工具 100% 失败。
+
+**改动**：
+
+| 项 | 位置 |
+|---|---|
+| 新增内置免 key 后端（Bing 结果页），零配置即可搜索 | `agent-tools/src/web.rs` |
+| 后端变成有序列表，失败（HTTP 错误/不可解析/零结果）自动顺延下一个 | 同上 |
+| 校验状态码并把状态码 + 正文摘要带进报错；识别 SearXNG JSON 输出未启用并给出具体改法 | `http_error` / `parse_searxng` |
+| URL 改由 `reqwest::Url` 的 `query_pairs_mut` 构造（含原参数保留与编码） | `SearchBackend::build_url` |
+| 显式 `Accept-Encoding: identity`——依赖未开 gzip 解压特性，否则取回压缩正文只会「解析出零结果」 | `WebSearch::run` |
+| 接入 `ctx.cancel`（与 `web_fetch` 一致） | 同上 |
+| `[search] backend`（auto/searxng/bing/off）+ 缺端点时的非致命警告 | `agent-providers/src/config.rs`、`config/config.example.toml` |
+| 两个入口按配置解析后端列表 | `apps/agent-*`、`agent-tools/src/registry.rs` |
+
+隐私取舍：`backend = "searxng"` 时**不回退**到内置后端，宁可失败也不把 query
+发给第三方；默认 `auto` 才允许回退。
+
+**回归保护**：新增 19 个单测——后端解析矩阵（含 `searxng` 无端点不得偷偷回退、
+`off` 关闭）、URL 构造（保留原参数、中文查询往返一致、非法端点报错点名字段）、
+Bing 解析（实体解码、多字节不乱码、切片不 panic、`count` 上限）、SearXNG JSON
+解析与 HTML 错误页可读性、`http_error` 内容与提示、渲染格式、`backend=off`
+与空 query 的输入校验。另有 1 个 `--ignored` 真实网络冒烟测试
+（`searches_without_configuration_against_live_bing`），已实跑通过并拿到 5 条
+真实结果（中文标题/摘要正常）。
+
+**验收**：`cargo xtask check` 通过（fmt + clippy 0 warning + 测试）；
+`cargo test --workspace` **257 passed / 0 failed / 2 ignored**（原 225 passed）。
+
 ## 已知限制（一期）
 
 | 限制 | 说明 |
 |---|---|
 | 上下文压缩为轻量摘录 | 非 LLM 摘要，二期可增强 |
 | 工具调用为串行执行 | 设计上支持并行，一期按顺序执行 |
-| `web_search` 需自备 SearXNG | 未配置时返回明确提示，不静默失败 |
+| `web_search` 内置后端依赖 Bing 结果页结构 | HTML 结构变了会退化为「无结果」，此时可改用自建 SearXNG（JSON API，稳定契约） |
 | TUI 任务面板未实现 | 单任务流，多任务切换在 M4 |
 
 ## 待办（M3 起）

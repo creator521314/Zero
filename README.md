@@ -178,6 +178,10 @@ save_stream_deltas = false   # 逐字增量（开着日志会大一数量级）
   碰到 TUI 的屏幕。输出先按 UTF-8 严格解，失败再按系统 OEM 代码页解
   （`dir` 这类是 GBK，`git` 这类是 UTF-8，两者都要活下来）。
 - `web_fetch` 有 SSRF 防护（禁内网/非 http(s)）；
+- `web_search` **免配置即可用**（内置后端）。想走自建 SearXNG 就在 `[search]`
+  设 `searxng_endpoint`，缺省策略是「SearXNG 优先、失败自动回退」；
+  只想用自建实例时设 `backend = "searxng"`，`backend = "off"` 则彻底关闭搜索。
+  全部后端都失败时会逐个列出失败原因，不会只留一句「search failed」。
 - 超大工具输出自动外置到 `ctx/`。
 
 ## 数据布局

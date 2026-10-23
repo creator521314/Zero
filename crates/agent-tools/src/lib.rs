@@ -11,3 +11,4 @@ pub mod shell;
 pub mod web;
 
 pub use registry::{default_tools, ToolRegistry};
+pub use web::SearchBackend;

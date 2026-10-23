@@ -96,11 +96,23 @@ per_task_limit_usd = 0.5
 # ============================================================
 #  🔍  search —— 网络搜索
 # ============================================================
-# web_search 工具的 SearXNG 端点（自建）。未配置时 web_search 会失败并给出明确提示。
+# web_search **免配置即可用**：内置后端直接发起搜索，报错会带上原因。
+#
+# 想让搜索请求不经过第三方（自建实例），配置 searxng_endpoint 即可，
+# 缺省策略是「先用 SearXNG，失败自动退回内置后端」。
+#
+# backend 取值：
+#   auto     （默认）配了 SearXNG 就先用它，失败再退回内置后端
+#   searxng  只用 SearXNG，失败就失败（不外发 query 给第三方）
+#   bing     只用内置后端
+#   off      关闭搜索（此时调用 web_search 会返回明确提示）
 
-# 「不启用搜索」的表达方式：省略 searxng_endpoint 这一行。
 [search]
-# searxng_endpoint = "http://localhost:8080/search"   # 示例
+# backend          = "auto"                                # 省略就是 auto
+# searxng_endpoint = "http://localhost:8080/search"        # 自建实例（可选）
+#
+# 注意：SearXNG 默认**关闭 JSON 输出**，直接取得到的是 HTML 错误页。
+# 需在实例的 settings.yml 里让 search.formats 包含 json。
 
 # ============================================================
 #  ⚙️  agent —— 工作区与执行参数

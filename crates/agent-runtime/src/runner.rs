@@ -213,7 +213,7 @@ struct StreamOutcome {
 struct ToolExecuted {
     /// 回填给模型的内容（大输出已外置，出错时带 `[error]` 前缀）。
     content: String,
-    /// 工具自报失败（如 `web_search` 未配置后端）。
+    /// 工具自报失败（如 `web_search` 所有后端都没搜到结果）。
     is_error: bool,
     artifacts: Vec<String>,
 }

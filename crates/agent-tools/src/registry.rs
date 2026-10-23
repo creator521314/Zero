@@ -9,7 +9,7 @@ use agent_core::tool::Tool;
 use crate::finish::Finish;
 use crate::fs_tools::{FileEdit, FileRead, FileWrite, ListDir};
 use crate::shell::ShellExec;
-use crate::web::{WebFetch, WebSearch};
+use crate::web::{SearchBackend, WebFetch, WebSearch};
 
 /// 工具注册表：按名索引，可注入自定义工具。
 #[derive(Default)]
@@ -53,7 +53,10 @@ impl ToolRegistry {
 }
 
 /// 组装一期默认工具集。
-pub fn default_tools(client: reqwest::Client, search_endpoint: Option<String>) -> ToolRegistry {
+///
+/// `search_backends` 由 [`SearchBackend::resolve`] 产出：为空表示配置了关闭搜索，
+/// 此时 `web_search` 仍在工具列表里但只会返回一条明确的「已关闭」提示。
+pub fn default_tools(client: reqwest::Client, search_backends: Vec<SearchBackend>) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(FileRead));
     reg.register(Arc::new(FileWrite));
@@ -61,7 +64,7 @@ pub fn default_tools(client: reqwest::Client, search_endpoint: Option<String>) -
     reg.register(Arc::new(ListDir));
     reg.register(Arc::new(ShellExec));
     reg.register(Arc::new(WebFetch::new(client.clone())));
-    reg.register(Arc::new(WebSearch::new(client, search_endpoint)));
+    reg.register(Arc::new(WebSearch::new(client, search_backends)));
     reg.register(Arc::new(Finish));
     reg
 }
