@@ -43,6 +43,16 @@ pub struct TaskSpec {
     pub max_iterations: usize,
     /// 单任务预算上限（USD），None 使用全局配置。
     pub budget_usd: Option<f64>,
+    /// 续跑时携带的历史消息（`/resume` 用）。
+    ///
+    /// 由 store 里该任务最后一次 `ContextSnapshot` 还原而来——那就是当时
+    /// **真正送给模型**的上下文。带它启动时，执行循环不再从零拼 system+prompt，
+    /// 而是接着这份上下文继续。
+    ///
+    /// 注意：`prompt` 仍会写进新的 system 固定区（system 提示词每次都要重建），
+    /// 所以「当初要做什么」不会因为续跑而丢失。
+    #[serde(default)]
+    pub resume_messages: Option<Vec<crate::provider::Message>>,
 }
 
 impl TaskSpec {
@@ -59,6 +69,7 @@ impl TaskSpec {
             model: None,
             max_iterations: 25,
             budget_usd: None,
+            resume_messages: None,
         }
     }
 }

@@ -16,7 +16,7 @@ use crate::theme::{glyph, tier_label};
 /// 切换权限档，三者都只改本地 UI 状态。设计稿里的 `/model`（切模型）、
 /// `/compact`（手动压缩上下文）依赖后端能力，尚未落地，故不列入——遵循
 /// 「只提示已实现功能」的原则，避免补出执行不了的入口。
-pub const SLASH_COMMANDS: &[&str] = &["/clear", "/help", "/tier"];
+pub const SLASH_COMMANDS: &[&str] = &["/clear", "/help", "/tier", "/tasks", "/resume"];
 
 /// 右上角瞬态通知：`on_tick` 里到期自动清除，`text` 供渲染读取。
 pub struct Toast {
@@ -175,6 +175,8 @@ pub struct App {
     pub input: InputState,
     pub pending: Option<PendingApproval>,
     pub active_task: Option<TaskId>,
+    /// 待转交编排层的 `/` 命令（`/tasks`、`/resume` 需要 store，UI 够不着）。
+    pub pending_command: Option<Command>,
     pub tier: String,
     pub provider: String,
     pub status: String,
@@ -236,6 +238,7 @@ impl Default for App {
             input: InputState::default(),
             pending: None,
             active_task: None,
+            pending_command: None,
             tier: "L2".into(),
             provider: "-".into(),
             status: "就绪".into(),
@@ -569,6 +572,22 @@ impl App {
             "/clear" => self.clear_conversation(),
             "/help" => self.show_help(),
             "/tier" => self.cycle_tier(),
+            // 这两个不直接改 UI，而是转成 Command 交给编排层（它才够得着 store）。
+            "/tasks" => {
+                self.pending_command = Some(Command::ListTasks);
+                self.input.take();
+                return true;
+            }
+            _ if cmd.starts_with("/resume ") => {
+                let id = cmd["/resume ".len()..].trim();
+                if id.is_empty() {
+                    self.toast("用法：/resume <任务ID前几位>");
+                    return true;
+                }
+                self.pending_command = Some(Command::ResumeTask(id.to_string()));
+                self.input.take();
+                return true;
+            }
             _ => return false,
         }
         self.input.take();
@@ -652,6 +671,14 @@ impl App {
     /// 中断当前任务。
     pub fn cancel_command(&self) -> Option<Command> {
         self.active_task.clone().map(Command::Cancel)
+    }
+
+    /// 取走待编排层处理的 `/` 命令（`/tasks`、`/resume`）。
+    ///
+    /// 与 `take_approval` 同一套路：UI 只负责产生意图，真正要碰 store 的动作
+    /// 交给编排层，TUI 因此不需要依赖 agent-store。
+    pub fn take_pending_command(&mut self) -> Option<Command> {
+        self.pending_command.take()
     }
 
     /// 记录日志文件路径（启动时由装配层注入）。

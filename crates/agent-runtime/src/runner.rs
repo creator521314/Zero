@@ -226,7 +226,7 @@ struct ToolExecuted {
 impl AgentRunner for AgentRuntime {
     async fn run(
         &self,
-        task: TaskSpec,
+        mut task: TaskSpec,
         bus: EventBus,
         ctl: RunControl,
     ) -> Result<Outcome, AgentError> {
@@ -245,7 +245,17 @@ impl AgentRunner for AgentRuntime {
         });
 
         let mut cm = ContextManager::new(self.deps.context_cfg.clone(), Self::system_prompt(&task));
-        cm.push(Message::user(&task.prompt));
+        // 续跑：接着上一次的上下文往下走（快照里已含 system 固定区与历史消息），
+        // 而不是从零开始——否则「恢复」只是把老对话留在日志里，模型什么都没记住。
+        match task.resume_messages.take() {
+            Some(history) if !history.is_empty() => {
+                for m in history {
+                    cm.push(m);
+                }
+                tracing::info!(task = %task_id.0, turns = cm.messages().len(), "resumed from snapshot");
+            }
+            _ => cm.push(Message::user(&task.prompt)),
+        }
 
         let cancel = ctl.cancel.clone();
         let mut artifacts: Vec<String> = Vec::new();

@@ -139,6 +139,10 @@ pub enum Command {
         reason: String,
     },
     Cancel(TaskId),
+    /// 列出历史任务（TUI `/tasks`）。由编排层读 store 后把结果回灌成对话行。
+    ListTasks,
+    /// 恢复某个历史任务继续对话：参数为任务 id（或 id 前缀）。
+    ResumeTask(String),
     Quit,
 }
 

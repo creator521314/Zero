@@ -94,6 +94,51 @@ impl JsonlStore {
         tokio::fs::write(path, data).await?;
         Ok(())
     }
+
+    /// 列出所有已知任务（按更新时间倒序）。
+    ///
+    /// 供 TUI 的 `/tasks` 面板用。读不到/读不懂的单个文件跳过，不让一条坏数据
+    /// 把整个列表搞没。
+    pub async fn list_tasks(&self) -> Vec<TaskSummary> {
+        let mut out = Vec::new();
+        let mut rd = match tokio::fs::read_dir(self.tasks_dir()).await {
+            Ok(rd) => rd,
+            Err(_) => return out,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(text) = tokio::fs::read_to_string(&path).await {
+                if let Ok(summary) = serde_json::from_str::<TaskSummary>(&text) {
+                    out.push(summary);
+                }
+            }
+        }
+        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out
+    }
+
+    /// 取某个任务最后一次上下文快照里的消息（用于「恢复继续」）。
+    ///
+    /// 之所以用快照而不是重放事件：快照就是**当时真正送给模型的那份上下文**
+    /// （含 system 固定区与历史工具结果），重放还得自己重新拼。
+    /// 会话 id 与任务 id 同名（见 `recorder`），找不到就返回 None。
+    pub async fn last_messages(&self, task_id: &TaskId) -> Option<Vec<agent_core::provider::Message>> {
+        let session = self
+            .load_session(&SessionId::from_raw(task_id.0.clone()))
+            .await
+            .ok()?;
+        session
+            .events
+            .iter()
+            .rev()
+            .find_map(|ev| match &ev.payload {
+                Event::ContextSnapshot { messages, .. } => Some(messages.clone()),
+                _ => None,
+            })
+    }
 }
 
 #[async_trait]

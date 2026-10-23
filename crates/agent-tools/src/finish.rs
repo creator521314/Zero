@@ -59,13 +59,15 @@ impl Tool for Finish {
                     continue;
                 }
                 if let Ok(full) = resolve_in_ctx(ctx, raw) {
-                    let bytes = tokio::fs::metadata(&full)
-                        .await
-                        .map(|m| m.len())
-                        .unwrap_or(0);
+                    // 实测（M4.2）：模型会把「写又被自己删掉」的临时文件登记成交付物，
+                    // 落到审计里就是一条 bytes=0 的幽灵产物。文件不在就跳过，
+                    // 别让不存在的路径污染产物清单。
+                    let Ok(meta) = tokio::fs::metadata(&full).await else {
+                        continue;
+                    };
                     arts.push(Artifact {
                         path: full.display().to_string(),
-                        bytes,
+                        bytes: meta.len(),
                     });
                 }
             }
@@ -163,6 +165,38 @@ mod tests {
             "逃逸路径不应登记: {:?}",
             out.side_effects
         );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn finish_skips_artifacts_that_no_longer_exist() {
+        // 实测回归（M4.2）：模型把「写完又删掉的临时脚本」登记成交付物，
+        // 旧实现会记成 bytes=0 的幽灵产物。
+        let base = std::env::temp_dir().join("agent-tools-finish-ghost-test");
+        let proj = base.join("proj");
+        let ws = base.join("workspace").join("t1");
+        tokio::fs::create_dir_all(&proj).await.unwrap();
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::write(proj.join("real.md"), "# 真产物")
+            .await
+            .unwrap();
+
+        let out = Finish
+            .execute(
+                json!({ "summary": "ok", "artifacts": ["real.md", "deleted_tmp.ps1"] }),
+                &ctx(Some(&proj), &ws),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.side_effects.len(),
+            1,
+            "只登记真实存在的文件，实际: {:?}",
+            out.side_effects
+        );
+        assert!(out.side_effects[0].path.ends_with("real.md"));
 
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
