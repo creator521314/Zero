@@ -38,11 +38,13 @@ pub struct Toast {
 pub enum Line {
     User(String),
     Assistant(String),
-    /// 折叠的工具调用：名称 + 参数摘要 + 状态。
+    /// 折叠的工具调用：名称 + 参数摘要 + 状态（成功时附 diff 预览）。
     Tool {
         name: String,
         summary: String,
         status: ToolStatus,
+        /// 编辑类工具的改动预览；只有 `file_edit` 有（入参里就带改前/改后文本）。
+        diff: Option<DiffPreview>,
     },
     /// 思考链（灰显）。
     Reasoning(String),
@@ -236,9 +238,43 @@ pub struct App {
     /// 上下文快照作为续跑上下文（由编排层补齐），所以对话是连续的，而不是
     /// 每按一次回车就开一条新任务、模型忘光前面做过什么。
     pub viewing: Option<(TaskId, String)>,
-    /// 项目根（装配层注入）：`/news` 从这里读 `templates/news.md`。
+    /// 项目根（装配层注入）：`/news` 从这里读 `templates/news.md`，`@` 补全扫这里。
     project_root: Option<std::path::PathBuf>,
+    /// `@` 文件补全状态。
+    pub at: AtCompletion,
 }
+
+/// `@` 文件补全状态。
+///
+/// 生命周期跟着输入框里的 `@` 走：输入 `@` 打开、补全/ Esc / 删掉 `@` 关闭。
+/// 文件清单在打开时扫一次（关闭即丢弃）——不常驻内存，也就不会拿到过期的清单。
+#[derive(Default)]
+pub struct AtCompletion {
+    pub active: bool,
+    /// 当前高亮的候选。
+    pub sel: usize,
+    /// `@` 在输入框里的字节位置（补全时整段替换 `@query`）。
+    pub token_start: usize,
+    /// `@` 之后的查询串。
+    pub query: String,
+    /// 候选（相对路径，`/` 分隔），最多 [`AT_MAX_CANDIDATES`] 条。
+    pub candidates: Vec<String>,
+}
+
+/// 候选上限：够用且不会把浮层撑到天上去；再多就靠把查询打细。
+pub const AT_MAX_CANDIDATES: usize = 50;
+/// 扫描上限：防止在超大仓库上打开输入框就卡住（超出部分直接不看）。
+const AT_SCAN_LIMIT: usize = 20_000;
+/// 扫描时跳过的目录名（构建产物 / 依赖 / 版本库内部）。
+const AT_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "target-ws",
+    "node_modules",
+    "tmp",
+    ".codebuddy",
+    ".vscode",
+];
 
 impl App {
     /// 构造带状态栏标识的 App（权限档 / provider 名由装配层传入）。
@@ -284,6 +320,7 @@ impl Default for App {
             panel_sel: 0,
             viewing: None,
             project_root: None,
+            at: AtCompletion::default(),
         }
     }
 }
@@ -336,10 +373,12 @@ impl App {
             }
             Event::ToolCallStart { name, args, .. } => {
                 let summary = summarize_args(&args);
+                let diff = diff_for_tool(&name, &args);
                 self.lines.push(Line::Tool {
                     name,
                     summary,
                     status: ToolStatus::Running,
+                    diff,
                 });
                 self.status = "执行工具…".into();
                 self.auto_scroll();
@@ -507,12 +546,15 @@ impl App {
         self.input.insert_char(c);
         self.leave_history();
         self.wake_cursor();
+        // `@` 的打开/过滤跟着输入走（`/` 补全由调用方再刷一次）。
+        self.refresh_at();
     }
 
     pub fn on_backspace(&mut self) {
         self.input.backspace();
         self.leave_history();
         self.wake_cursor();
+        self.refresh_at();
     }
 
     /// 软光标闪烁周期。
@@ -694,9 +736,141 @@ impl App {
         true
     }
 
-    /// 记录项目根（装配层注入）：`/news` 从这里读 `templates/news.md`。
+    /// 记录项目根（装配层注入）：`/news` 从这里读 `templates/news.md`，
+    /// `@` 文件补全从这里扫文件。
     pub fn set_project_root(&mut self, root: impl Into<std::path::PathBuf>) {
         self.project_root = Some(root.into());
+    }
+
+    // ---- `@` 文件补全 ----
+
+    /// 光标所在的 `@` 提及：返回 `@` 的字节位置与查询串。
+    ///
+    /// 只认「行首或空白之后的 `@`」且到光标之间没有空白：`a@b.com` 这种
+    /// 邮箱不该弹菜单，`看看 @app` 才该弹。
+    pub fn at_token(&self) -> Option<(usize, String)> {
+        let before = &self.input.buffer[..self.input.cursor];
+        let at = before.rfind('@')?;
+        if at > 0 {
+            let prev = before[..at].chars().next_back()?;
+            if !prev.is_whitespace() {
+                return None;
+            }
+        }
+        let query = &before[at + 1..];
+        if query.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some((at, query.to_string()))
+    }
+
+    /// 当前查询命中的候选：先「路径前缀」，再「文件名前缀」，最后「包含」。
+    ///
+    /// 排序还带上路径长度与字典序，保证同样的查询每次顺序一致（否则列表会
+    /// 在两次按键之间随机换位，高亮落在哪条全看运气）。
+    pub fn at_candidates(&self) -> Vec<&str> {
+        let q = self.at.query.to_ascii_lowercase();
+        let mut hits: Vec<(u8, &str)> = self
+            .at
+            .candidates
+            .iter()
+            .filter_map(|p| {
+                let lower = p.to_ascii_lowercase();
+                let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+                let score = if q.is_empty() || lower.starts_with(&q) {
+                    0
+                } else if name.starts_with(&q) {
+                    1
+                } else if lower.contains(&q) {
+                    2
+                } else {
+                    return None;
+                };
+                Some((score, p.as_str()))
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.len().cmp(&b.1.len()))
+                .then_with(|| a.1.cmp(b.1))
+        });
+        hits.into_iter()
+            .take(AT_MAX_CANDIDATES)
+            .map(|(_, p)| p)
+            .collect()
+    }
+
+    /// 重算 `@` 补全状态（输入 / 退格 / 删除 / 移动光标后调用）。
+    pub fn refresh_at(&mut self) {
+        // `/` 补全与审批弹层优先：两个浮层同时弹出来只会让人不知道在选什么。
+        if self.completion_active || self.pending.is_some() {
+            self.close_at();
+            return;
+        }
+        let Some((start, query)) = self.at_token() else {
+            self.close_at();
+            return;
+        };
+        let Some(root) = self.project_root.clone() else {
+            // 没有项目根（headless / 无目录）就没什么可补全的。
+            self.close_at();
+            return;
+        };
+        if self.at.candidates.is_empty() {
+            self.at.candidates = scan_project_files(&root, AT_SCAN_LIMIT);
+        }
+        let changed = !self.at.active || self.at.token_start != start || self.at.query != query;
+        self.at.token_start = start;
+        self.at.query = query;
+        if changed {
+            self.at.sel = 0;
+        }
+        self.at.active = !self.at_candidates().is_empty();
+        let last = self.at_candidates().len().saturating_sub(1);
+        self.at.sel = self.at.sel.min(last);
+    }
+
+    /// 关闭 `@` 补全，并丢掉这次扫出来的文件清单。
+    pub fn close_at(&mut self) {
+        self.at = AtCompletion::default();
+    }
+
+    /// 上下移动 `@` 补全高亮。
+    pub fn at_move(&mut self, delta: isize) {
+        let last = self.at_candidates().len().saturating_sub(1);
+        let next = self.at.sel as isize + delta;
+        self.at.sel = next.clamp(0, last as isize) as usize;
+        self.wake_cursor();
+    }
+
+    /// 用高亮项替换光标前的 `@查询`；成功返回 true。
+    pub fn complete_at(&mut self) -> bool {
+        let Some(cand) = self.at_candidates().get(self.at.sel).map(|s| s.to_string()) else {
+            return false;
+        };
+        let start = self.at.token_start;
+        let end = self.input.cursor;
+        if start > end || end > self.input.buffer.len() {
+            return false;
+        }
+        let insert = format!("@{cand}");
+        self.input.buffer.replace_range(start..end, &insert);
+        // 补全后自动补一个空格（若后面不是空白）：否则继续打字会把新字符拼进
+        // 路径，`@src/app.rs` 后面刚打一个字母就又把菜单弹出来。
+        let mut cursor = start + insert.len();
+        if self.input.buffer[cursor..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_whitespace())
+        {
+            self.input.buffer.insert(cursor, ' ');
+            cursor += 1;
+        }
+        self.input.cursor = cursor;
+        self.close_at();
+        self.leave_history();
+        self.wake_cursor();
+        true
     }
 
     /// 新闻收集模板：优先用项目里的 `templates/news.md`（用户可改），
@@ -1029,6 +1203,91 @@ fn slugify(s: &str) -> String {
     } else {
         t.to_string()
     }
+}
+
+/// 扫描项目文件，返回相对路径（`/` 分隔、按字典序）。
+///
+/// 跳过构建产物与版本库内部（见 [`AT_SKIP_DIRS`]）与所有点开头目录：`@` 补全
+/// 是为了选「我要让 agent 看的文件」，不是给 `target/debug/deps/...` 做目录浏览。
+/// 有深度与数量上限，避免在超大仓库上按一下 `@` 就卡住。
+fn scan_project_files(root: &std::path::Path, limit: usize) -> Vec<String> {
+    const MAX_DEPTH: usize = 8;
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if out.len() >= limit || depth > MAX_DEPTH {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            if out.len() >= limit {
+                break;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            let name = entry.file_name().to_string_lossy().to_string();
+            if ft.is_dir() {
+                // 点开头（.git/.github/.venv…）与构建产物一律不进。
+                if name.starts_with('.') || AT_SKIP_DIRS.contains(&name.as_str()) {
+                    continue;
+                }
+                stack.push((entry.path(), depth + 1));
+            } else if ft.is_file() {
+                let rel = entry
+                    .path()
+                    .strip_prefix(root)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| name.clone());
+                out.push(rel);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 编辑类工具的改动预览。
+///
+/// 只对 `file_edit` 生成：它的入参里就带 `old_str` / `new_str`，不需要读盘、
+/// 也不需要翻快照就能算出来。`file_write` 没有「改前」文本，故不做假 diff。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffPreview {
+    /// 被删掉的行。
+    pub removed: Vec<String>,
+    /// 新增的行。
+    pub added: Vec<String>,
+    /// 因过长被省略的行数（两侧合计）。
+    pub omitted: usize,
+}
+
+/// 每侧最多展示的 diff 行数（再长就只报「还有 N 行」）。
+const MAX_DIFF_LINES: usize = 12;
+
+/// 从工具入参里提取改动预览；不可用返回 None。
+fn diff_for_tool(name: &str, args: &serde_json::Value) -> Option<DiffPreview> {
+    if name != "file_edit" {
+        return None;
+    }
+    let old = args.get("old_str")?.as_str()?;
+    let new = args.get("new_str").and_then(|v| v.as_str()).unwrap_or("");
+    let mut removed: Vec<String> = old.lines().map(str::to_string).collect();
+    let mut added: Vec<String> = new.lines().map(str::to_string).collect();
+    if removed.is_empty() && added.is_empty() {
+        return None;
+    }
+    let mut omitted = 0;
+    for side in [&mut removed, &mut added] {
+        if side.len() > MAX_DIFF_LINES {
+            omitted += side.len() - MAX_DIFF_LINES;
+            side.truncate(MAX_DIFF_LINES);
+        }
+    }
+    Some(DiffPreview {
+        removed,
+        added,
+        omitted,
+    })
 }
 
 fn summarize_args(args: &serde_json::Value) -> String {
@@ -1951,6 +2210,235 @@ mod tests {
         assert_eq!(slugify("AI 芯片"), "AI-芯片");
         assert_eq!(slugify("a/b:c*d"), "abcd");
         assert_eq!(slugify("   "), "news");
+    }
+
+    // ---- 编辑类工具的 diff 预览 ----
+
+    fn tool_start(app: &mut App, name: &str, args: serde_json::Value) {
+        app.apply_event(Event::ToolCallStart {
+            id: TaskId::new(),
+            call_id: agent_core::ids::ToolCallId::new(),
+            name: name.into(),
+            args,
+        });
+    }
+
+    #[test]
+    fn file_edit_carries_diff_preview() {
+        let mut app = App::default();
+        tool_start(
+            &mut app,
+            "file_edit",
+            serde_json::json!({
+                "path": "a.rs",
+                "old_str": "fn old() {}\nlet x = 1;",
+                "new_str": "fn new() {}\nlet x = 2;"
+            }),
+        );
+        match app.lines.last() {
+            Some(Line::Tool { diff: Some(d), .. }) => {
+                assert_eq!(d.removed, vec!["fn old() {}", "let x = 1;"]);
+                assert_eq!(d.added, vec!["fn new() {}", "let x = 2;"]);
+                assert_eq!(d.omitted, 0);
+            }
+            other => panic!("file_edit 应带 diff 预览，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_edit_tool_has_no_diff_preview() {
+        let mut app = App::default();
+        tool_start(
+            &mut app,
+            "file_write",
+            serde_json::json!({ "path": "a.rs", "content": "hello" }),
+        );
+        match app.lines.last() {
+            Some(Line::Tool { diff, .. }) => assert!(diff.is_none(), "file_write 没有「改前」文本"),
+            other => panic!("应为工具行，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn long_edit_reports_omitted_lines() {
+        let mut app = App::default();
+        let old = (0..30)
+            .map(|i| format!("old {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = "new".to_string();
+        tool_start(
+            &mut app,
+            "file_edit",
+            serde_json::json!({ "path": "a.rs", "old_str": old, "new_str": new }),
+        );
+        match app.lines.last() {
+            Some(Line::Tool { diff: Some(d), .. }) => {
+                assert_eq!(d.removed.len(), MAX_DIFF_LINES, "最多展示 12 行");
+                assert_eq!(d.omitted, 30 - MAX_DIFF_LINES, "其余报数");
+            }
+            other => panic!("应带 diff，实际 {other:?}"),
+        }
+    }
+
+    // ---- `@` 文件补全 ----
+
+    /// 造一个「项目根已注入、候选已就绪」的 App（不真的扫盘）。
+    fn at_app(files: &[&str]) -> App {
+        let mut app = App::default();
+        app.set_project_root(std::env::temp_dir());
+        app.at.candidates = files.iter().map(|s| s.to_string()).collect();
+        app
+    }
+
+    #[test]
+    fn at_token_only_recognises_word_start_mentions() {
+        let mut app = App::default();
+        // 行首
+        app.input.buffer = "@app".into();
+        app.input.move_end();
+        assert_eq!(app.at_token(), Some((0, "app".to_string())));
+
+        // 空白之后（"看看 " = 3+3+1 = 7 字节）
+        app.input.buffer = "看看 @app".into();
+        app.input.move_end();
+        assert_eq!(app.at_token(), Some((7, "app".to_string())));
+
+        // 邮箱不该弹菜单
+        app.input.buffer = "a@b.com".into();
+        app.input.move_end();
+        assert_eq!(app.at_token(), None);
+
+        // 查询里出现空格 = 已经不是在提文件了
+        app.input.buffer = "看 @app 文件".into();
+        app.input.move_end();
+        assert_eq!(app.at_token(), None);
+
+        // 光标在 `@` 之前
+        app.input.buffer = "@app".into();
+        app.input.move_home();
+        assert_eq!(app.at_token(), None);
+    }
+
+    #[test]
+    fn at_candidates_rank_path_prefix_then_name_then_contains() {
+        let mut app = at_app(&[
+            "src/app.rs",
+            "docs/application.md",
+            "crates/app/mod.rs",
+            "app.rs",
+            "README.md",
+        ]);
+        app.at.query = "app".into();
+        assert_eq!(
+            app.at_candidates(),
+            vec![
+                "app.rs",              // 路径前缀
+                "src/app.rs",          // 文件名前缀（app.rs）
+                "docs/application.md", // 文件名前缀（application.md 也是 app 开头）
+                "crates/app/mod.rs",   // 仅路径中包含
+            ],
+            "README.md 不该入列"
+        );
+
+        // 空查询 = 全量（按长度、字典序稳定排序）
+        app.at.query.clear();
+        assert_eq!(app.at_candidates().len(), 5);
+        assert_eq!(app.at_candidates()[0], "app.rs");
+    }
+
+    #[test]
+    fn at_candidates_are_case_insensitive() {
+        let mut app = at_app(&["Src/App.Rs"]);
+        app.at.query = "APP".into();
+        assert_eq!(app.at_candidates(), vec!["Src/App.Rs"]);
+    }
+
+    #[test]
+    fn complete_at_replaces_the_mention_text() {
+        let mut app = at_app(&["src/app.rs"]);
+        app.input.buffer = "看看 @ap 这个文件".into();
+        app.input.move_end();
+        // 光标挪到 `ap` 之后（"这个文件" 之前）
+        for _ in 0.." 这个文件".chars().count() {
+            app.input.move_left();
+        }
+        app.refresh_at();
+        assert!(app.at.active, "光标在 @ap 之后应激活");
+        assert!(app.complete_at());
+        assert_eq!(app.input.buffer, "看看 @src/app.rs 这个文件");
+        assert!(!app.at.active, "补全后关闭菜单");
+        assert_eq!(
+            app.input.cursor,
+            "看看 @src/app.rs".len(),
+            "光标落在插入内容之后"
+        );
+    }
+
+    #[test]
+    fn refresh_at_closes_without_project_root() {
+        // 没有项目根（headless）就别弹一个永远空的菜单。
+        let mut app = App::default();
+        app.input.buffer = "@".into();
+        app.input.move_end();
+        app.refresh_at();
+        assert!(!app.at.active);
+    }
+
+    #[test]
+    fn scan_project_files_skips_build_vcs_and_dependency_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-tui-atscan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        for (p, body) in [
+            ("src/main.rs", "x"),
+            ("README.md", "x"),
+            ("target/debug/agent.exe", "x"),
+            (".git/config", "x"),
+            ("node_modules/pkg/index.js", "x"),
+            (".venv/bin/python", "x"),
+        ] {
+            let path = root.join(p);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+
+        let files = scan_project_files(&root, 100);
+        assert!(files.contains(&"src/main.rs".to_string()), "{files:?}");
+        assert!(files.contains(&"README.md".to_string()), "{files:?}");
+        for skipped in ["target", ".git", "node_modules", ".venv"] {
+            assert!(
+                !files.iter().any(|f| f.starts_with(skipped)),
+                "{skipped}/ 不该被扫进来：{files:?}"
+            );
+        }
+        // 相对路径一律 `/` 分隔（Windows 上也不能冒出 `\`）
+        assert!(!files.iter().any(|f| f.contains('\\')), "{files:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_respects_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-tui-atlimit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..10 {
+            std::fs::write(root.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        assert_eq!(scan_project_files(&root, 4).len(), 4, "上限要生效");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

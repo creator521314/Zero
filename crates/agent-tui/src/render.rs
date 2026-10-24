@@ -281,6 +281,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
         MouseEventKind::Down(button) | MouseEventKind::Drag(button)
             if button == MouseButton::Left =>
         {
+            // `@` 文件补全优先（和 `/` 菜单一样吞掉本次点击，避免误触背后界面）。
+            if app.at.active {
+                if click_at_completion(app, m.row, m.column, input) {
+                    return None;
+                }
+                app.close_at();
+                return None;
+            }
             // 补全菜单优先：点候选执行命令；点菜单外关闭菜单（都吞掉本次点击，
             // 避免误触背后的对话区 / 滚动条）。
             if app.completion_active {
@@ -350,6 +358,20 @@ fn panel_rect(area: Rect, count: usize) -> (Rect, Rect) {
     let outer = Rect::new(x, y, w, h);
     let inner = Rect::new(x + 1, y + 1, w.saturating_sub(2), h.saturating_sub(2));
     (outer, inner)
+}
+
+/// 点击 `@` 补全候选：命中则补全并返回 true；未命中返回 false。
+fn click_at_completion(app: &mut App, row: u16, column: u16, input_area: Rect) -> bool {
+    let cands = app.at_candidates();
+    if !app.at.active || cands.is_empty() {
+        return false;
+    }
+    let (_popup, inner) = at_menu_rect(input_area, &cands);
+    if !point_in(inner, row, column) {
+        return false;
+    }
+    app.at.sel = row.saturating_sub(inner.y) as usize;
+    app.complete_at()
 }
 
 /// 点击补全菜单候选：命中则执行命令并返回 true；未命中返回 false。
@@ -563,6 +585,34 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
         return UiAction::None;
     }
 
+    // `@` 文件补全：↑/↓ 选、Tab 或 Enter 补全、Esc 关闭。
+    // Enter 在这里**只补全不提交**——挑文件挑到一半把任务发出去是最坏的意外。
+    // 其余按键继续走下面的普通输入分支，让用户能边打边过滤。
+    if app.at.active {
+        let n = app.at_candidates().len();
+        if n > 0 {
+            match key.code {
+                KeyCode::Up => {
+                    app.at_move(-1);
+                    return UiAction::None;
+                }
+                KeyCode::Down => {
+                    app.at_move(1);
+                    return UiAction::None;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    app.complete_at();
+                    return UiAction::None;
+                }
+                KeyCode::Esc => {
+                    app.close_at();
+                    return UiAction::None;
+                }
+                _ => {}
+            }
+        }
+    }
+
     // `/` 命令补全：菜单激活时，方向键选候选、Tab 补全、Enter 执行、Esc 关闭。
     let cands = app.slash_candidates();
     if app.completion_active && !cands.is_empty() {
@@ -623,6 +673,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
             app.leave_history();
             app.wake_cursor();
             app.refresh_completion();
+            app.refresh_at();
             UiAction::None
         }
         (KeyCode::Enter, _) => {
@@ -651,6 +702,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
             app.wake_cursor();
             app.leave_history();
             app.refresh_completion();
+            app.refresh_at();
             UiAction::None
         }
         (KeyCode::Left, _) => {
@@ -737,6 +789,7 @@ fn draw(f: &mut Frame, app: &App) {
     draw_conversation(f, app, chunks[1]);
     draw_input(f, app, chunks[2]);
     draw_completion(f, app, chunks[2]);
+    draw_at_completion(f, app, chunks[2]);
     if app.footer_visible {
         draw_footer(f, chunks[3]);
     }
@@ -819,6 +872,37 @@ fn draw_toast(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), popup);
 }
 
+/// 编辑类工具的 diff 行：`- 旧行` / `+ 新行`，缩进对齐工具名。
+///
+/// 只铺行内容，不加整行底色：对话区已经有「用户消息铺底」与「代码块铺底」
+/// 两种底色，再来一种会糊成一片；红色 `-` 与绿色 `+` 足够分辨方向。
+fn push_diff_lines(lines: &mut Vec<RtLine<'static>>, d: &crate::app::DiffPreview) {
+    for line in &d.removed {
+        lines.push(RtLine::from(vec![
+            Span::styled("     - ", Style::default().fg(ink::ERROR)),
+            Span::styled(
+                truncate_display(&one_line(line), 200),
+                Style::default().fg(ink::ERROR),
+            ),
+        ]));
+    }
+    for line in &d.added {
+        lines.push(RtLine::from(vec![
+            Span::styled("     + ", Style::default().fg(ink::SUCCESS)),
+            Span::styled(
+                truncate_display(&one_line(line), 200),
+                Style::default().fg(ink::SUCCESS),
+            ),
+        ]));
+    }
+    if d.omitted > 0 {
+        lines.push(RtLine::from(Span::styled(
+            format!("     … 还有 {} 行未展开", d.omitted),
+            Style::default().fg(ink::FG_MUTED),
+        )));
+    }
+}
+
 /// 构建对话区的渲染行（纯函数，便于单测）。
 ///
 /// `inner_w` 为内容区宽度：用户消息整行铺底需要靠它算右侧填充。
@@ -876,6 +960,7 @@ fn build_conversation_lines(items: &[Line], inner_w: usize) -> Vec<RtLine<'stati
                 name,
                 summary,
                 status,
+                diff,
             } => {
                 let (mark, color) = match status {
                     ToolStatus::Running => (glyph::RUNNING, ink::WARNING),
@@ -915,6 +1000,13 @@ fn build_conversation_lines(items: &[Line], inner_w: usize) -> Vec<RtLine<'stati
                     )),
                 }
                 lines.push(RtLine::from(spans));
+
+                // 编辑成功才展示 diff：失败 / 被拒时「改了什么」是假的，只会误导。
+                if matches!(status, ToolStatus::Ok { .. }) {
+                    if let Some(d) = diff {
+                        push_diff_lines(&mut lines, d);
+                    }
+                }
             }
             // 系统提示：灰显，首行带 · 标记。
             Line::System(s) => {
@@ -1202,6 +1294,64 @@ fn draw_completion(f: &mut Frame, app: &App, input_area: Rect) {
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
+/// `@` 文件补全浮层：贴在输入框上方，显示相对路径与高亮项。
+fn draw_at_completion(f: &mut Frame, app: &App, input_area: Rect) {
+    let cands = app.at_candidates();
+    if !app.at.active || cands.is_empty() {
+        return;
+    }
+    let (popup, inner) = at_menu_rect(input_area, &cands);
+    f.render_widget(Clear, popup);
+
+    let title = format!(" 文件 {} · Tab 补全 ", cands.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(title, Style::default().fg(ink::PRIMARY)))
+        .border_style(Style::default().fg(ink::PRIMARY));
+    f.render_widget(block, popup);
+
+    let rows = inner.height as usize;
+    let offset = app.at.sel.saturating_sub(rows.saturating_sub(1));
+    let mut lines: Vec<RtLine> = Vec::new();
+    for (i, c) in cands.iter().enumerate().skip(offset).take(rows) {
+        let style = if i == app.at.sel {
+            Style::default()
+                .fg(BG)
+                .bg(ink::PRIMARY)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(ink::FG)
+        };
+        let text = truncate_display(c, inner.width.saturating_sub(1) as usize);
+        lines.push(RtLine::from(Span::styled(format!(" {text}"), style)));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// `@` 补全浮层的 `(外框, 内区)`——渲染与鼠标命中共用。
+///
+/// 宽度跟最长路径走但会被屏宽压住，高度最多 8 行：路径太长时靠输入更多字符
+/// 收窄，而不是让浮层吃掉半个屏幕。
+fn at_menu_rect(input_area: Rect, cands: &[&str]) -> (Rect, Rect) {
+    let max_w = cands
+        .iter()
+        .map(|c| UnicodeWidthStr::width(*c))
+        .max()
+        .unwrap_or(0) as u16;
+    let w = (max_w + 3).max(24).min(input_area.width);
+    let rows = cands.len().min(8) as u16;
+    let h = (rows + 2).min(input_area.y).max(3);
+    let popup = Rect::new(input_area.x, input_area.y.saturating_sub(h), w, h);
+    let inner = Rect {
+        x: popup.x + 1,
+        y: popup.y + 1,
+        width: popup.width.saturating_sub(2),
+        height: popup.height.saturating_sub(2),
+    };
+    (popup, inner)
+}
+
 /// 补全菜单的 `(外框, 内区)` 矩形——渲染与鼠标命中共用，保证坐标一致。
 ///
 /// 菜单贴着输入框左上角往上长；高度超出屏幕上沿时截断，极端窄屏下个别候选
@@ -1279,9 +1429,20 @@ fn cursor_cell(visible: bool, ch: char) -> Span<'static> {
 ///
 /// 只提示**已实现**的功能，避免出现「提示了却做不到」的入口；Enter 的提示
 /// 交给右侧的发送指示器（见 [`send_indicator`]），这里不重复。
+/// `/` 与 `@` 都已落地，所以按设计稿 §6.2 用反显 pill 标出来（`!` `$` `#`
+/// 等尚未实现的入口仍然不显示）。
 fn placeholder_spans() -> Vec<Span<'static>> {
     let hint = Style::default().fg(ink::FG_MUTED);
-    vec![Span::styled(" 输入任务… ", hint)]
+    let pill = Style::default()
+        .fg(ink::PRIMARY)
+        .add_modifier(Modifier::REVERSED);
+    vec![
+        Span::styled(" 输入任务… ", hint),
+        Span::styled(" / ", pill),
+        Span::styled("命令 ", hint),
+        Span::styled(" @ ", pill),
+        Span::styled("引用文件 ", hint),
+    ]
 }
 
 /// [wrap_line][crate::markdown] 也要用（软换行 + 悬挂缩进），故为 crate 内可见。
@@ -2248,14 +2409,21 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_spans_have_no_unimplemented_prefixes() {
+    fn placeholder_spans_only_advertise_implemented_prefixes() {
         let spans = placeholder_spans();
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        // 只提示已实现的功能，不应出现尚未落地的前缀入口。
-        for not_yet in ["/", "@", "!", "$", "#"] {
+        // 已落地的两个可以提示……
+        for done in ["/", "@"] {
+            assert!(
+                joined.contains(done),
+                "已实现的前缀应提示 {done}: {joined:?}"
+            );
+        }
+        // ……尚未落地的一律不提示（`!` shell 直通 / `$` 切模型 / `#` 切智能体）。
+        for not_yet in ["!", "$", "#"] {
             assert!(
                 !joined.contains(not_yet),
-                "P0 不应提示未实现入口 {not_yet}: {joined:?}"
+                "不应提示未实现入口 {not_yet}: {joined:?}"
             );
         }
     }
@@ -2508,11 +2676,13 @@ mod tests {
                 name: "read_file".into(),
                 summary: "src/a.rs".into(),
                 status: ToolStatus::Running,
+                diff: None,
             },
             Line::Tool {
                 name: "edit_file".into(),
                 summary: "src/a.rs".into(),
                 status: ToolStatus::Ok { ms: 42 },
+                diff: None,
             },
             Line::Tool {
                 name: "shell_exec".into(),
@@ -2521,6 +2691,7 @@ mod tests {
                     reason: "命令退出码 1".into(),
                     ms: 12,
                 },
+                diff: None,
             },
             Line::Tool {
                 name: "web_fetch".into(),
@@ -2528,6 +2699,7 @@ mod tests {
                 status: ToolStatus::Rejected {
                     reason: "命中内网访问规则".into(),
                 },
+                diff: None,
             },
             Line::System("任务已完成".into()),
             Line::Error("连接失败".into()),
@@ -2589,6 +2761,7 @@ mod tests {
             name: "read_file".into(),
             summary: "src/a.rs".into(),
             status: ToolStatus::Running,
+            diff: None,
         }];
         let line = tool_line(&items, "read_file");
         assert!(line.contains('⏺'), "运行中应显示 ⏺: {line}");
@@ -2601,6 +2774,7 @@ mod tests {
             name: "edit_file".into(),
             summary: "src/a.rs".into(),
             status: ToolStatus::Ok { ms: 42 },
+            diff: None,
         }];
         let line = tool_line(&items, "edit_file");
         assert!(line.contains('✔'), "成功应显示 ✔: {line}");
@@ -2616,6 +2790,7 @@ mod tests {
                 reason: "命令退出码 1".into(),
                 ms: 12,
             },
+            diff: None,
         }];
         let line = tool_line(&items, "shell_exec");
         assert!(line.contains('✖'), "失败应显示 ✖: {line}");
@@ -2632,6 +2807,7 @@ mod tests {
             status: ToolStatus::Rejected {
                 reason: "命中内网访问规则".into(),
             },
+            diff: None,
         }];
         let line = tool_line(&items, "web_fetch");
         assert!(line.contains('⊘'), "被拒应显示 ⊘: {line}");
@@ -2649,6 +2825,7 @@ mod tests {
                 reason: "第一行\n  第二行".into(),
                 ms: 1,
             },
+            diff: None,
         }];
         let line = tool_line(&items, "shell_exec");
         assert!(
@@ -2666,6 +2843,7 @@ mod tests {
                 reason: "错误".repeat(200),
                 ms: 1,
             },
+            diff: None,
         }];
         let line = tool_line(&items, "shell_exec");
         assert!(line.ends_with('…'), "超长原因应截断: {line:?}");
@@ -2673,6 +2851,71 @@ mod tests {
             UnicodeWidthStr::width(line.as_str()) < 200,
             "截断后宽度应显著变短: {line:?}"
         );
+    }
+
+    // ---- 编辑 diff 预览 ----
+
+    fn conv_text(items: &[Line]) -> String {
+        build_conversation_lines(items, 80)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn diff(removed: &[&str], added: &[&str], omitted: usize) -> crate::app::DiffPreview {
+        crate::app::DiffPreview {
+            removed: removed.iter().map(|s| s.to_string()).collect(),
+            added: added.iter().map(|s| s.to_string()).collect(),
+            omitted,
+        }
+    }
+
+    #[test]
+    fn ok_edit_renders_diff_lines() {
+        let items = vec![Line::Tool {
+            name: "file_edit".into(),
+            summary: "src/a.rs".into(),
+            status: ToolStatus::Ok { ms: 3 },
+            diff: Some(diff(&["let x = 1;"], &["let x = 2;"], 0)),
+        }];
+        let out = conv_text(&items);
+        assert!(out.contains("- let x = 1;"), "{out}");
+        assert!(out.contains("+ let x = 2;"), "{out}");
+    }
+
+    #[test]
+    fn failed_edit_does_not_render_diff() {
+        // 失败/被拒时「改了什么」是假的，展示 diff 只会误导。
+        let items = vec![Line::Tool {
+            name: "file_edit".into(),
+            summary: "src/a.rs".into(),
+            status: ToolStatus::Failed {
+                reason: "找不到 old_str".into(),
+                ms: 2,
+            },
+            diff: Some(diff(&["old"], &["new"], 0)),
+        }];
+        let out = conv_text(&items);
+        assert!(!out.contains("+ new"), "失败不该展示 diff：{out}");
+        assert!(out.contains("找不到 old_str"), "{out}");
+    }
+
+    #[test]
+    fn truncated_diff_reports_remaining_lines() {
+        let items = vec![Line::Tool {
+            name: "file_edit".into(),
+            summary: "src/a.rs".into(),
+            status: ToolStatus::Ok { ms: 1 },
+            diff: Some(diff(&["a"], &["b"], 7)),
+        }];
+        let out = conv_text(&items);
+        assert!(out.contains("还有 7 行"), "{out}");
     }
 
     // ---- truncate_display / one_line ----
@@ -2738,6 +2981,8 @@ mod tests {
         let s = squash(&out);
         assert!(s.contains("输入任务"), "空输入应显示占位文字:\n{out}");
         assert!(s.contains("⏎"), "空输入应显示 Enter pill:\n{out}");
+        assert!(s.contains("/"), "应提示 / 命令（已实现）:\n{out}");
+        assert!(s.contains("@"), "应提示 @ 文件补全（已实现）:\n{out}");
     }
 
     // ---- Ctrl+H / Ctrl+R / Toast ----
@@ -2942,6 +3187,154 @@ mod tests {
         );
         assert!(app.input.buffer.contains("web_search"), "应填入模板");
         assert!(!app.lines.iter().any(|l| matches!(l, Line::User(_))));
+    }
+
+    // ---- @ 文件补全 ----
+
+    /// 临时项目目录（Drop 时删掉），里面准备三个文件供 `@` 补全扫描。
+    struct TempProj(std::path::PathBuf);
+
+    impl Drop for TempProj {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_proj() -> TempProj {
+        let root = std::env::temp_dir().join(format!(
+            "agent-tui-at-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        for (p, body) in [
+            ("src/app.rs", "x"),
+            ("src/render.rs", "x"),
+            ("README.md", "x"),
+        ] {
+            let path = root.join(p);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        TempProj(root)
+    }
+
+    fn at_app(dir: &TempProj) -> App {
+        let mut app = App::default();
+        app.set_project_root(&dir.0);
+        app
+    }
+
+    /// 依次敲入若干键。
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            let _ = handle_key(app, key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn typing_at_opens_file_completion() {
+        let dir = temp_proj();
+        let mut app = at_app(&dir);
+        type_str(&mut app, "@app");
+        assert!(app.at.active, "输入 @ 应弹出文件补全");
+        assert_eq!(app.at.query, "app");
+        assert_eq!(app.at_candidates(), vec!["src/app.rs"]);
+    }
+
+    #[test]
+    fn at_completion_tab_and_enter_insert_and_never_submit() {
+        let dir = temp_proj();
+        let mut app = at_app(&dir);
+        type_str(&mut app, "看看 @ap");
+        assert!(app.at.active, "候选：{:?}", app.at_candidates());
+
+        let action = handle_key(&mut app, key(KeyCode::Tab));
+        assert!(matches!(action, UiAction::None));
+        assert_eq!(app.input.buffer, "看看 @src/app.rs ", "补全后自动补空格");
+        assert!(!app.at.active);
+        assert!(
+            !app.lines.iter().any(|l| matches!(l, Line::User(_))),
+            "补全不该提交任务"
+        );
+
+        // Enter 同样是「补全」而不是「发送」——挑文件挑到一半发出去是最坏的意外。
+        let mut app = at_app(&dir);
+        type_str(&mut app, "@RE");
+        assert!(app.at.active, "候选：{:?}", app.at_candidates());
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(matches!(action, UiAction::None));
+        assert_eq!(app.input.buffer, "@README.md ");
+    }
+
+    #[test]
+    fn at_completion_esc_closes_and_keeps_text() {
+        let dir = temp_proj();
+        let mut app = at_app(&dir);
+        type_str(&mut app, "@app");
+        let _ = handle_key(&mut app, key(KeyCode::Esc));
+        assert!(!app.at.active);
+        assert_eq!(app.input.buffer, "@app", "关闭菜单不该改输入");
+    }
+
+    #[test]
+    fn at_completion_arrow_keys_move_selection() {
+        let dir = temp_proj();
+        let mut app = at_app(&dir);
+        type_str(&mut app, "@src/");
+        assert_eq!(app.at_candidates().len(), 2, "{:?}", app.at_candidates());
+        assert_eq!(app.at.sel, 0);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.at.sel, 1);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.at.sel, 1, "到底不越界");
+    }
+
+    #[test]
+    fn at_completion_menu_renders_above_input() {
+        let dir = temp_proj();
+        let mut app = at_app(&dir);
+        type_str(&mut app, "@app");
+        let out = render_to_string(&app, 100, 30);
+        let s = squash(&out);
+        assert!(s.contains("文件1"), "应显示候选数量：\n{out}");
+        assert!(s.contains("src/app.rs"), "应列出路径：\n{out}");
+        assert!(s.contains("Tab补全"), "应提示怎么补全：\n{out}");
+    }
+
+    #[test]
+    fn at_completion_click_inserts_clicked_path() {
+        let dir = temp_proj();
+        let mut app = at_app(&dir);
+        type_str(&mut app, "@");
+        let area = Rect::new(0, 0, 100, 30);
+        let input = layout_chunks(area, app.footer_visible)[2];
+        let cands = app.at_candidates();
+        // 空查询下按「短者在前」排序：README.md / src/app.rs / src/render.rs
+        assert_eq!(cands, vec!["README.md", "src/app.rs", "src/render.rs"]);
+        let (_, inner) = at_menu_rect(input, &cands);
+        // 点第二行
+        let m = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            inner.x + 2,
+            inner.y + 1,
+        );
+        assert!(handle_mouse(&mut app, m, area).is_none());
+        assert_eq!(app.input.buffer, "@src/app.rs ");
+        assert!(!app.at.active);
+    }
+
+    /// 文件路径很长时浮层不能超出屏幕宽度。
+    #[test]
+    fn at_menu_rect_never_exceeds_input_width() {
+        let input = Rect::new(0, 27, 40, 5);
+        let long = "a/very/long/path/that/keeps/going/and/going/file.rs";
+        let cands = vec![long];
+        let (popup, _inner) = at_menu_rect(input, &cands);
+        assert!(popup.width <= input.width, "{popup:?} vs {input:?}");
+        assert!(popup.height <= input.y, "菜单不能盖住 header 以上");
     }
 
     // ---- 审批弹层按键 ----
