@@ -165,19 +165,19 @@ async fn dispatch(
     action: UiAction,
     cmd_tx: &mpsc::Sender<Command>,
 ) -> anyhow::Result<bool> {
-    match action {
+    let quit = match action {
         UiAction::Quit => {
             let _ = cmd_tx.send(Command::Quit).await;
-            Ok(true)
+            true
         }
-        UiAction::Submit(text) => {
-            let mut spec = agent_core::task::TaskSpec::new(text.clone(), String::new());
-            spec.title = text.chars().take(24).collect();
-            // 工作区由编排层填入；这里发送带 prompt 的任务。
+        // 任务规格由 `App::submit` 造好：权限档位、续跑目标都在里面。
+        // 这里**不要**重新 `TaskSpec::new`——上一次重构漏了这个，导致界面切档
+        // 与「接着说」的上下文都白设了。
+        UiAction::Submit(spec) => {
             if cmd_tx.send(Command::SubmitTask(spec)).await.is_err() {
                 app.backend_disconnected();
             }
-            Ok(false)
+            false
         }
         UiAction::Cancel => {
             if let Some(c) = app.cancel_command() {
@@ -185,7 +185,7 @@ async fn dispatch(
                     app.backend_disconnected();
                 }
             }
-            Ok(false)
+            false
         }
         UiAction::Approve { remember } => {
             if let Some(c) = app.take_approval(true, remember) {
@@ -193,7 +193,7 @@ async fn dispatch(
                     app.backend_disconnected();
                 }
             }
-            Ok(false)
+            false
         }
         UiAction::Reject => {
             if let Some(c) = app.take_approval(false, false) {
@@ -201,10 +201,24 @@ async fn dispatch(
                     app.backend_disconnected();
                 }
             }
-            Ok(false)
+            false
         }
-        UiAction::None => Ok(false),
+        UiAction::Command(cmd) => {
+            if cmd_tx.send(cmd).await.is_err() {
+                app.backend_disconnected();
+            }
+            false
+        }
+        UiAction::None => false,
+    };
+    // 统一出口：`/tasks`、`/resume`、Ctrl+G 请求列表这类动作由 UI 先攒在
+    // `pending_command` 里（UI 够不着 store），这里一并送出去。
+    if let Some(cmd) = app.take_pending_command() {
+        if cmd_tx.send(cmd).await.is_err() {
+            app.backend_disconnected();
+        }
     }
+    Ok(quit)
 }
 
 /// 是否应处理该按键事件。
@@ -230,6 +244,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
     // 弹层优先：审批期间其它鼠标交互一律吞掉，避免误触背后的界面。
     if app.pending.is_some() {
         return handle_approval_mouse(m, area);
+    }
+    // 任务面板同样是模态的：点某一行即切过去，点面板外关闭。
+    if app.panel_open {
+        return handle_panel_mouse(app, m, area);
     }
 
     let chunks = layout_chunks(area, app.footer_visible);
@@ -288,6 +306,50 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
         _ => {}
     }
     None
+}
+
+/// 任务面板期间的鼠标：点某一行即切过去，点面板外关闭。
+///
+/// 面板是模态的——期间不把点击漏给背后的对话区/滚动条，避免「关面板时
+/// 顺手把对话滚没了」。
+fn handle_panel_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
+    if !matches!(m.kind, MouseEventKind::Down(button) if button == MouseButton::Left) {
+        return None;
+    }
+    let (outer, inner) = panel_rect(area, app.tasks.len());
+    if !point_in(outer, m.row, m.column) {
+        app.close_panel();
+        return None;
+    }
+    if point_in(inner, m.row, m.column) {
+        let idx = panel_offset(app, inner) + (m.row - inner.y) as usize;
+        if idx < app.tasks.len() {
+            app.panel_sel = idx;
+            return app.panel_activate().map(UiAction::Command);
+        }
+    }
+    None
+}
+
+/// 面板列表的滚动起点：让高亮行始终可见（到末尾时整段上移）。
+fn panel_offset(app: &App, inner: Rect) -> usize {
+    app.panel_sel
+        .saturating_sub(inner.height.saturating_sub(1) as usize)
+}
+
+/// 任务面板的外框与列表区（渲染与鼠标命中**共用**，坐标不会走散）。
+fn panel_rect(area: Rect, count: usize) -> (Rect, Rect) {
+    let w = area.width.saturating_sub(6).clamp(28, 78).min(area.width);
+    let rows = (count.max(1) as u16).min(12);
+    let h = (rows + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3)
+        .min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let outer = Rect::new(x, y, w, h);
+    let inner = Rect::new(x + 1, y + 1, w.saturating_sub(2), h.saturating_sub(2));
+    (outer, inner)
 }
 
 /// 点击补全菜单候选：命中则执行命令并返回 true；未命中返回 false。
@@ -468,6 +530,39 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
         };
     }
 
+    // 任务面板：打开时独占键盘（↑/↓ 选、Enter 切换、Esc 或 Ctrl+G 关）。
+    // 放在补全菜单之前——面板是模态的，期间不该让 `/` 补全抢按键。
+    if app.panel_open {
+        return match key.code {
+            KeyCode::Esc => {
+                app.close_panel();
+                UiAction::None
+            }
+            KeyCode::Up => {
+                app.panel_move(-1);
+                UiAction::None
+            }
+            KeyCode::Down => {
+                app.panel_move(1);
+                UiAction::None
+            }
+            KeyCode::Enter => match app.panel_activate() {
+                Some(cmd) => UiAction::Command(cmd),
+                None => UiAction::None,
+            },
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.close_panel();
+                UiAction::None
+            }
+            _ => UiAction::None,
+        };
+    }
+    // Ctrl+G：打开任务面板（顺带向编排层要一份最新列表）。
+    if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.toggle_panel();
+        return UiAction::None;
+    }
+
     // `/` 命令补全：菜单激活时，方向键选候选、Tab 补全、Enter 执行、Esc 关闭。
     let cands = app.slash_candidates();
     if app.completion_active && !cands.is_empty() {
@@ -531,10 +626,19 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
             UiAction::None
         }
         (KeyCode::Enter, _) => {
-            // 提交
+            // 带参数的 `/` 命令（`/resume <id>`、`/news <主题>`）在补全菜单里
+            // 匹配不到（前缀对不上），得在这里拦一道——否则会被当成普通任务
+            // 原样发给模型。
+            if app.is_slash_command() {
+                let cmd = app.input.buffer.trim_start().to_string();
+                app.run_slash_command(&cmd);
+                return UiAction::None;
+            }
+            // 提交：`App::submit` 负责记历史、落用户行，并把权限档位与续跑目标
+            // 一起写进 `TaskSpec`。
             match app.submit() {
-                Some(Command::SubmitTask(spec)) => UiAction::Submit(spec.prompt),
-                _ => UiAction::None,
+                Some(spec) => UiAction::Submit(spec),
+                None => UiAction::None,
             }
         }
         (KeyCode::Backspace, _) => {
@@ -637,6 +741,10 @@ fn draw(f: &mut Frame, app: &App) {
         draw_footer(f, chunks[3]);
     }
 
+    if app.panel_open {
+        draw_task_panel(f, app, area);
+    }
+
     if let Some(p) = &app.pending {
         draw_approval(f, app, p, area);
     }
@@ -683,7 +791,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 /// 底部快捷键提示条（灰字，溢出时由 ratatui 自动裁剪）。
 fn draw_footer(f: &mut Frame, area: Rect) {
-    let text = " ⏎ 发送  ^⏎ 换行  Esc 中断  PgUp/Dn 滚动  Ctrl+C 退出 ";
+    let text = " ⏎ 发送  ^⏎ 换行  Esc 中断  ^G 任务  PgUp/Dn 滚动  Ctrl+C 退出 ";
     f.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(ink::FG_MUTED))),
         area,
@@ -1354,6 +1462,65 @@ fn draw_approval(f: &mut Frame, _app: &App, p: &crate::app::PendingApproval, are
     );
 }
 
+/// 任务面板（`Ctrl+G`）：居中卡片列出历史任务，↑/↓ 选择、Enter 切换。
+///
+/// 面板只做「挑一条」这件事——选中后由编排层回灌该任务的转写事件，
+/// 对话区随之还原成当时的样子（见 `App::apply_event` 的 `TaskOpened` 分支）。
+fn draw_task_panel(f: &mut Frame, app: &App, area: Rect) {
+    let (outer, inner) = panel_rect(area, app.tasks.len());
+    f.render_widget(Clear, outer);
+
+    let title = format!(" 任务 {} · Enter 切换 · Esc 关闭 ", app.tasks.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ink::PRIMARY))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(ink::PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(surface::DIM));
+    f.render_widget(block, outer);
+
+    if app.tasks.is_empty() {
+        let hint = RtLine::from(Span::styled(
+            " 还没有历史任务：跑完一个任务后再来看。",
+            Style::default().fg(ink::FG_MUTED),
+        ));
+        f.render_widget(Paragraph::new(hint), inner);
+        return;
+    }
+
+    let offset = panel_offset(app, inner);
+    let width = inner.width as usize;
+    let mut lines: Vec<RtLine<'static>> = Vec::new();
+    for (i, t) in app
+        .tasks
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(inner.height as usize)
+    {
+        let selected = i == app.panel_sel;
+        let text = truncate_display(
+            &crate::app::task_row(t, app.viewing.as_ref().map(|(id, _)| id)),
+            width.saturating_sub(1),
+        );
+        let style = if selected {
+            Style::default()
+                .bg(surface::SELECTED)
+                .fg(ink::PRIMARY)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(ink::FG)
+        };
+        lines.push(RtLine::from(Span::styled(format!(" {text}"), style)));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// 审批弹层中的一行「字段  值」。
 fn approval_field(key: &str, value: &str) -> RtLine<'static> {
     RtLine::from(vec![
@@ -1789,13 +1956,22 @@ mod tests {
         assert!(app.slash_candidates().is_empty(), "空输入无候选");
 
         app.input.buffer = "/".into();
-        assert_eq!(app.slash_candidates(), vec!["/clear", "/help", "/tier"]);
+        assert_eq!(
+            app.slash_candidates(),
+            vec!["/clear", "/help", "/tier", "/tasks", "/resume", "/news"]
+        );
 
         app.input.buffer = "/c".into();
         assert_eq!(app.slash_candidates(), vec!["/clear"]);
 
         app.input.buffer = "/t".into();
-        assert_eq!(app.slash_candidates(), vec!["/tier"]);
+        assert_eq!(app.slash_candidates(), vec!["/tier", "/tasks"]);
+
+        app.input.buffer = "/r".into();
+        assert_eq!(app.slash_candidates(), vec!["/resume"]);
+
+        app.input.buffer = "/n".into();
+        assert_eq!(app.slash_candidates(), vec!["/news"]);
 
         app.input.buffer = "abc".into();
         assert!(app.slash_candidates().is_empty(), "非 / 开头无候选");
@@ -1849,7 +2025,7 @@ mod tests {
         let mut app = App::default();
         let _ = handle_key(&mut app, key(KeyCode::Char('/')));
         assert!(app.completion_active);
-        assert_eq!(app.slash_candidates().len(), 3);
+        assert_eq!(app.slash_candidates().len(), 6);
 
         let _ = handle_key(&mut app, key(KeyCode::Char('c')));
         assert_eq!(app.slash_candidates(), vec!["/clear"]);
@@ -1871,7 +2047,7 @@ mod tests {
         let mut k = key(KeyCode::Enter);
         k.modifiers = KeyModifiers::CONTROL;
         let action = handle_key(&mut app, k);
-        assert_eq!(action, UiAction::None, "换行不应提交任务");
+        assert!(matches!(action, UiAction::None), "换行不应提交任务");
         assert_eq!(app.input.buffer, "ab\n");
         assert_eq!(app.lines.len(), lines_before, "不应产生用户消息");
 
@@ -1921,9 +2097,15 @@ mod tests {
         let _ = handle_key(&mut app, key(KeyCode::Down));
         assert_eq!(app.completion_sel, 2);
         let _ = handle_key(&mut app, key(KeyCode::Down));
-        assert_eq!(app.completion_sel, 2, "到底后 clamp");
+        assert_eq!(app.completion_sel, 3);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 4);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 5);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 5, "到底后 clamp");
         let _ = handle_key(&mut app, key(KeyCode::Up));
-        assert_eq!(app.completion_sel, 1);
+        assert_eq!(app.completion_sel, 4);
 
         let _ = handle_key(&mut app, key(KeyCode::Esc));
         assert!(!app.completion_active, "Esc 关闭补全");
@@ -2622,6 +2804,144 @@ mod tests {
             squash(&out).contains("权限档位L2"),
             "右上角应显示 Toast:\n{out}"
         );
+    }
+
+    // ---- 任务面板（Ctrl+G）----
+
+    fn sample_task(
+        id: &str,
+        title: &str,
+        state: agent_core::task::TaskState,
+    ) -> agent_core::store::TaskSummary {
+        agent_core::store::TaskSummary {
+            id: agent_core::ids::TaskId::from_raw(id),
+            title: title.into(),
+            state,
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        }
+    }
+
+    fn panel_app() -> App {
+        let mut app = App::default();
+        app.tasks = vec![
+            sample_task(
+                "1111aaaa-0000",
+                "写个统计脚本",
+                agent_core::task::TaskState::Done,
+            ),
+            sample_task(
+                "2222bbbb-0000",
+                "收集新闻",
+                agent_core::task::TaskState::Failed,
+            ),
+        ];
+        app
+    }
+
+    #[test]
+    fn ctrl_g_opens_panel_and_requests_list() {
+        let mut app = App::default();
+        let _ = handle_key(&mut app, ctrl('g'));
+        assert!(app.panel_open, "Ctrl+G 应打开面板");
+        assert!(
+            matches!(app.take_pending_command(), Some(Command::ListTasks)),
+            "打开面板要向编排层要列表"
+        );
+        let _ = handle_key(&mut app, ctrl('g'));
+        assert!(!app.panel_open, "再按一次关闭");
+    }
+
+    #[test]
+    fn panel_keys_move_and_switch_task() {
+        let mut app = panel_app();
+        app.panel_open = true;
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.panel_sel, 1);
+        match handle_key(&mut app, key(KeyCode::Enter)) {
+            UiAction::Command(Command::ResumeTask(id)) => {
+                assert_eq!(id, "2222bbbb-0000", "Enter 切到高亮那条");
+            }
+            other => panic!("应返回切换命令，实际 {other:?}"),
+        }
+        assert!(!app.panel_open);
+
+        let mut app = panel_app();
+        app.panel_open = true;
+        let _ = handle_key(&mut app, key(KeyCode::Esc));
+        assert!(!app.panel_open, "Esc 关闭面板");
+        assert!(app.input.buffer.is_empty());
+    }
+
+    #[test]
+    fn panel_swallows_typing() {
+        // 面板是模态的：误触字母不该落进输入框（否则关掉面板后会「冒出」半句话）。
+        let mut app = panel_app();
+        app.panel_open = true;
+        let _ = handle_key(&mut app, key(KeyCode::Char('x')));
+        assert!(app.input.buffer.is_empty(), "面板期间不接收正文输入");
+    }
+
+    #[test]
+    fn panel_renders_task_rows_and_highlight() {
+        let mut app = panel_app();
+        app.panel_open = true;
+        let out = render_to_string(&app, 100, 30);
+        let s = squash(&out);
+        assert!(s.contains("任务2"), "标题应带任务数:\n{out}");
+        assert!(s.contains("写个统计脚本"), "应列出任务标题:\n{out}");
+        assert!(s.contains("收集新闻"));
+        assert!(s.contains("Enter切换"), "应提示怎么操作:\n{out}");
+        assert!(s.contains("1111aaaa"), "应带 id 前 8 位:\n{out}");
+    }
+
+    #[test]
+    fn panel_click_switches_to_clicked_row() {
+        let mut app = panel_app();
+        app.panel_open = true;
+        let area = Rect::new(0, 0, 100, 30);
+        let (_, inner) = panel_rect(area, app.tasks.len());
+        // 点第二行（索引 1）
+        let m = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            inner.x + 2,
+            inner.y + 1,
+        );
+        match handle_mouse(&mut app, m, area) {
+            Some(UiAction::Command(Command::ResumeTask(id))) => {
+                assert_eq!(id, "2222bbbb-0000");
+            }
+            other => panic!("点第二行应切到第二条，实际 {other:?}"),
+        }
+        assert!(!app.panel_open);
+    }
+
+    #[test]
+    fn panel_click_outside_closes_without_rapid_switching() {
+        let mut app = panel_app();
+        app.panel_open = true;
+        let area = Rect::new(0, 0, 100, 30);
+        let m = mouse(MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert!(handle_mouse(&mut app, m, area).is_none());
+        assert!(
+            !app.panel_open,
+            "点面板外应关闭，而不是把点击漏给背后的界面"
+        );
+    }
+
+    #[test]
+    fn enter_on_news_command_does_not_submit_task() {
+        // 回归：`/news x` 带参数时补全前缀对不上，回车曾被当成普通任务原样提交。
+        let mut app = App::default();
+        app.input.buffer = "/news Rust".into();
+        app.refresh_completion();
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            matches!(action, UiAction::None),
+            "带参数的 / 命令不该被当作任务提交"
+        );
+        assert!(app.input.buffer.contains("web_search"), "应填入模板");
+        assert!(!app.lines.iter().any(|l| matches!(l, Line::User(_))));
     }
 
     // ---- 审批弹层按键 ----

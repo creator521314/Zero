@@ -70,7 +70,8 @@ fork bomb、`curl | sh`、写 `/etc`、`~/.ssh` 等。
 | `Ctrl+L` | 整屏重绘（屏幕被外部改动弄花时救回） |
 | `PageUp` / `PageDown` / 鼠标滚轮 | 对话区滚动 |
 | `Ctrl+A` / `Home`、`Ctrl+E` / `End` | 光标行首 / 行尾 |
-| `/` | 触发命令补全（`/clear` 清空对话、`/help` 帮助、`/tier` 切档） |
+| `/` | 触发命令补全（`/clear` `/help` `/tier` `/tasks` `/resume` `/news`） |
+| `Ctrl+G` | 任务面板：`↑/↓` 选、`Enter` 切到该任务、`Esc` 关闭 |
 | `Tab` / `↑` `↓` / `Esc` | 补全菜单：补全选中 / 选候选 / 关闭 |
 | `Ctrl+C` | 退出（审批弹层期间也可退出） |
 | 点击 header 档位徽章 | 循环切换权限档 L1 → L2 → L3 |
@@ -78,6 +79,24 @@ fork bomb、`curl | sh`、写 `/etc`、`~/.ssh` 等。
 审批弹层：`y` 或 `Enter` 批准本次；`a` 批准本任务同类操作；`n` 或 `Esc` 拒绝；
 `Ctrl+C` 退出。弹层按钮与补全候选也支持鼠标点击。档位切换（`/tier` 或点徽章）
 只影响**之后**提交的任务。
+
+### 多轮对话、历史任务与续跑
+
+- **对话是连续的**：同一个话题里连续追问，沿用同一任务 id，并把上一轮的上下文
+  （最后一次 `context_snapshot` + 快照之后的答复）带给模型——模型记得刚才做过什么。
+  `/clear` 才是「开新话题」。
+- **`/tasks`**：把历史任务打在对话区（`id 前 8 位 · 状态 · 最近更新 · 标题`）。
+- **`Ctrl+G`**：同一份数据的面板版，选中即切过去，对话区还原成当时的样子；
+  之后输入的话会接着那条任务跑。
+- **`/resume <id前几位>`**：面板的命令版，支持唯一前缀（前缀有歧义会报「匹配到 N 个」）。
+- 历史任务列表来自 `agent.root/tasks/<id>.json`，由执行循环在开始与收尾时更新。
+
+### `/news`：新闻收集模板
+
+`/news <主题>`（如 `/news Rust`）把 `templates/news.md` 渲染进输入框——**不自动发送**，
+先看一眼、改一改再回车。模板要求模型「先搜再抓、每条带标题/日期/链接、不许拼 URL、
+交付到 `artifacts/news-<slug>.md` 并登记」；`templates/news.md` 优先于内置副本，
+改完重启即生效。
 
 ## 配置
 
@@ -249,6 +268,10 @@ TUI 只发送差分（ratatui 的机制），物理屏幕一旦被外部改动�
 cargo test           # 全量测试
 cargo xtask check    # fmt + clippy + test 一站式检查
 cargo xtask smoke    # 工具端到端冒烟：真实跑一遍 8 个工具
+
+# 真实模型用例（--ignored，需要配置 provider，会花少量 token）
+cargo test -p agent-cli --test resume_live -- --ignored --nocapture   # 续跑：模型记得上一轮
+cargo test -p agent-providers --test review_live -- --ignored --nocapture  # L2 审视判定
 ```
 
 ### 工具冒烟
@@ -275,7 +298,7 @@ cargo xtask smoke    # 工具端到端冒烟：真实跑一遍 8 个工具
 
 | 阶段 | 内容 |
 |---|---|
-| **一期（当前）** | 单机通用 Agent：Rust + TUI + 多模型 + 三档权限 |
+| **一期（✅ 已完成，M4 收尾 2026-10-24）** | 单机通用 Agent：Rust + TUI + 多模型 + 三档权限；三类真实任务（写程序 / 写脚本 / 收集新闻）均跑通 = MVP 达成 |
 | 二期 | 跨设备同步：手机权威节点、四级频率分级同步、AI 辅助合并 + 回滚、设备注册中心 |
 | 三期 | 手机端 App、单片机哑终端接入 |
 

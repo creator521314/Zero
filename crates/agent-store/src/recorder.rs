@@ -43,6 +43,10 @@ pub fn classify(ev: &Event, cfg: &LogConfig) -> Option<(TaskId, Durability)> {
                 None
             }
         }
+
+        // 纯界面事件（`/tasks` 列表、切历史任务）：不是任务事实，不进真相源。
+        // 它们由编排层按需从 store 重算，落盘只会在日志里堆一堆可再生的副本。
+        Event::TaskList { .. } | Event::TaskOpened { .. } => None,
     }
 }
 

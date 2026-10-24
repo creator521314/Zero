@@ -20,7 +20,7 @@ use agent_core::provider::{
     ChatRequest, ContentPart, LlmProvider, Message, RequestMeta, Role, StreamEvent, ToolCall, Usage,
 };
 use agent_core::store::LogConfig;
-use agent_core::task::{AgentRunner, RunControl, TaskSpec};
+use agent_core::task::{AgentRunner, RunControl, TaskSpec, TaskState};
 use agent_core::tool::{Tool, ToolCtx};
 use agent_store::JsonlStore;
 use async_trait::async_trait;
@@ -226,6 +226,42 @@ struct ToolExecuted {
 impl AgentRunner for AgentRuntime {
     async fn run(
         &self,
+        task: TaskSpec,
+        bus: EventBus,
+        ctl: RunControl,
+    ) -> Result<Outcome, AgentError> {
+        // 任务摘要先登记为 Running：`/tasks`、任务面板都只认这一份数据。
+        // 收尾再落终态——中途 panic / 断电也留下「跑过但没跑完」的痕迹。
+        self.mark_task(&task, TaskState::Running).await;
+        let outcome = self.run_inner(task.clone(), bus, ctl).await;
+        let state = match &outcome {
+            Ok(Outcome::Success { .. }) => TaskState::Done,
+            Ok(Outcome::Failed { .. }) => TaskState::Failed,
+            Ok(Outcome::Cancelled) => TaskState::Cancelled,
+            Ok(Outcome::Paused) => TaskState::Paused,
+            Err(_) => TaskState::Failed,
+        };
+        self.mark_task(&task, state).await;
+        outcome
+    }
+}
+
+impl AgentRuntime {
+    /// 记录任务状态（失败只记日志：摘要写不进去不该让任务本身失败）。
+    async fn mark_task(&self, task: &TaskSpec, state: TaskState) {
+        if let Err(e) = self
+            .deps
+            .store
+            .touch_task(&task.id, &task.title, state)
+            .await
+        {
+            tracing::warn!(task = %task.id.0, error = %e, "task summary write failed");
+        }
+    }
+
+    /// 执行循环本体；状态登记与终态收尾在 [`AgentRunner::run`] 里做。
+    async fn run_inner(
+        &self,
         mut task: TaskSpec,
         bus: EventBus,
         ctl: RunControl,
@@ -249,10 +285,17 @@ impl AgentRunner for AgentRuntime {
         // 而不是从零开始——否则「恢复」只是把老对话留在日志里，模型什么都没记住。
         match task.resume_messages.take() {
             Some(history) if !history.is_empty() => {
+                let turns = history.len();
                 for m in history {
                     cm.push(m);
                 }
-                tracing::info!(task = %task_id.0, turns = cm.messages().len(), "resumed from snapshot");
+                // 恢复的上下文只到「上一次请求之前 + 上轮答复」为止；用户这次
+                // 新发的指令必须补进去，否则模型拿到的是原样的问题，只会把上一轮
+                // 的答案再答一遍。
+                if !task.prompt.trim().is_empty() {
+                    cm.push(Message::user(&task.prompt));
+                }
+                tracing::info!(task = %task_id.0, turns, "resumed from snapshot");
             }
             _ => cm.push(Message::user(&task.prompt)),
         }
@@ -621,9 +664,7 @@ impl AgentRunner for AgentRuntime {
         });
         Err(err)
     }
-}
 
-impl AgentRuntime {
     fn tool_risk(&self, name: &str) -> agent_core::perm::Risk {
         (self.deps.tools)(name)
             .map(|t| t.risk_level())
@@ -1693,6 +1734,124 @@ mod tests {
         assert_eq!(costs.len(), 1, "每轮应上报一次成本，实际 {costs:?}");
         assert!(costs[0] > 0.0, "usage 非零时成本应 > 0，实际 {costs:?}");
         drop(ap_tx);
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // ---- M4：任务摘要（`/tasks` 的数据源）与续跑 ----
+
+    #[tokio::test]
+    async fn task_summary_is_recorded_on_start_and_finish() {
+        // 回归：`tasks/<id>.json` 曾因为没有任何生产路径调用 `upsert_task`
+        // 而永远是空的——`/tasks` 打开就是一片空白。
+        let (runtime, store, tmp) = make_runtime(
+            vec![vec![StreamEvent::Done(
+                agent_core::provider::FinishReason::Stop,
+            )]],
+            LogConfig::default(),
+        );
+        let mut spec = TaskSpec::new("写个统计脚本", tmp.join("workspace").display().to_string());
+        let id = spec.id.clone();
+        spec.max_iterations = 2;
+
+        runtime
+            .run(spec, event_bus(), RunControl::new())
+            .await
+            .unwrap();
+
+        let summary = store.task_summary(&id).await.expect("任务摘要必须落盘");
+        assert_eq!(summary.title, "写个统计脚本");
+        assert_eq!(
+            summary.state,
+            TaskState::Done,
+            "跑完应落终态，而不是一直挂在 Running"
+        );
+        let listed = store.recent_tasks(10).await;
+        assert_eq!(listed.len(), 1, "列表要能查到这条任务");
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// 记录每次请求发给模型的消息，用于断言「续跑到底带了什么」。
+    struct RecordingProvider {
+        seen: Mutex<Vec<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingProvider {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
+            Err(LlmError::InvalidRequest("tests use chat_stream".into()))
+        }
+        async fn chat_stream(
+            &self,
+            req: ChatRequest,
+        ) -> Result<BoxStream<Result<StreamEvent, LlmError>>, LlmError> {
+            self.seen.lock().await.push(req.messages.clone());
+            Ok(Box::pin(stream::iter(vec![Ok(StreamEvent::Done(
+                agent_core::provider::FinishReason::Stop,
+            ))])))
+        }
+        fn price(&self, _model: &str) -> Option<ModelPrice> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_sends_history_and_then_the_new_instruction() {
+        let tmp = std::env::temp_dir().join(format!("agent-rt-resume-{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("workspace");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+        let provider = Arc::new(RecordingProvider {
+            seen: Mutex::new(Vec::new()),
+        });
+        let (_ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(1);
+
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: provider.clone(),
+            provider_name: "recording".into(),
+            tools: Arc::new(|_| None),
+            tool_defs: vec![],
+            perm: Arc::new(AllowAll),
+            store: store.clone(),
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(Mutex::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            per_task_budget: 0.0,
+            cost_sink: None,
+        });
+
+        let mut spec = TaskSpec::new("再把结果写进 README", ws.display().to_string());
+        spec.resume_messages = Some(vec![
+            Message::system("旧的 system"),
+            Message::user("统计文件数"),
+            Message::assistant("共 3 个文件。"),
+        ]);
+        spec.max_iterations = 2;
+        runtime
+            .run(spec, event_bus(), RunControl::new())
+            .await
+            .unwrap();
+
+        let seen = provider.seen.lock().await;
+        let text: Vec<String> = seen[0].iter().map(|m| m.text()).collect();
+        assert!(
+            text.iter().any(|t| t == "统计文件数"),
+            "历史消息必须带上，否则「恢复」等于新开一个任务：{text:?}"
+        );
+        assert!(
+            text.iter().any(|t| t == "共 3 个文件。"),
+            "快照之后的答复也要带上（模型得记得自己刚说过什么）：{text:?}"
+        );
+        assert_eq!(
+            text.last().map(String::as_str),
+            Some("再把结果写进 README"),
+            "新的指令必须补在最后——只接历史而不接新指令，模型会把上一轮再答一遍：{text:?}"
+        );
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }

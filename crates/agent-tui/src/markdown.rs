@@ -17,9 +17,10 @@
 //! | 分隔线 | 32 列细线（**不**铺满，铺满的分隔线留给「任务完成」） |
 //! | 链接 | 文字加下划线，URL 与文字不同时附后 |
 //!
-//! 表格与 HTML **不渲染**：表格要算列宽，窄屏一定挤坏；HTML 事件直接丢弃
-//! （终端不是浏览器，渲染 HTML 既没意义也不安全）。pulldown-cmark 会把表格
-//! 当成普通段落文本交出来，所以**内容不丢**，只是保留源码形态。
+//! 表格按**终端能做到的方式**渲染：宽度够就对齐成列（表头加粗 + 一条细分隔线），
+//! 不够就降级成「列名: 值」的逐条记录——窄屏下强行对齐必然挤成一团，
+//! 那还不如竖排好读。HTML 事件直接丢弃（终端不是浏览器，渲染它既没意义也不安全），
+//! 公式按字面文本输出：共同点是**内容不丢**。
 //!
 //! **流式友好**：LLM 是逐字吐的，片段常常是残缺的 Markdown——`**加粗` 没闭合、
 //! ```` ``` ```` 围栏只写了一半。pulldown-cmark 对未闭合围栏会照代码块内容收，
@@ -74,7 +75,23 @@ struct Renderer {
     link_url: Option<String>,
     /// 当前链接已收集到的文字（用来判断「链接文字是否就是 URL」）。
     link_text: String,
+    /// 正在累积的表格（`None` = 不在表格里）。
+    table: Option<TableBuild>,
     started: bool,
+}
+
+/// 一张正在收集的表格。
+///
+/// pulldown-cmark 把单元格拆成 `TableCell` 事件，表头**不包**在 `TableRow` 里，
+/// 所以表头单独收，行结束才落盘。
+#[derive(Default)]
+struct TableBuild {
+    header: Vec<String>,
+    rows: Vec<Vec<String>>,
+    row: Vec<String>,
+    cell: String,
+    in_head: bool,
+    in_cell: bool,
 }
 
 impl Renderer {
@@ -94,12 +111,14 @@ impl Renderer {
             ordered_stack: Vec::new(),
             link_url: None,
             link_text: String::new(),
+            table: None,
             started: false,
         }
     }
 
     fn run(mut self, src: &str) -> Vec<RtLine<'static>> {
-        let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+        let opts =
+            Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES;
         for ev in Parser::new_ext(src, opts) {
             match ev {
                 Event::Start(tag) => self.start(tag),
@@ -210,6 +229,13 @@ impl Renderer {
         if content.is_empty() {
             return;
         }
+        // 单元格里的文字先攒着：表格要等整张表收完才能算列宽。
+        if let Some(t) = &mut self.table {
+            if t.in_cell {
+                t.cell.push_str(content);
+                return;
+            }
+        }
         // 代码块的内容是**单个含换行的 Text 事件**——pulldown-cmark 不为它发
         // SoftBreak。直接整段塞进一个 span 会被 ratatui 当成同一行的单元格，
         // 代码三行就粘成一行了。所以这里自己按 \n 切。
@@ -300,6 +326,30 @@ impl Renderer {
                 }
             }
             Tag::Image { .. } => {}
+            Tag::Table(_) => {
+                self.flush_row();
+                if self.started {
+                    self.out.push(RtLine::from(""));
+                }
+                self.table = Some(TableBuild::default());
+            }
+            Tag::TableHead => {
+                if let Some(t) = &mut self.table {
+                    t.in_head = true;
+                    t.row.clear();
+                }
+            }
+            Tag::TableRow => {
+                if let Some(t) = &mut self.table {
+                    t.row.clear();
+                }
+            }
+            Tag::TableCell => {
+                if let Some(t) = &mut self.table {
+                    t.cell.clear();
+                    t.in_cell = true;
+                }
+            }
             _ => {}
         }
     }
@@ -338,7 +388,127 @@ impl Renderer {
                 }
             }
             TagEnd::Image => {}
+            TagEnd::TableCell => {
+                if let Some(t) = &mut self.table {
+                    t.in_cell = false;
+                    let cell = std::mem::take(&mut t.cell);
+                    t.row.push(cell.trim().to_string());
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(t) = &mut self.table {
+                    t.in_head = false;
+                    // 表头行不包在 TableRow 里，这里直接收。
+                    if !t.row.is_empty() {
+                        t.header = std::mem::take(&mut t.row);
+                    }
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(t) = &mut self.table {
+                    let row = std::mem::take(&mut t.row);
+                    if t.in_head {
+                        t.header = row;
+                    } else if !row.is_empty() {
+                        t.rows.push(row);
+                    }
+                }
+            }
+            TagEnd::Table => {
+                if let Some(t) = self.table.take() {
+                    self.render_table(t);
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// 渲染一张表格：够宽就对齐成列，不够宽就降级成「列名: 值」的逐条记录。
+    ///
+    /// 判据看**最长一行**（各列最大宽度之和 + 分隔符），而不是平均宽度——
+    /// 只要有一格特别长，对齐后整体就必然越界。
+    fn render_table(&mut self, t: TableBuild) {
+        let cols = t
+            .rows
+            .iter()
+            .map(|r| r.len())
+            .chain(std::iter::once(t.header.len()))
+            .max()
+            .unwrap_or(0);
+        if cols == 0 {
+            return;
+        }
+
+        // 每列取「表头 + 所有行」的最大显示宽度。
+        let mut widths = vec![0usize; cols];
+        for (i, cell) in t.header.iter().enumerate() {
+            widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+        }
+        for row in &t.rows {
+            for (i, cell) in row.iter().enumerate() {
+                widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+            }
+        }
+        // 每列之间「 │ 」占 3 列；容器缩进 2 列。
+        let total: usize = widths.iter().sum::<usize>() + 3 * (cols - 1);
+        let fits = self.width > 0 && total + 2 <= self.width;
+
+        if fits {
+            let join = |cells: &[String], style: Style| -> Vec<Span<'static>> {
+                let mut spans = Vec::new();
+                for (i, w) in widths.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::styled(" │ ", Style::default().fg(surface::LINE)));
+                    }
+                    let cell = cells.get(i).map(String::as_str).unwrap_or("");
+                    let pad = w.saturating_sub(UnicodeWidthStr::width(cell));
+                    spans.push(Span::styled(format!("{cell}{}", " ".repeat(pad)), style));
+                }
+                spans
+            };
+
+            if !t.header.is_empty() {
+                self.line = join(
+                    &t.header,
+                    Style::default()
+                        .fg(ink::PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                );
+                self.started = true;
+                self.flush_row();
+                let rule: String = "─".repeat(total);
+                self.line = vec![Span::styled(rule, Style::default().fg(surface::LINE))];
+                self.flush_row();
+            }
+            for row in &t.rows {
+                self.line = join(row, Style::default().fg(BODY_FG));
+                self.flush_row();
+            }
+            return;
+        }
+
+        // 窄屏：一条记录一个缩进块，列名当标签。不做列宽计算，永远不会挤坏。
+        for (ri, row) in t.rows.iter().enumerate() {
+            if ri > 0 {
+                self.out.push(RtLine::from(""));
+            }
+            for (ci, cell) in row.iter().enumerate() {
+                let label = t.header.get(ci).map(String::as_str).unwrap_or("");
+                let (lead, value_style) = if ci == 0 {
+                    (
+                        format!("{} ", glyph::BULLET),
+                        Style::default().fg(BODY_FG).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    (format!("  {label}: "), Style::default().fg(BODY_FG))
+                };
+                // 走 bullet 机制而不是把标签拼进内容：折行后要悬挂对齐，
+                // 否则续行会顶到最左边（见 `flush_row` 的续行处理）。
+                self.bullet = vec![Span::styled(lead, Style::default().fg(ink::FG_MUTED))];
+                self.line = vec![Span::styled(cell.clone(), value_style)];
+                self.started = true;
+                self.flush_row();
+            }
         }
     }
 }
@@ -594,13 +764,64 @@ mod tests {
 
     #[test]
     fn table_degrades_to_plain_text_without_losing_content() {
-        // 表格不在终端的能力范围内：降级为原样文本，内容不丢
+        // 终端里表格只能「对齐」或「竖排」；两种情况都不能丢内容。
         let rows = parse("| 名称 | 说明 |\n|---|---|\n| a | b |\n", 40);
         let s = text(&rows);
         assert!(
             s.contains("名称") && s.contains("说明") && s.contains("b"),
             "{s:?}"
         );
+    }
+
+    /// 宽度够时渲染成对齐的列：表头 + 一条分隔线 + 数据行。
+    #[test]
+    fn wide_table_renders_aligned_columns() {
+        let src = "| 文件 | 行数 |\n|---|---|\n| main.rs | 12 |\n| lib.rs | 340 |\n";
+        let rows = parse(src, 60);
+        let s = text(&rows);
+        assert!(s.contains("文件"), "{s:?}");
+        // 列分隔符是 │，不是源码里的 |
+        assert!(s.contains("│"), "应对齐成列：{s:?}");
+        assert!(!s.contains("|---|"), "不该把源码分隔行印出来：{s:?}");
+        // 同一列的数在一条竖线上：两行的 │ 列位置相同
+        let bar_col = |line: &str| line.find('│');
+        let data: Vec<&str> = s
+            .lines()
+            .filter(|l| l.contains("main.rs") || l.contains("lib.rs"))
+            .collect();
+        assert_eq!(data.len(), 2, "{s:?}");
+        assert_eq!(bar_col(data[0]), bar_col(data[1]), "列要对齐：{s:?}");
+    }
+
+    /// 窄屏下不硬对齐（一定挤坏），改成「列名: 值」的竖排记录，且每行不超宽。
+    #[test]
+    fn narrow_table_falls_back_to_labelled_records() {
+        let src = "| 文件名 | 说明 | 修改时间 |\n|---|---|---|\n\
+                   | main.rs | 程序入口，负责解析参数并调度各个子命令 | 2026-10-24 |\n\
+                   | lib.rs | 公共库 | 2026-10-20 |\n";
+        let width = 24;
+        let rows = parse(src, width);
+        let s = text(&rows);
+        for needle in ["main.rs", "程序入口", "2026-10-24", "lib.rs", "公共库"] {
+            assert!(s.contains(needle), "内容不能丢（{needle}）：{s:?}");
+        }
+        assert!(s.contains("说明:"), "窄屏应降级成「列名: 值」：{s:?}");
+        for r in &rows {
+            assert!(
+                width_of(&r.spans) <= width,
+                "每行都不能超宽（{width}）：{:?}",
+                text(std::slice::from_ref(r))
+            );
+        }
+    }
+
+    #[test]
+    fn table_with_inline_code_keeps_cell_text() {
+        let src = "| 命令 | 作用 |\n|---|---|\n| `ls` | 列目录 |\n";
+        let s = text(&parse(src, 60));
+        assert!(s.contains("ls"), "{s:?}");
+        assert!(s.contains("列目录"), "{s:?}");
+        assert!(!s.contains('`'), "行内码的反引号不该显示：{s:?}");
     }
 
     #[test]

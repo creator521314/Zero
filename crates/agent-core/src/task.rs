@@ -43,6 +43,12 @@ pub struct TaskSpec {
     pub max_iterations: usize,
     /// 单任务预算上限（USD），None 使用全局配置。
     pub budget_usd: Option<f64>,
+    /// 续跑：从哪个历史任务接上（`/resume` / 任务面板切换后提交时由界面填入）。
+    ///
+    /// 编排层据此从 store 取该任务最后一次 `ContextSnapshot` 还原 `resume_messages`。
+    /// 界面只传 id、不碰消息，因为 TUI 不依赖 `agent-store`。
+    #[serde(default)]
+    pub resume_from: Option<TaskId>,
     /// 续跑时携带的历史消息（`/resume` 用）。
     ///
     /// 由 store 里该任务最后一次 `ContextSnapshot` 还原而来——那就是当时
@@ -69,6 +75,7 @@ impl TaskSpec {
             model: None,
             max_iterations: 25,
             budget_usd: None,
+            resume_from: None,
             resume_messages: None,
         }
     }

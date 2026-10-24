@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_core::event::{event_bus, Command, Event};
-use agent_core::perm::{PermissionEngine, PermissionTier};
-use agent_core::task::RunControl;
+use agent_core::perm::PermissionEngine;
+use agent_core::task::{RunControl, TaskSpec};
 use agent_core::AgentRunner;
 use agent_perm::rules::StaticRules;
 use agent_perm::{PermConfig, PermissionEngineImpl};
@@ -19,11 +19,65 @@ use agent_store::JsonlStore;
 use agent_tui::{run_tui, App};
 use tokio::sync::{mpsc, Mutex};
 
-fn parse_tier(s: &str) -> PermissionTier {
-    match s.to_ascii_uppercase().as_str() {
-        "L1" => PermissionTier::L1,
-        "L3" => PermissionTier::L3,
-        _ => PermissionTier::L2,
+/// 把「从哪个历史任务接上」落成实际上下文。
+///
+/// 界面只传 id（TUI 不依赖 store），消息由这里补：取该任务最后一份
+/// `ContextSnapshot` + 快照之后的答复。顺带把任务 id 与标题锁定为原任务——
+/// 否则每追问一句就会在面板里多出一条同名任务。
+///
+/// 返回 `Err(提示)` 表示续跑不可用（日志被清理 / 从没落过快照），调用方按新任务继续。
+async fn apply_resume(store: &JsonlStore, spec: &mut TaskSpec) -> Result<(), String> {
+    let Some(id) = spec.resume_from.clone() else {
+        return Ok(());
+    };
+    spec.id = id.clone();
+    match store.resume_context(&id).await {
+        Some(msgs) if !msgs.is_empty() => {
+            tracing::info!(task = %id.0, messages = msgs.len(), "resuming task with stored context");
+            spec.resume_messages = Some(msgs);
+            if let Some(s) = store.task_summary(&id).await {
+                spec.title = s.title;
+            }
+            Ok(())
+        }
+        _ => {
+            tracing::warn!(task = %id.0, "resume requested but no context snapshot found");
+            spec.resume_from = None;
+            Err("该任务没有可用的上下文快照，已按新任务继续。".into())
+        }
+    }
+}
+
+/// 按 id 或唯一前缀找任务（`/resume` 与任务面板共用）。
+///
+/// 规则：先精确匹配完整 id；否则按前缀匹配。0 个 / 多个都算失败——多个时
+/// 报出「匹配到几个」，让用户多打几位，而不是随便挑一个切过去。
+fn resolve_task(
+    prefix: &str,
+    tasks: &[agent_core::TaskSummary],
+) -> Result<agent_core::TaskSummary, String> {
+    let needle = prefix.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Err("用法：/resume <任务ID前几位>（用 /tasks 查看）".into());
+    }
+    if let Some(t) = tasks
+        .iter()
+        .find(|t| t.id.0.eq_ignore_ascii_case(needle.as_str()))
+    {
+        return Ok(t.clone());
+    }
+    let hits: Vec<&agent_core::TaskSummary> = tasks
+        .iter()
+        .filter(|t| t.id.0.to_ascii_lowercase().starts_with(&needle))
+        .collect();
+    match hits.len() {
+        0 => Err(format!(
+            "找不到 id 以「{prefix}」开头的任务；用 /tasks 查看历史任务"
+        )),
+        1 => Ok(hits[0].clone()),
+        n => Err(format!(
+            "前缀「{prefix}」匹配到 {n} 个任务，请多输入几位；用 /tasks 查看"
+        )),
     }
 }
 
@@ -157,7 +211,6 @@ async fn main() -> anyhow::Result<()> {
         let log_cfg2 = cfg.log.clone();
         let cfg_root = root.clone();
         let proj_root = project_root.clone();
-        let default_tier = parse_tier(&cfg.agent.default_tier);
         let max_iter = cfg.agent.max_iterations;
 
         tokio::spawn(async move {
@@ -202,6 +255,16 @@ async fn main() -> anyhow::Result<()> {
                             continue;
                         }
 
+                        // 续跑：界面只传「从哪个任务接上」，消息由编排层从 store 取。
+                        // 同一任务 id 继续追加事件，面板里仍是同一条任务，而不是
+                        // 每说一句话就多出一条「新任务」。
+                        if let Err(msg) = apply_resume(&store, &mut spec).await {
+                            let _ = bus.send(Event::Error {
+                                id: spec.id.clone(),
+                                err: agent_core::ErrorInfo::new("resume_unavailable", msg),
+                            });
+                        }
+
                         if spec.workspace.is_empty() {
                             let ws = agent_store::workspace_of(&cfg_root, &spec.id);
                             tokio::fs::create_dir_all(&ws).await.ok();
@@ -211,7 +274,9 @@ async fn main() -> anyhow::Result<()> {
                         if spec.project_root.is_none() {
                             spec.project_root = Some(proj_root.display().to_string());
                         }
-                        spec.tier = default_tier;
+                        // 权限档位由界面随任务带来（header 徽章可切档，「立即作用于
+                        // 之后提交的任务」）；这里不再用配置默认值覆盖——覆盖了徽章
+                        // 就只是装饰，切了档提交时仍走默认 L2。
                         spec.max_iterations = max_iter;
 
                         let provider = match router.resolve(None, spec.model.as_deref()).await {
@@ -303,6 +368,48 @@ async fn main() -> anyhow::Result<()> {
                             t.cancel();
                         }
                     }
+                    // `/tasks` 与任务面板：读 store 回灌事件。
+                    // 这两个命令只是「看一眼」，不启动任务，因此不受串行限制。
+                    Command::ListTasks => {
+                        let tasks = store.recent_tasks(50).await;
+                        tracing::info!(count = tasks.len(), "task list requested");
+                        let _ = bus.send(Event::TaskList { tasks });
+                    }
+                    // 切到历史任务：回灌转写事件，界面据此还原对话区。
+                    Command::ResumeTask(prefix) => {
+                        if current.is_some() {
+                            let _ = bus.send(Event::Error {
+                                id: agent_core::TaskId::new(),
+                                err: agent_core::ErrorInfo::new(
+                                    "busy",
+                                    "任务运行中无法切换，请等它结束或按 Esc 取消。",
+                                ),
+                            });
+                            continue;
+                        }
+                        let tasks = store.recent_tasks(200).await;
+                        match resolve_task(&prefix, &tasks) {
+                            Ok(t) => {
+                                let events = store.task_events(&t.id).await;
+                                tracing::info!(
+                                    task = %t.id.0,
+                                    events = events.len(),
+                                    "task opened"
+                                );
+                                let _ = bus.send(Event::TaskOpened {
+                                    id: t.id.clone(),
+                                    title: t.title.clone(),
+                                    events,
+                                });
+                            }
+                            Err(msg) => {
+                                let _ = bus.send(Event::Error {
+                                    id: agent_core::TaskId::new(),
+                                    err: agent_core::ErrorInfo::new("task_not_found", msg),
+                                });
+                            }
+                        }
+                    }
                     Command::Quit => break,
                 }
             }
@@ -311,6 +418,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut app = App::with_identity(cfg.agent.default_tier.clone(), router.available().join(","));
     app.set_log_path(log_file.display().to_string());
+    // `/news` 从项目根读 `templates/news.md`（读不到用内置副本）。
+    app.set_project_root(project_root.clone());
 
     tracing::info!("tui starting");
     run_tui(app, ev_rx, cmd_tx).await?;
@@ -379,5 +488,113 @@ mod tests {
         // 空白串视为未设置，继续走配置
         let d = resolve_log_dir(cfg, Some("   ".into()));
         assert!(d.ends_with("logs"), "{d:?}");
+    }
+
+    // ---- /resume 的任务前缀解析 ----
+
+    fn summary(id: &str, title: &str) -> agent_core::TaskSummary {
+        agent_core::TaskSummary {
+            id: agent_core::ids::TaskId::from_raw(id),
+            title: title.into(),
+            state: agent_core::task::TaskState::Done,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn resolve_task_accepts_full_id_and_unique_prefix() {
+        let tasks = vec![
+            summary("7f3a9c2b-1111-2222", "写脚本"),
+            summary("b4d5e6f7-3333-4444", "收集新闻"),
+        ];
+        assert_eq!(
+            resolve_task("7f3a9c2b-1111-2222", &tasks).unwrap().title,
+            "写脚本"
+        );
+        assert_eq!(resolve_task("7f3a", &tasks).unwrap().title, "写脚本");
+        // 大小写不敏感：用户从日志里复制来的 id 常常是大写
+        assert_eq!(resolve_task("B4D5", &tasks).unwrap().title, "收集新闻");
+    }
+
+    #[test]
+    fn ambiguous_prefix_is_rejected_instead_of_guessing() {
+        let tasks = vec![summary("abc1-0000", "一"), summary("abc2-0000", "二")];
+        let err = resolve_task("abc", &tasks).unwrap_err();
+        assert!(err.contains("匹配到 2 个"), "应报出歧义：{err}");
+        assert!(err.contains("/tasks"), "应指路怎么查：{err}");
+    }
+
+    #[test]
+    fn unknown_or_empty_prefix_explains_what_to_do() {
+        let tasks = vec![summary("abc1-0000", "一")];
+        let err = resolve_task("zzz", &tasks).unwrap_err();
+        assert!(err.contains("找不到"), "{err}");
+        assert!(
+            resolve_task("  ", &tasks).is_err(),
+            "空参数不该被当成任意任务"
+        );
+    }
+
+    // ---- 续跑：把 id 落成真实上下文 ----
+
+    #[tokio::test]
+    async fn apply_resume_loads_snapshot_and_locks_task_identity() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agent-cli-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let store = JsonlStore::new(&tmp);
+        let tid = agent_core::ids::TaskId::new();
+        let sid = agent_core::ids::SessionId(tid.0.clone());
+        store
+            .record(
+                &sid,
+                &tid,
+                agent_core::store::Durability::Transient,
+                Event::ContextSnapshot {
+                    id: tid.clone(),
+                    iteration: 1,
+                    model: "m".into(),
+                    messages: vec![
+                        agent_core::provider::Message::system("你是助理"),
+                        agent_core::provider::Message::user("统计文件数"),
+                    ],
+                    tools: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .touch_task(&tid, "统计文件数", agent_core::task::TaskState::Done)
+            .await
+            .unwrap();
+
+        // 界面只会给出「从哪条任务接上」和一个新的追问。
+        let mut spec = TaskSpec::new("再把结果写进 README", String::new());
+        spec.resume_from = Some(tid.clone());
+        apply_resume(&store, &mut spec).await.expect("应能续跑");
+
+        assert_eq!(spec.id.0, tid.0, "续跑沿用原任务 id（面板里不该多出一条）");
+        assert_eq!(spec.title, "统计文件数", "标题沿用原任务");
+        let msgs = spec.resume_messages.expect("应带上上下文");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(spec.prompt, "再把结果写进 README", "新指令不能被上下文覆盖");
+
+        // 找不到快照：按新任务继续，并明确告知。
+        let mut fresh = TaskSpec::new("x", String::new());
+        fresh.resume_from = Some(agent_core::ids::TaskId::new());
+        let err = apply_resume(&store, &mut fresh).await.unwrap_err();
+        assert!(err.contains("上下文快照"), "{err}");
+        assert!(
+            fresh.resume_from.is_none(),
+            "续跑失败要清掉标记，避免死循环重试"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -87,19 +87,51 @@ impl JsonlStore {
         Ok(ev)
     }
 
-    /// 更新任务摘要（覆盖写 tasks/<id>.json）。
+    /// 更新任务摘要（先写临时文件再改名：崩溃时不会留下半截 JSON）。
     pub async fn upsert_task(&self, summary: &TaskSummary) -> Result<(), StoreError> {
+        tokio::fs::create_dir_all(self.tasks_dir()).await?;
         let path = self.tasks_dir().join(format!("{}.json", summary.id));
         let data = serde_json::to_vec_pretty(summary)?;
-        tokio::fs::write(path, data).await?;
+        let tmp = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, data).await?;
+        tokio::fs::rename(&tmp, &path).await?;
         Ok(())
+    }
+
+    /// 登记 / 更新一个任务的状态，保留首次创建时间。
+    ///
+    /// 执行循环在开始与收尾各调用一次——**这是 `/tasks` 面板唯一的数据来源**。
+    /// 历史教训：`upsert_task` 早在 M1 就写好了，但没有任何生产路径调用它，
+    /// 于是 `tasks/` 目录永远是空的，`/tasks` 列出来一片空白。
+    pub async fn touch_task(
+        &self,
+        id: &TaskId,
+        title: &str,
+        state: TaskState,
+    ) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let created_at =
+            match tokio::fs::read(self.tasks_dir().join(format!("{}.json", id.0))).await {
+                Ok(bytes) => serde_json::from_slice::<TaskSummary>(&bytes)
+                    .map(|s| s.created_at)
+                    .unwrap_or(now),
+                Err(_) => now,
+            };
+        let summary = TaskSummary {
+            id: id.clone(),
+            title: title.to_string(),
+            state,
+            created_at,
+            updated_at: now,
+        };
+        self.upsert_task(&summary).await
     }
 
     /// 列出所有已知任务（按更新时间倒序）。
     ///
     /// 供 TUI 的 `/tasks` 面板用。读不到/读不懂的单个文件跳过，不让一条坏数据
     /// 把整个列表搞没。
-    pub async fn list_tasks(&self) -> Vec<TaskSummary> {
+    pub async fn recent_tasks(&self, limit: usize) -> Vec<TaskSummary> {
         let mut out = Vec::new();
         let mut rd = match tokio::fs::read_dir(self.tasks_dir()).await {
             Ok(rd) => rd,
@@ -116,16 +148,20 @@ impl JsonlStore {
                 }
             }
         }
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        out.truncate(limit);
         out
     }
 
-    /// 取某个任务最后一次上下文快照里的消息（用于「恢复继续」）。
+    /// 取某个任务最后一份上下文快照里的消息（用于「恢复继续」）。
     ///
     /// 之所以用快照而不是重放事件：快照就是**当时真正送给模型的那份上下文**
     /// （含 system 固定区与历史工具结果），重放还得自己重新拼。
     /// 会话 id 与任务 id 同名（见 `recorder`），找不到就返回 None。
-    pub async fn last_messages(&self, task_id: &TaskId) -> Option<Vec<agent_core::provider::Message>> {
+    pub async fn last_messages(
+        &self,
+        task_id: &TaskId,
+    ) -> Option<Vec<agent_core::provider::Message>> {
         let session = self
             .load_session(&SessionId::from_raw(task_id.0.clone()))
             .await
@@ -138,6 +174,75 @@ impl JsonlStore {
                 Event::ContextSnapshot { messages, .. } => Some(messages.clone()),
                 _ => None,
             })
+    }
+
+    /// 续跑上下文：最后一次快照 + 快照之后的模型答复。
+    ///
+    /// 快照是在**每次请求之前**拍的，所以任务最后那轮答复不在快照里；不带上的话，
+    /// 恢复后模型会「忘记自己刚刚说过什么」。快照之前的答复都已在快照内，不重复补。
+    pub async fn resume_context(
+        &self,
+        task_id: &TaskId,
+    ) -> Option<Vec<agent_core::provider::Message>> {
+        let session = self
+            .load_session(&SessionId::from_raw(task_id.0.clone()))
+            .await
+            .ok()?;
+        let last = session
+            .events
+            .iter()
+            .rposition(|e| matches!(e.payload, Event::ContextSnapshot { .. }))?;
+        let mut messages = match &session.events[last].payload {
+            Event::ContextSnapshot { messages, .. } => messages.clone(),
+            _ => return None,
+        };
+        for ev in &session.events[last + 1..] {
+            if let Event::AssistantTurn { text, .. } = &ev.payload {
+                if !text.trim().is_empty() {
+                    messages.push(agent_core::provider::Message::assistant(text));
+                }
+            }
+        }
+        Some(messages)
+    }
+
+    /// 读某个任务的摘要（不存在 / 坏文件都返回 None）。
+    pub async fn task_summary(&self, id: &TaskId) -> Option<TaskSummary> {
+        let bytes = tokio::fs::read(self.tasks_dir().join(format!("{}.json", id.0)))
+            .await
+            .ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// 任务转写：只取「对话长什么样」相关的事件，按时间顺序。
+    ///
+    /// 上下文快照刻意排除在外——它每轮都重复整份历史，几百 KB 且对界面无用
+    /// （一次 24 工具的会话里，快照占了绝大部分体积）。
+    pub async fn task_events(&self, task_id: &TaskId) -> Vec<Event> {
+        let Ok(session) = self
+            .load_session(&SessionId::from_raw(task_id.0.clone()))
+            .await
+        else {
+            return Vec::new();
+        };
+        session
+            .events
+            .into_iter()
+            .map(|e| e.payload)
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::TaskStarted { .. }
+                        | Event::TextDelta { .. }
+                        | Event::ReasoningDelta { .. }
+                        | Event::AssistantTurn { .. }
+                        | Event::ToolCallStart { .. }
+                        | Event::ToolCallEnd { .. }
+                        | Event::TaskFinished { .. }
+                        | Event::Error { .. }
+                )
+            })
+            .collect()
     }
 }
 
@@ -198,22 +303,7 @@ impl Store for JsonlStore {
 
     async fn list_tasks(&self, limit: usize) -> Result<Vec<TaskSummary>, StoreError> {
         self.init().await?;
-        let mut dir = tokio::fs::read_dir(self.tasks_dir()).await?;
-        let mut out = Vec::new();
-        while let Some(entry) = dir.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Ok(bytes) = tokio::fs::read(&path).await {
-                if let Ok(s) = serde_json::from_slice::<TaskSummary>(&bytes) {
-                    out.push(s);
-                }
-            }
-        }
-        out.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
-        out.truncate(limit);
-        Ok(out)
+        Ok(JsonlStore::recent_tasks(self, limit).await)
     }
 }
 
@@ -280,6 +370,125 @@ mod tests {
         assert_eq!(s.events[1].durability, Durability::Transient);
         // 逻辑时钟单调
         assert!(s.events[1].clock.seq > s.events[0].clock.seq);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    fn temp_store() -> (JsonlStore, std::path::PathBuf) {
+        let tmp = std::env::temp_dir().join(format!("agent-store-test-{}", uuid::Uuid::new_v4()));
+        (JsonlStore::new(&tmp), tmp)
+    }
+
+    /// 回归：`upsert_task` 早就写好了却没有任何生产路径调用，`tasks/` 永远为空，
+    /// `/tasks` 列出来一片空白。`touch_task` 是执行循环实际调用的那一层。
+    #[tokio::test]
+    async fn touch_task_writes_summary_and_preserves_created_at() {
+        let (store, tmp) = temp_store();
+        let tid = TaskId::new();
+        store
+            .touch_task(&tid, "写个统计脚本", TaskState::Running)
+            .await
+            .unwrap();
+
+        let first = store.task_summary(&tid).await.expect("摘要应已落盘");
+        assert_eq!(first.title, "写个统计脚本");
+        assert_eq!(first.state, TaskState::Running);
+
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        store
+            .touch_task(&tid, "写个统计脚本", TaskState::Done)
+            .await
+            .unwrap();
+        let second = store.task_summary(&tid).await.unwrap();
+        assert_eq!(second.state, TaskState::Done);
+        assert_eq!(
+            second.created_at, first.created_at,
+            "创建时间不能被后续更新改掉"
+        );
+        assert!(second.updated_at >= first.updated_at);
+
+        // 列表按更新时间倒序，且能同时看到标题与状态
+        let listed = store.recent_tasks(10).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, TaskState::Done);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn resume_context_appends_answer_after_last_snapshot() {
+        let (store, tmp) = temp_store();
+        let tid = TaskId::new();
+        let sid = SessionId(tid.0.clone());
+        // 快照在「最后一次请求之前」拍下：只到 user 消息为止。
+        store
+            .record(
+                &sid,
+                &tid,
+                Durability::Transient,
+                Event::ContextSnapshot {
+                    id: tid.clone(),
+                    iteration: 0,
+                    model: "m".into(),
+                    messages: vec![
+                        agent_core::provider::Message::system("你是助理"),
+                        agent_core::provider::Message::user("统计文件数"),
+                    ],
+                    tools: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        // 之后模型才给出最终答复：不在快照里，续跑必须补上。
+        store
+            .record(
+                &sid,
+                &tid,
+                Durability::Transient,
+                Event::AssistantTurn {
+                    id: tid.clone(),
+                    iteration: 0,
+                    text: "共 3 个文件。".into(),
+                    calls: vec![],
+                    usage: agent_core::provider::Usage::default(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ctx = store.resume_context(&tid).await.expect("应有上下文");
+        assert_eq!(ctx.len(), 3, "快照 2 条 + 快照后的答复 1 条");
+        assert_eq!(ctx[1].text(), "统计文件数");
+        assert_eq!(
+            ctx[2].text(),
+            "共 3 个文件。",
+            "恢复后模型要记得自己刚说过什么"
+        );
+
+        // 转写给界面用：快照排除在外（每轮重复整份历史，体积大且界面用不上）。
+        let events = store.task_events(&tid).await;
+        assert_eq!(events.len(), 1, "只留 AssistantTurn：{events:?}");
+        assert!(matches!(events[0], Event::AssistantTurn { .. }));
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn broken_task_file_does_not_break_listing() {
+        let (store, tmp) = temp_store();
+        store.init().await.unwrap();
+        let good = TaskId::new();
+        store
+            .touch_task(&good, "好任务", TaskState::Done)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.join("tasks/bad.json"), b"{ not json")
+            .await
+            .unwrap();
+
+        let listed = store.recent_tasks(10).await;
+        assert_eq!(listed.len(), 1, "坏文件应被跳过，而不是让整个列表消失");
+        assert_eq!(listed[0].id.0, good.0);
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }

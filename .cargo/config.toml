@@ -1,0 +1,6 @@
+# `cargo xtask ...` 的入口（docs 与 PROGRESS 里一直这么用）。
+#
+# 没有这个文件时 `cargo xtask check` 会直接报 `no such command: xtask`，
+# 而 README / PROGRESS 承诺的正是这条命令——文档里的命令必须真能跑。
+[alias]
+xtask = "run --package xtask --"

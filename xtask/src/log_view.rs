@@ -226,6 +226,8 @@ fn render_events(events: &[StoredEvent], opts: &ViewOpts) -> String {
             }
             // 逐字增量默认不落盘；即便落了也不进时间线（内容已在整轮回复里）。
             Event::TextDelta { .. } | Event::ReasoningDelta { .. } => {}
+            // 纯界面事件不落盘，也不会出现在审计日志里。
+            Event::TaskList { .. } | Event::TaskOpened { .. } => {}
         }
     }
     s

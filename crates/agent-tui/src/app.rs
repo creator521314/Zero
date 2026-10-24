@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use agent_core::event::{Command, Event, Outcome, ToolOutcome};
 use agent_core::ids::{ApprovalId, TaskId};
 use agent_core::perm::{ApprovalRequest, PermissionTier};
-use agent_core::task::TaskSpec;
+use agent_core::store::TaskSummary;
+use agent_core::task::{TaskSpec, TaskState};
 use tokio::sync::mpsc;
 
 use crate::theme::{glyph, tier_label};
@@ -13,10 +14,17 @@ use crate::theme::{glyph, tier_label};
 /// 一期可执行的 `/` 命令（顺序即补全菜单的展示顺序）。
 ///
 /// 只列**真正能落地**的命令：`/clear` 清空对话、`/help` 显示帮助、`/tier`
-/// 切换权限档，三者都只改本地 UI 状态。设计稿里的 `/model`（切模型）、
-/// `/compact`（手动压缩上下文）依赖后端能力，尚未落地，故不列入——遵循
-/// 「只提示已实现功能」的原则，避免补出执行不了的入口。
-pub const SLASH_COMMANDS: &[&str] = &["/clear", "/help", "/tier", "/tasks", "/resume"];
+/// 切换权限档、`/tasks` 列历史任务、`/resume` 切到某个历史任务继续、`/news`
+/// 填入新闻收集提示词，都只改本地状态或读 store 后回灌界面。设计稿里的
+/// `/model`（切模型）、`/compact`（手动压缩上下文）依赖后端能力，尚未落地，
+/// 故不列入——遵循「只提示已实现功能」的原则，避免补出执行不了的入口。
+pub const SLASH_COMMANDS: &[&str] = &["/clear", "/help", "/tier", "/tasks", "/resume", "/news"];
+
+/// 内置的新闻收集模板：`templates/news.md` 不存在时的兜底。
+///
+/// 直接编译进二进制，保证「零配置也能用」——仓库里那份是可改的副本，
+/// 不是唯一来源。
+const EMBEDDED_NEWS_TEMPLATE: &str = include_str!("../../../templates/news.md");
 
 /// 右上角瞬态通知：`on_tick` 里到期自动清除，`text` 供渲染读取。
 pub struct Toast {
@@ -216,6 +224,20 @@ pub struct App {
     pub footer_visible: bool,
     /// 右上角瞬态通知；None 表示当前没有。
     pub toast: Option<Toast>,
+    /// 最近一次从 store 取回的历史任务（`/tasks` 与任务面板共用）。
+    pub tasks: Vec<TaskSummary>,
+    /// 任务面板是否打开（`Ctrl+G`）。
+    pub panel_open: bool,
+    /// 任务面板高亮行。
+    pub panel_sel: usize,
+    /// 当前对话区正在看的是哪个任务。
+    ///
+    /// 有值意味着「接着这条任务说」：下一次提交沿用它当任务 id，并把该任务的
+    /// 上下文快照作为续跑上下文（由编排层补齐），所以对话是连续的，而不是
+    /// 每按一次回车就开一条新任务、模型忘光前面做过什么。
+    pub viewing: Option<(TaskId, String)>,
+    /// 项目根（装配层注入）：`/news` 从这里读 `templates/news.md`。
+    project_root: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -257,18 +279,30 @@ impl Default for App {
             history_cursor: None,
             footer_visible: true,
             toast: None,
+            tasks: Vec::new(),
+            panel_open: false,
+            panel_sel: 0,
+            viewing: None,
+            project_root: None,
         }
     }
 }
 
 /// 由按键解析出的动作。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 不派生 `PartialEq`：`Submit` 携带完整 [`TaskSpec`]（含 f64 / 消息列表），
+/// 比较整个规格没有意义，测试里一律用 `matches!`。
+#[derive(Debug, Clone)]
 pub enum UiAction {
     None,
-    Submit(String),
+    Submit(TaskSpec),
     Cancel,
-    Approve { remember: bool },
+    Approve {
+        remember: bool,
+    },
     Reject,
+    /// 需要编排层执行的动作（`/tasks`、`/resume`、面板选中某条任务）。
+    Command(Command),
     Quit,
 }
 
@@ -277,8 +311,11 @@ impl App {
     pub fn apply_event(&mut self, ev: Event) {
         match ev {
             Event::TaskStarted { id, title } => {
-                self.active_task = Some(id);
+                self.active_task = Some(id.clone());
                 self.status = format!("执行中: {title}");
+                // 对话区从此归这条任务：后续输入沿用它当任务 id 续跑。
+                self.viewing = Some((id, title.clone()));
+                self.panel_open = false;
                 self.lines
                     .push(Line::System(format!("▶ 任务开始: {title}")));
                 self.scroll_to_bottom();
@@ -343,8 +380,20 @@ impl App {
                 // 屏幕万一还是脏了，Ctrl+L 手动救。
                 self.auto_scroll();
             }
-            // 上下文快照与整轮回复只服务审计复盘，不进对话流。
-            Event::ContextSnapshot { .. } | Event::AssistantTurn { .. } => {}
+            // 上下文快照只服务审计复盘，不进对话流。
+            Event::ContextSnapshot { .. } => {}
+            // 整轮回复：实时路径下它与逐字增量重合（增量已经拼好了），但
+            // **历史转写**里通常只有它——`TextDelta` 默认不落盘。所以：内容
+            // 与最后一行正文相同就跳过，不同才补，两条路径都不重复。
+            Event::AssistantTurn { text, .. } => {
+                if !text.trim().is_empty() {
+                    let same = matches!(self.lines.last(), Some(Line::Assistant(t)) if t.trim() == text.trim());
+                    if !same {
+                        self.lines.push(Line::Assistant(text));
+                        self.auto_scroll();
+                    }
+                }
+            }
             Event::AwaitingApproval {
                 approval_id, req, ..
             } => {
@@ -397,6 +446,37 @@ impl App {
                 self.lines
                     .push(Line::Error(format!("{}: {}", err.kind, err.message)));
                 self.auto_scroll();
+            }
+            Event::TaskList { tasks } => {
+                self.tasks = tasks;
+                self.panel_sel = self.panel_sel.min(self.tasks.len().saturating_sub(1));
+                // 面板开着就只刷新面板（用户正在里面挑）；否则是 `/tasks`，打到对话区。
+                if !self.panel_open {
+                    self.print_task_list();
+                }
+                self.wake_cursor();
+            }
+            Event::TaskOpened { id, title, events } => {
+                self.panel_open = false;
+                if events.is_empty() {
+                    self.lines.push(Line::Error(format!(
+                        "任务「{title}」没有可回放的历史（日志可能已被清理），仍可继续输入。"
+                    )));
+                    self.viewing = Some((id, title));
+                    self.scroll_to_bottom();
+                    return;
+                }
+                // 转写回放走与实时事件完全相同的规则（见 `replay_lines`），
+                // 因此「切过去的对话」和「当时看到的对话」长得一样。
+                self.lines = replay_lines(&events);
+                self.lines.push(Line::System(format!(
+                    "已切到任务 {}「{}」：继续输入即接着它的上下文。",
+                    short_id(&id),
+                    title
+                )));
+                self.status = format!("查看: {title}");
+                self.viewing = Some((id, title));
+                self.scroll_to_bottom();
             }
         }
     }
@@ -566,6 +646,16 @@ impl App {
         self.history_cursor = None;
     }
 
+    /// 输入框内容是否是一条可直接执行的 `/` 命令。
+    ///
+    /// 带参数的两条（`/resume <id>`、`/news <主题>`）在补全菜单里没有意义——
+    /// 一旦带上参数，前缀匹配就落空了，回车会把它当普通任务提交给模型。
+    /// 所以回车时先用这个判据拦一道。
+    pub fn is_slash_command(&self) -> bool {
+        let buf = self.input.buffer.trim_start();
+        SLASH_COMMANDS.contains(&buf) || buf.starts_with("/resume ") || buf.starts_with("/news ")
+    }
+
     /// 执行一条 `/` 命令；成功执行后清空输入并关闭补全菜单。
     pub fn run_slash_command(&mut self, cmd: &str) -> bool {
         match cmd {
@@ -574,6 +664,7 @@ impl App {
             "/tier" => self.cycle_tier(),
             // 这两个不直接改 UI，而是转成 Command 交给编排层（它才够得着 store）。
             "/tasks" => {
+                self.panel_open = false;
                 self.pending_command = Some(Command::ListTasks);
                 self.input.take();
                 return true;
@@ -588,6 +679,12 @@ impl App {
                 self.input.take();
                 return true;
             }
+            // `/news <主题>`：把模板渲染成提示词填进输入框（不直接发送——
+            // 让用户先看一眼、改一改，避免一按回车就花掉一次联网任务）。
+            _ if cmd == "/news" || cmd.starts_with("/news ") => {
+                self.fill_news_prompt(cmd.trim_start_matches("/news").trim());
+                return true;
+            }
             _ => return false,
         }
         self.input.take();
@@ -597,10 +694,54 @@ impl App {
         true
     }
 
-    /// 清空对话，只留一条系统提示。
+    /// 记录项目根（装配层注入）：`/news` 从这里读 `templates/news.md`。
+    pub fn set_project_root(&mut self, root: impl Into<std::path::PathBuf>) {
+        self.project_root = Some(root.into());
+    }
+
+    /// 新闻收集模板：优先用项目里的 `templates/news.md`（用户可改），
+    /// 读不到就用编译进二进制的内置副本——零配置也必须能用。
+    fn news_template(&self) -> String {
+        let from_disk = self
+            .project_root
+            .as_ref()
+            .map(|r| r.join("templates").join("news.md"))
+            .and_then(|p| std::fs::read_to_string(p).ok());
+        match from_disk {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => EMBEDDED_NEWS_TEMPLATE.to_string(),
+        }
+    }
+
+    /// `/news <主题>`：渲染模板并填进输入框（不自动发送）。
+    pub fn fill_news_prompt(&mut self, topic: &str) {
+        let topic = topic.trim();
+        if topic.is_empty() {
+            self.toast("用法：/news <主题>，例如 /news Rust");
+            return;
+        }
+        let rendered = self
+            .news_template()
+            .replace("{topic}", topic)
+            .replace("{period}", "最近 7 天")
+            .replace("{slug}", &slugify(topic));
+        self.input.buffer = rendered;
+        self.input.move_end();
+        self.completion_active = false;
+        self.completion_sel = 0;
+        self.leave_history();
+        self.wake_cursor();
+        self.toast("已填入新闻收集提示词：确认或修改后回车发送");
+    }
+
+    /// 清空对话并开一条新线：下一次提交会作为**新任务**开始（不再续跑当前任务）。
     pub fn clear_conversation(&mut self) {
         self.lines.clear();
-        self.lines.push(Line::System("对话已清空。".into()));
+        self.viewing = None;
+        self.panel_open = false;
+        self.lines.push(Line::System(
+            "对话已清空（下一条指令将作为新任务开始）。".into(),
+        ));
         self.scroll_to_bottom();
     }
 
@@ -608,17 +749,83 @@ impl App {
     pub fn show_help(&mut self) {
         for l in [
             "/ 命令：",
-            "  /clear  清空对话",
+            "  /clear  清空对话（开新任务）",
             "  /help   显示本帮助",
             "  /tier   切换权限档 L1→L2→L3",
+            "  /tasks  列出历史任务",
+            "  /resume <ID前几位>  切到某条历史任务继续",
+            "  /news <主题>  填入新闻收集提示词（改完再发送）",
+            "  Ctrl+G  打开任务面板（↑/↓ 选择，Enter 切换）",
         ] {
             self.lines.push(Line::System(l.into()));
         }
         self.scroll_to_bottom();
     }
 
+    // ---- 任务面板（Ctrl+G）----
+
+    /// 开关任务面板；打开时向编排层要一份最新列表。
+    pub fn toggle_panel(&mut self) {
+        self.panel_open = !self.panel_open;
+        self.panel_sel = 0;
+        if self.panel_open {
+            self.pending_command = Some(Command::ListTasks);
+            self.toast("任务面板：↑/↓ 选择，Enter 切换，Esc 关闭");
+        }
+        self.wake_cursor();
+    }
+
+    /// 面板内上下移动（到边界不循环：位置感比兜圈更有用）。
+    pub fn panel_move(&mut self, delta: isize) {
+        if self.tasks.is_empty() {
+            return;
+        }
+        let last = self.tasks.len() - 1;
+        let next = self.panel_sel as isize + delta;
+        self.panel_sel = next.clamp(0, last as isize) as usize;
+        self.wake_cursor();
+    }
+
+    /// 选中面板当前行：切到那条任务（Esc / 列表为空时返回 None）。
+    pub fn panel_activate(&mut self) -> Option<Command> {
+        let t = self.tasks.get(self.panel_sel)?.clone();
+        self.panel_open = false;
+        Some(Command::ResumeTask(t.id.0.clone()))
+    }
+
+    /// 关闭面板（Esc）。
+    pub fn close_panel(&mut self) {
+        self.panel_open = false;
+        self.wake_cursor();
+    }
+
+    /// 把历史任务打印进对话区（`/tasks`；面板打开时不打印）。
+    pub fn print_task_list(&mut self) {
+        if self.tasks.is_empty() {
+            self.lines.push(Line::System(
+                "还没有历史任务（完成一个任务后就会出现在这里）。".into(),
+            ));
+            self.scroll_to_bottom();
+            return;
+        }
+        self.lines
+            .push(Line::System(format!("历史任务（{}）：", self.tasks.len())));
+        for t in &self.tasks {
+            self.lines.push(Line::System(format!(
+                "  {}",
+                task_row(t, self.viewing.as_ref().map(|(id, _)| id))
+            )));
+        }
+        self.lines.push(Line::System(
+            "用 /resume <ID前几位> 或 Ctrl+G 切到某条任务继续。".into(),
+        ));
+        self.scroll_to_bottom();
+    }
+
     /// 提交当前输入；空输入返回 None。
-    pub fn submit(&mut self) -> Option<Command> {
+    ///
+    /// 返回的 `TaskSpec` 已经带好权限档位与续跑目标，编排层直接执行即可。
+    pub fn submit(&mut self) -> Option<TaskSpec> {
         let text = self.input.take();
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -633,8 +840,17 @@ impl App {
         self.scroll_to_bottom();
         let mut spec = TaskSpec::new(trimmed.to_string(), String::new());
         spec.tier = self.tier_enum();
-        spec.workspace = String::new(); // 由编排层补齐
-        Some(Command::SubmitTask(spec))
+        // 工作区由编排层补齐。
+        spec.workspace = String::new();
+
+        // 对话区正看着某条任务：沿用它的 id 与标题，并让编排层补上它的上下文，
+        // 这样「接着说」是连续的（模型记得刚才做过什么），面板里也仍是同一条任务。
+        if let Some((id, title)) = &self.viewing {
+            spec.id = id.clone();
+            spec.title = title.clone();
+            spec.resume_from = Some(id.clone());
+        }
+        Some(spec)
     }
 
     /// 滚动。
@@ -717,6 +933,101 @@ impl App {
     /// 编排层是否已断开。
     pub fn is_backend_down(&self) -> bool {
         self.backend_down
+    }
+}
+
+/// 回放一段历史事件，得到与实时渲染一致的对话行。
+///
+/// 复用 [`App::apply_event`]：增量合并、工具四态、收尾判重这些规则在「实时」与
+/// 「回看」两条路径上必须一模一样，所以不复制一份渲染逻辑——复制出来的第二份
+/// 迟早会跟第一份走散。
+fn replay_lines(events: &[Event]) -> Vec<Line> {
+    let mut ctx = App::default();
+    ctx.lines.clear();
+    for ev in events {
+        // 面板/列表事件本身不属于对话内容（正常也不会落盘，这里防御性跳过）。
+        if matches!(ev, Event::TaskList { .. } | Event::TaskOpened { .. }) {
+            continue;
+        }
+        ctx.apply_event(ev.clone());
+    }
+    ctx.lines
+}
+
+/// 任务 id 的前 8 位——列表里够区分，又不会把整行撑满（uuid 有 36 字符）。
+fn short_id(id: &TaskId) -> String {
+    id.0.chars().take(8).collect()
+}
+
+/// 任务状态 → 2 字标签（全部等宽，列表才对得齐）。
+fn state_label(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Created => "新建",
+        TaskState::Running => "运行",
+        TaskState::Paused => "暂停",
+        TaskState::Done => "完成",
+        TaskState::Failed => "失败",
+        TaskState::Cancelled => "取消",
+    }
+}
+
+/// 毫秒时间戳 → 相对时间（面板里的「最近一次动过」）。
+///
+/// 刻意不引入时间库：任务列表关心的是「多久以前」，不是绝对时刻；而相对时间
+/// 不需要时区换算，也就不会因为时区/夏令时把「昨天」显示成「今天」。
+fn fmt_time(ms: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(ms);
+    let secs = (now - ms).max(0) / 1000;
+    match secs {
+        0..=59 => "刚刚".into(),
+        60..=3599 => format!("{} 分钟前", secs / 60),
+        3600..=86_399 => format!("{} 小时前", secs / 3600),
+        86_400..=2_591_999 => format!("{} 天前", secs / 86_400),
+        _ => format!("{} 个月前", secs / 2_592_000),
+    }
+}
+
+/// 一条历史任务的单行描述（`/tasks` 与任务面板共用）。
+///
+/// 当前正在看的那条用 `▸` 标出来，避免「我到底在哪条任务里」的困惑。
+pub(crate) fn task_row(t: &TaskSummary, current: Option<&TaskId>) -> String {
+    let marker = if current == Some(&t.id) { "▸" } else { " " };
+    format!(
+        "{} {}  {}  {}  {}",
+        marker,
+        short_id(&t.id),
+        state_label(t.state),
+        fmt_time(t.updated_at),
+        t.title
+    )
+}
+
+/// 主题 → 文件名安全的形式：空白换成短横线，去掉 Windows 不允许的字符。
+///
+/// 模板里 `artifacts/news-{slug}.md` 会用到它：`/news AI 芯片` 得到
+/// `news-AI-芯片.md`，而不是一个带空格、在命令行里必须加引号的文件名。
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            ' ' | '\t' | '\n' | '\r' => {
+                if !out.is_empty() && !out.ends_with('-') {
+                    out.push('-');
+                }
+            }
+            // Windows 文件名非法字符 + 路径分隔符。
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => {}
+            _ => out.push(c),
+        }
+    }
+    let t = out.trim_matches('-');
+    if t.is_empty() {
+        "news".into()
+    } else {
+        t.to_string()
     }
 }
 
@@ -1327,5 +1638,344 @@ mod tests {
         app.cursor_visible = false;
         app.on_char('x');
         assert!(app.cursor_visible, "wake_cursor 应立即可见");
+    }
+
+    // ---- 任务面板 / 历史任务 / 续跑 ----
+
+    fn task(id: &str, title: &str, state: TaskState) -> TaskSummary {
+        TaskSummary {
+            id: TaskId::from_raw(id),
+            title: title.into(),
+            state,
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn task_list_prints_into_conversation_when_panel_closed() {
+        let mut app = App::default();
+        app.apply_event(Event::TaskList {
+            tasks: vec![task("aaaaaaaa-1111", "写脚本", TaskState::Done)],
+        });
+        assert_eq!(app.tasks.len(), 1);
+        let text = app
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::System(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("历史任务"), "{text}");
+        assert!(text.contains("写脚本"), "列表要带标题：{text}");
+        assert!(text.contains("aaaaaaaa"), "列表要带 id 前 8 位：{text}");
+        assert!(text.contains("完成"), "列表要带状态：{text}");
+    }
+
+    #[test]
+    fn task_list_does_not_spam_conversation_when_panel_open() {
+        // 面板开着时列表只刷新面板：否则每开一次面板就往对话里灌一遍。
+        let mut app = App::default();
+        app.toggle_panel();
+        app.apply_event(Event::TaskList {
+            tasks: vec![task("aaaaaaaa-1111", "写脚本", TaskState::Done)],
+        });
+        assert!(
+            !app.lines
+                .iter()
+                .any(|l| matches!(l, Line::System(s) if s.contains("历史任务"))),
+            "面板打开时不该打印列表：{:?}",
+            app.lines
+        );
+    }
+
+    #[test]
+    fn toggle_panel_requests_task_list() {
+        let mut app = App::default();
+        app.toggle_panel();
+        assert!(app.panel_open);
+        assert!(
+            matches!(app.take_pending_command(), Some(Command::ListTasks)),
+            "打开面板要向编排层要列表（UI 够不着 store）"
+        );
+        app.toggle_panel();
+        assert!(!app.panel_open);
+    }
+
+    #[test]
+    fn panel_move_and_activate_produce_resume_command() {
+        let mut app = App {
+            tasks: vec![
+                task("aaaaaaaa-1111", "第一", TaskState::Done),
+                task("bbbbbbbb-2222", "第二", TaskState::Done),
+            ],
+            panel_open: true,
+            ..Default::default()
+        };
+        app.panel_move(1);
+        assert_eq!(app.panel_sel, 1);
+        app.panel_move(5);
+        assert_eq!(app.panel_sel, 1, "到底不越界");
+        match app.panel_activate() {
+            Some(Command::ResumeTask(id)) => assert_eq!(id, "bbbbbbbb-2222"),
+            other => panic!("应选中第二条并切换，实际 {other:?}"),
+        }
+        assert!(!app.panel_open, "切换后关闭面板");
+    }
+
+    #[test]
+    fn panel_activate_with_empty_list_is_noop() {
+        let mut app = App {
+            panel_open: true,
+            ..Default::default()
+        };
+        assert!(app.panel_activate().is_none());
+    }
+
+    /// 造一段「历史任务」的事件流：模型答复只通过 `AssistantTurn` 留下
+    /// （默认不落逐字增量），这是回放最容易漏内容的地方。
+    fn history_events(id: &TaskId) -> Vec<Event> {
+        vec![
+            Event::TaskStarted {
+                id: id.clone(),
+                title: "统计文件数".into(),
+            },
+            Event::AssistantTurn {
+                id: id.clone(),
+                iteration: 0,
+                text: "我先看看目录里有什么。".into(),
+                calls: vec![],
+                usage: agent_core::provider::Usage::default(),
+            },
+            Event::ToolCallStart {
+                id: id.clone(),
+                call_id: agent_core::ids::ToolCallId::new(),
+                name: "shell_exec".into(),
+                args: serde_json::json!({ "cmd": "dir" }),
+            },
+            Event::ToolCallEnd {
+                id: id.clone(),
+                call_id: agent_core::ids::ToolCallId::new(),
+                outcome: ToolOutcome::Ok,
+                ms: 12,
+                detail: None,
+                output: Some("ok".into()),
+            },
+            Event::AssistantTurn {
+                id: id.clone(),
+                iteration: 1,
+                text: "共 3 个文件。".into(),
+                calls: vec![],
+                usage: agent_core::provider::Usage::default(),
+            },
+            Event::TaskFinished {
+                id: id.clone(),
+                outcome: Outcome::Success {
+                    summary: "共 3 个文件。".into(),
+                    artifacts: vec!["artifacts/count.md".into()],
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn task_opened_replays_history_into_conversation() {
+        let mut app = App::default();
+        let id = TaskId::from_raw("cccccccc-3333");
+        app.apply_event(Event::TaskOpened {
+            id: id.clone(),
+            title: "统计文件数".into(),
+            events: history_events(&id),
+        });
+
+        assert_eq!(
+            app.viewing.as_ref().map(|(i, _)| i.0.clone()),
+            Some(id.0.clone())
+        );
+        assert!(!app.panel_open);
+        let text: Vec<String> = app
+            .lines
+            .iter()
+            .map(|l| match l {
+                Line::User(s) | Line::Assistant(s) | Line::System(s) | Line::Done(s) => s.clone(),
+                Line::Tool { name, .. } => name.clone(),
+                Line::Reasoning(s) | Line::Error(s) => s.clone(),
+            })
+            .collect();
+        let joined = text.join("\n");
+        assert!(
+            joined.contains("我先看看目录里有什么"),
+            "整轮答复要回放：{joined}"
+        );
+        assert!(
+            joined.contains("共 3 个文件"),
+            "最后一轮答复也要在：{joined}"
+        );
+        assert!(joined.contains("shell_exec"), "工具调用要回放：{joined}");
+        assert!(
+            joined.contains("artifacts/count.md"),
+            "产物要回放：{joined}"
+        );
+        // 同一段答复只出现一次（TextDelta 与 AssistantTurn 重合时不重复）
+        assert_eq!(
+            text.iter().filter(|t| t.contains("我先看看")).count(),
+            1,
+            "答复不该重复：{text:?}"
+        );
+    }
+
+    #[test]
+    fn resume_without_history_keeps_view_and_warns() {
+        // 日志被清理时仍允许「接着这条任务说」，只是没有上下文可带。
+        let mut app = App::default();
+        let id = TaskId::from_raw("dddddddd-4444");
+        app.apply_event(Event::TaskOpened {
+            id: id.clone(),
+            title: "旧任务".into(),
+            events: vec![],
+        });
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| matches!(l, Line::Error(s) if s.contains("没有可回放"))));
+        assert_eq!(app.viewing.as_ref().map(|(i, _)| i.0.clone()), Some(id.0));
+    }
+
+    #[test]
+    fn submit_after_switch_resumes_the_same_task() {
+        let mut app = App::default();
+        let id = TaskId::from_raw("eeeeeeee-5555");
+        app.apply_event(Event::TaskOpened {
+            id: id.clone(),
+            title: "统计文件数".into(),
+            events: history_events(&id),
+        });
+
+        app.input.buffer = "再把结果写进 README".into();
+        let spec = app.submit().expect("应生成任务规格");
+        assert_eq!(spec.id.0, id.0, "沿用同一任务 id：面板里仍是一条任务");
+        assert_eq!(spec.title, "统计文件数", "标题不随每次追问改名");
+        assert_eq!(
+            spec.resume_from.as_ref().map(|i| i.0.clone()),
+            Some(id.0),
+            "要告诉编排层从哪条任务续跑"
+        );
+        assert_eq!(spec.prompt, "再把结果写进 README");
+    }
+
+    #[test]
+    fn fresh_app_submit_starts_a_new_task() {
+        let mut app = App::default();
+        app.input.buffer = "写个脚本".into();
+        let spec = app.submit().expect("应生成任务规格");
+        assert!(spec.resume_from.is_none(), "新对话不该带续跑上下文");
+    }
+
+    #[test]
+    fn clear_conversation_starts_a_new_thread() {
+        let mut app = App::default();
+        let id = TaskId::from_raw("ffffffff-6666");
+        app.apply_event(Event::TaskOpened {
+            id,
+            title: "旧任务".into(),
+            events: vec![],
+        });
+        app.clear_conversation();
+        assert!(app.viewing.is_none(), "/clear 之后是新话题");
+        app.input.buffer = "换个话题".into();
+        assert!(app.submit().unwrap().resume_from.is_none());
+    }
+
+    // ---- `/news`：新闻收集模板 ----
+
+    #[test]
+    fn news_command_fills_template_with_topic() {
+        let mut app = App::default();
+        assert!(app.run_slash_command("/news Rust"));
+
+        let buf = &app.input.buffer;
+        assert!(buf.contains("Rust"), "主题要填进去：{buf}");
+        assert!(buf.contains("web_search"), "要引导先搜再抓：{buf}");
+        assert!(
+            buf.contains("artifacts/news-Rust.md"),
+            "产物路径要具体：{buf}"
+        );
+        assert!(
+            !buf.contains("{topic}") && !buf.contains("{slug}") && !buf.contains("{period}"),
+            "占位符必须都被替换：{buf}"
+        );
+        assert!(
+            !app.lines.iter().any(|l| matches!(l, Line::User(_))),
+            "只填提示词，不自动提交（避免一按回车就烧钱）"
+        );
+        assert!(app.toast.is_some(), "要提示「填好了」");
+    }
+
+    #[test]
+    fn news_without_topic_shows_usage() {
+        let mut app = App::default();
+        assert!(app.run_slash_command("/news"));
+        assert!(app.input.buffer.is_empty(), "没主题时不该往输入框塞东西");
+        assert!(
+            app.toast.as_ref().is_some_and(|t| t.text.contains("用法")),
+            "应提示怎么用"
+        );
+    }
+
+    #[test]
+    fn news_template_prefers_project_file() {
+        // 用户可改 `templates/news.md`：改完不该还被内置副本盖住。
+        let root = std::env::temp_dir().join(format!(
+            "agent-tui-news-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(root.join("templates")).unwrap();
+        std::fs::write(root.join("templates/news.md"), "自定义模板：{topic}").unwrap();
+
+        let mut app = App::default();
+        app.set_project_root(&root);
+        assert!(app.run_slash_command("/news 芯片"));
+        assert_eq!(app.input.buffer, "自定义模板：芯片");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn slugify_makes_safe_file_names() {
+        assert_eq!(slugify("AI 芯片"), "AI-芯片");
+        assert_eq!(slugify("a/b:c*d"), "abcd");
+        assert_eq!(slugify("   "), "news");
+    }
+
+    #[test]
+    fn streamed_then_assistant_turn_does_not_duplicate() {
+        let mut app = App::default();
+        let id = TaskId::new();
+        app.apply_event(Event::TextDelta {
+            id: id.clone(),
+            text: "你好".into(),
+        });
+        app.apply_event(Event::AssistantTurn {
+            id,
+            iteration: 0,
+            text: "你好".into(),
+            calls: vec![],
+            usage: agent_core::provider::Usage::default(),
+        });
+        assert_eq!(
+            app.lines
+                .iter()
+                .filter(|l| matches!(l, Line::Assistant(_)))
+                .count(),
+            1,
+            "实时路径下增量与整轮回复不该各占一行：{:?}",
+            app.lines
+        );
     }
 }

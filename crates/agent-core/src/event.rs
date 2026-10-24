@@ -91,6 +91,21 @@ pub enum Event {
         id: TaskId,
         err: ErrorInfo,
     },
+    /// 历史任务列表（TUI `/tasks` 与任务面板的数据源）。
+    ///
+    /// 由编排层读 store 后回灌：TUI 不依赖 `agent-store`，只负责显示。
+    TaskList {
+        tasks: Vec<crate::store::TaskSummary>,
+    },
+    /// 切到某个历史任务：带上它的转写事件，供界面把对话区还原成当时的样子。
+    ///
+    /// `events` 只含与「对话长什么样」有关的事件（任务开始/工具调用/整轮回复/
+    /// 收尾），已按时间顺序排好；GUI 侧按与实时事件相同的规则回放。
+    TaskOpened {
+        id: TaskId,
+        title: String,
+        events: Vec<Event>,
+    },
 }
 
 /// 工具调用的终结状态（[`Event::ToolCallEnd`] 的细分）。
@@ -139,9 +154,14 @@ pub enum Command {
         reason: String,
     },
     Cancel(TaskId),
-    /// 列出历史任务（TUI `/tasks`）。由编排层读 store 后把结果回灌成对话行。
+    /// 列出历史任务（TUI `/tasks` 与任务面板）。由编排层读 store 后把结果回灌成
+    /// [`Event::TaskList`]。
     ListTasks,
-    /// 恢复某个历史任务继续对话：参数为任务 id（或 id 前缀）。
+    /// 切到某个历史任务：参数为任务 id（或唯一前缀）。
+    ///
+    /// 编排层回灌 [`Event::TaskOpened`]（转写事件 + 续跑上下文），界面据此把对话区
+    /// 还原成该任务当时的样子；之后用户再发指令，即以同一任务 id 携带这份上下文
+    /// 继续跑（`TaskSpec::resume_from`）。
     ResumeTask(String),
     Quit,
 }
