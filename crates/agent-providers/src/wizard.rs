@@ -18,7 +18,7 @@ use dialoguer::{Confirm, Input, MultiSelect, Select};
 
 use crate::config::{
     AgentConfig, Budget, ConfigError, LogConfig, ProviderConfig, ProvidersFile, RouterConfig,
-    SearchConfig, EXAMPLE_TOML,
+    SearchConfig,
 };
 
 /// 预置 provider 模板。
@@ -336,9 +336,12 @@ fn confirm_and_write(cfg: &ProvidersFile, overwriting: bool) -> anyhow::Result<(
         anyhow::bail!("已取消。可重新启动再次运行 wizard。");
     }
 
-    // 用嵌入模板（带注释、可读性更好）+ 我们 wizard 生成的 section 覆盖关键字段。
-    // 简化：直接写 wizard 生成的紧凑版本（to_string_pretty）。
     let body = render_with_header(cfg)?;
+    // 写盘前先按「读取路径」解析一遍：向导产出的文件必须能被自己读回。
+    // 否则用户会看到「已写入」紧接着 `TOML parse error`，还留下一份坏配置，
+    // 下次启动只能再进一次「配置无效」向导——死循环。
+    let _: ProvidersFile = toml::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("向导生成了无法解析的配置（已中止，未写入）：{e}"))?;
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
     }
@@ -355,17 +358,26 @@ fn confirm_and_write(cfg: &ProvidersFile, overwriting: bool) -> anyhow::Result<(
 }
 
 /// 写出带顶部说明的 TOML，便于用户首次打开时看懂结构。
+///
+/// **只写 wizard 生成的内容，不再拼接 `EXAMPLE_TOML`。** 曾经为了「注释更全」
+/// 把整份模板附在生成内容后面，结果同一个文件里出现两份 `[providers.deepseek]`，
+/// 写出来的配置**连自己都读不回**（`duplicate key`）：向导刚打印「已写入」，
+/// 下一行就报 TOML 解析错误。注释放在顶部摘要里，完整模板留在
+/// `config/config.example.toml`，不再进同一份文件。
 fn render_with_header(cfg: &ProvidersFile) -> anyhow::Result<String> {
-    use std::fmt::Write as _;
-
     let mut out = String::new();
     out.push_str("# 个人 Agent 配置文件（由配置向导生成）\n");
     out.push_str("# 安全提示：API key 不会写入此文件，只记录环境变量名。\n");
-    out.push_str("# 详细模板与字段说明见 config/config.example.toml。\n\n");
+    out.push_str("# 字段说明与注释版模板见 config/config.example.toml（`cargo xtask gen-cfg` 可重新生成）。\n");
+    out.push_str("# 常用改法：\n");
+    out.push_str(
+        "#   - 不想依赖环境变量：在对应 [providers.<name>] 下补 api_key = \"sk-...\" 作兜底；\n",
+    );
+    out.push_str("#   - 工具读写范围：agent.project_root（默认 \".\" 即启动目录）；\n");
+    out.push_str("#   - 权限档位：agent.default_tier = \"L1\" / \"L2\" / \"L3\"。\n\n");
 
     let body = toml::to_string_pretty(cfg)?;
     out.push_str(&body);
-    let _ = write!(out, "\n# === 嵌入模板 (示例) ===\n{EXAMPLE_TOML}");
     Ok(out)
 }
 
@@ -401,6 +413,56 @@ mod tests {
         assert!(body.contains("[budget]"));
         assert!(body.contains("[search]"));
         assert!(body.contains("[agent]"));
+    }
+
+    /// 向导只勾一个 provider、`by_task` 为空时的产物。
+    /// 用户报出的 `duplicate key` 正是这条路径。
+    fn wizard_like_config() -> ProvidersFile {
+        ProvidersFile {
+            providers: HashMap::from([("deepseek".to_string(), Preset::DeepSeek.template())]),
+            router: RouterConfig {
+                default: "deepseek".into(),
+                by_task: HashMap::new(),
+            },
+            ..ProvidersFile::default()
+        }
+    }
+
+    /// 回归：向导写出的文件必须能被**读取路径**解析回来。
+    ///
+    /// 曾经的 bug：`render_with_header` 为了保留注释，把整份 `EXAMPLE_TOML`
+    /// 拼在生成内容后面——同一文件里出现两份 `[providers.deepseek]`，
+    /// 向导打印「已写入」后紧接着就 `duplicate key` 解析失败。
+    #[test]
+    fn rendered_config_round_trips_through_loader() {
+        for cfg in [ProvidersFile::default(), wizard_like_config()] {
+            let body = render_with_header(&cfg).unwrap();
+            let parsed: ProvidersFile =
+                toml::from_str(&body).expect("向导产物必须能读回（不能有重复表）");
+            assert_eq!(parsed.providers.len(), cfg.providers.len());
+            assert_eq!(parsed.router.default, cfg.router.default);
+            assert_eq!(
+                parsed.budget.per_task_limit_usd,
+                cfg.budget.per_task_limit_usd
+            );
+            assert_eq!(parsed.agent.default_tier, cfg.agent.default_tier);
+        }
+    }
+
+    /// 同一个表头只能出现一次（重复即 TOML 解析失败）。
+    #[test]
+    fn rendered_config_has_no_duplicate_tables() {
+        let body = render_with_header(&wizard_like_config()).unwrap();
+        assert_eq!(
+            body.matches("[providers.deepseek]").count(),
+            1,
+            "表头重复了：\n{body}"
+        );
+        assert!(
+            !body.contains("# === 嵌入模板"),
+            "不应再把整份模板拼进同一文件"
+        );
+        assert!(body.contains("config.example.toml"), "应给出模板文件的指路");
     }
 
     #[test]

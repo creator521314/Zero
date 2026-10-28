@@ -931,6 +931,47 @@ M4 之后按「已知偏差」清单补 P2 的两项 UI 欠账。**sqlite 索引
 功能都没落地，所以一个 pill 都不显示；现在落地了就该让人看得见），`!` `$` `#`
 仍然不显示。
 
+## 修复：向导生成的配置读不回来（2026-10-29）
+
+**症状**：首次运行走完配置向导，先看到「[✓] 已写入 …」和「下一步 …」，
+紧接着进程以 TOML 解析错误退出：
+
+```
+Error: TOML parse error at line 72, column 1
+   |
+72 | [providers.deepseek]
+   | ^
+invalid table header
+duplicate key `deepseek` in table `providers`
+```
+
+磁盘上留下一份解析不了的 `config/config.toml`；下次启动还是同样的错误，
+只能再进一次「配置无效」向导。
+
+**根因**：`render_with_header` 想「顺手保留注释版模板」，在向导生成的 TOML
+后面又整份追加了 `EXAMPLE_TOML`。生成内容本身已有 `[providers.deepseek]`
+等表头，追加的模板再带一份 → 同一文件两份同名表，TOML 规范不允许。
+而 `confirm_and_write` 是先写盘、后由 `run_first_time` 重新加载校验，
+于是「写入成功」已经打印出去，错误才在下一步爆出来——用户拿到的是一份坏配置。
+
+**为什么单测没拦住**：`render_contains_all_sections` 只断言 `contains("[search]")`
+之类，没有「把产物解析回来」这一步；而那个 `[search]` 恰恰是追加的模板贡献的——
+bug 存在时测试反而更容易绿。
+
+**改动**：
+
+| 项 | 位置 |
+|---|---|
+| 生成内容不再追加整份模板；注释摘要留在顶部，指向 `config.example.toml` | `crates/agent-providers/src/wizard.rs::render_with_header` |
+| 写盘前先按读取路径 `toml::from_str` 解析一遍，不合法就中止且**不落盘** | `wizard.rs::confirm_and_write` |
+| 回归测试：默认配置与「单 provider + 空 `by_task`」两种产物都能往返解析；表头不重复 | `wizard.rs` tests（新增 3 个） |
+
+**已有坏配置怎么办**：重新启动会进入「配置无效」向导，确认覆盖即可；
+或直接删掉 `config/config.toml` 再走一次向导（向导只记录环境变量名，重配不涉及 key）。
+
+**验证**：`cargo xtask check` 通过（fmt + clippy `-D warnings` 0 warning）；
+`cargo test --workspace` **354 passed / 0 failed / 4 ignored**。
+
 ## 已知限制（一期）
 
 | 限制 | 说明 |
