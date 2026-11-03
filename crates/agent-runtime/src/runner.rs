@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_core::error::AgentError;
-use agent_core::event::{Event, EventBus, Outcome, ToolOutcome};
+use agent_core::event::{ApprovalDecision, Event, EventBus, Outcome, ToolOutcome};
 use agent_core::ids::{ApprovalId, ToolCallId};
-use agent_core::perm::{ApprovalRequest, Decision, PermissionEngine};
+use agent_core::perm::{class_key, ApprovalRequest, Decision, PermissionEngine};
 use agent_core::provider::{
     ChatRequest, ContentPart, LlmProvider, Message, RequestMeta, Role, StreamEvent, ToolCall, Usage,
 };
@@ -45,6 +45,12 @@ pub type ToolLookup = Arc<dyn Fn(&str) -> Option<Arc<dyn Tool>> + Send + Sync>;
 /// 熔断配了却等于没配。
 pub type CostSinkFn = Arc<dyn Fn(f64) + Send + Sync>;
 
+/// 工具输出脱敏函数：把已知密钥值（API key 等）替换成 `<redacted>`。
+///
+/// 由装配层从配置 + 进程环境构造；执行循环在**回填给模型之前**与**落盘之前**
+/// 各用一次，保证上下文快照与 jsonl 里都不出现明文密钥。
+pub type RedactFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 /// 审批消息：(审批 ID, 应答)。
 pub type ApprovalMsg = (ApprovalId, ApprovalReply);
 
@@ -69,6 +75,8 @@ pub struct RuntimeDeps {
     pub per_task_budget: f64,
     /// 把成本报给账本，用于月度熔断。
     pub cost_sink: Option<CostSinkFn>,
+    /// 工具输出脱敏。测试 / 无密钥场景注入恒等函数。
+    pub redact: RedactFn,
 }
 
 /// Agent 运行时。
@@ -99,7 +107,12 @@ impl AgentRuntime {
              3. 任务完成时调用 finish 工具结束：在 summary 里给用户一段简洁总结。\n\
              4. 如果某个操作被拒绝，换一种策略，不要重复同样的调用。\n\
              5. 目标文件/目录不存在或目录为空时，**不要继续猜路径**；\n\
-                直接说明缺什么，向用户索要材料或改用其他思路。",
+                直接说明缺什么，向用户索要材料或改用其他思路。\n\
+             \n\
+             【审批】当你发起的工具调用需要用户确认时，用户批准后该工具的返回会以\n\
+             [user-approved] 开头；被拒绝会以 [rejected by user] 或 [denied] 开头。\n\
+             除此之外，你**无法得知**某次操作是否经过人工审批，也不得依据「操作成功了」\n\
+             推断权限系统是否设防。",
             prompt = task.prompt,
             ws = ws,
         )
@@ -454,6 +467,9 @@ impl AgentRuntime {
                         Decision::Deny("相同操作已重复 3 次，请更换策略或结束任务".to_string());
                 }
 
+                // 本次调用是否由用户亲手批准（只影响回填给模型的文本）。
+                let mut user_approved = false;
+
                 match decision {
                     Decision::Deny(reason) => {
                         tool_messages.push(Message {
@@ -473,7 +489,11 @@ impl AgentRuntime {
                         });
                         continue;
                     }
-                    Decision::AskUser => {
+                    Decision::AskUser {
+                        reason,
+                        source,
+                        matched_rule,
+                    } => {
                         let approval_id = ApprovalId::new();
                         tracing::info!(
                             task = %task_id.0,
@@ -490,12 +510,21 @@ impl AgentRuntime {
                                 tool: call.name.clone(),
                                 args: call.arguments.clone(),
                                 risk: self.tool_risk(&call.name),
-                                reason: "需要用户确认".into(),
-                                matched_rule: None,
+                                reason,
+                                matched_rule,
+                                source: Some(source),
                             },
                         });
                         match self.wait_approval(&approval_id, &cancel).await {
                             Ok(ApprovalReply::Approve { remember }) => {
+                                user_approved = true;
+                                // 「被批准」本身也是审计事实：只记请求不记结果，
+                                // 事后无法区分「人工放行」与「自动放行」。
+                                let _ = bus.send(Event::ApprovalDecided {
+                                    id: task_id.clone(),
+                                    approval_id: approval_id.clone(),
+                                    decision: ApprovalDecision::Approved { remember },
+                                });
                                 if remember {
                                     // 直接 await 引擎的登记：曾经这里走一个同步回调、
                                     // 回调内部再 `tokio::spawn` 去登记，于是**下一次同类
@@ -505,11 +534,18 @@ impl AgentRuntime {
                                     // 执行循环本身就是 async，没有理由绕这一圈。
                                     self.deps
                                         .perm
-                                        .approve_for_task(task.id.0.as_str(), &call.name)
+                                        .approve_for_task(task.id.0.as_str(), &class_key(call))
                                         .await;
                                 }
                             }
                             Ok(ApprovalReply::Reject { reason }) => {
+                                let _ = bus.send(Event::ApprovalDecided {
+                                    id: task_id.clone(),
+                                    approval_id: approval_id.clone(),
+                                    decision: ApprovalDecision::Rejected {
+                                        reason: reason.clone(),
+                                    },
+                                });
                                 tool_messages.push(Message {
                                     role: Role::Tool,
                                     content: vec![ContentPart::text(format!(
@@ -544,11 +580,22 @@ impl AgentRuntime {
 
                 match result {
                     Ok(r) => {
+                        // 脱敏必须发生在回填模型与落盘之前：工具输出里可能带出
+                        // 明文 API key（`env`、`cat config.toml`），一旦进了
+                        // 上下文或 jsonl 就收不回来了。
+                        let redacted = (self.deps.redact)(&r.content);
+                        // 只给模型加「被人工批准」标记：日志保留工具原文（已脱敏），
+                        // 便于区分「工具说了什么」与「模型看到了什么」。
+                        let model_content = if user_approved {
+                            format!("[user-approved] {redacted}")
+                        } else {
+                            redacted.clone()
+                        };
                         if terminating {
-                            finish_summary = Some(if r.content.is_empty() {
+                            finish_summary = Some(if redacted.is_empty() {
                                 "（无文本输出）".to_string()
                             } else {
-                                r.content.clone()
+                                redacted.clone()
                             });
                         }
                         if !r.artifacts.is_empty() {
@@ -558,7 +605,7 @@ impl AgentRuntime {
                                     artifacts.push(a.clone());
                                 }
                             }
-                        } else if !r.content.is_empty() {
+                        } else if !redacted.is_empty() {
                             progressed = true;
                         }
                         // 工具自报失败（is_error）也算失败：以前统一按 Ok 记，
@@ -570,7 +617,7 @@ impl AgentRuntime {
                         };
                         tool_messages.push(Message {
                             role: Role::Tool,
-                            content: vec![ContentPart::text(r.content.clone())],
+                            content: vec![ContentPart::text(model_content)],
                             tool_calls: vec![],
                             tool_call_id: Some(call_id.clone()),
                             reasoning: None,
@@ -581,13 +628,13 @@ impl AgentRuntime {
                             outcome,
                             ms,
                             detail: if r.is_error {
-                                Some(r.content.clone())
+                                Some(redacted.clone())
                             } else {
                                 None
                             },
                             // 工具返回的原文一并落盘：这是事后回答「工具到底
                             // 返回了什么」的唯一依据。
-                            output: Some(r.content),
+                            output: Some(redacted),
                         });
                     }
                     Err(e) => {
@@ -930,6 +977,32 @@ mod tests {
         }
     }
 
+    /// 返回带密钥文本的测试工具：验证 runner 在回填模型与落盘前脱敏。
+    struct LeakyTool;
+
+    #[async_trait]
+    impl Tool for LeakyTool {
+        fn name(&self) -> &str {
+            "leaky"
+        }
+        fn description(&self) -> &str {
+            "返回一段带密钥的文本"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn risk_level(&self) -> Risk {
+            Risk::Low
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("token=sk-leak-value-123456 done"))
+        }
+    }
+
     struct AllowAll;
 
     #[async_trait]
@@ -945,7 +1018,11 @@ mod tests {
     #[async_trait]
     impl PermissionEngine for AskAll {
         async fn check(&self, _call: &ToolCall, _task: &TaskSpec) -> Decision {
-            Decision::AskUser
+            Decision::AskUser {
+                reason: "测试：一律询问".into(),
+                source: agent_core::perm::ApprovalSource::User,
+                matched_rule: None,
+            }
         }
     }
 
@@ -1050,6 +1127,7 @@ mod tests {
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
+            redact: Arc::new(|s: &str| s.to_string()),
         });
         (runtime, store, tmp)
     }
@@ -1105,6 +1183,7 @@ mod tests {
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
+            redact: Arc::new(|s: &str| s.to_string()),
         });
         (runtime, store, tmp)
     }
@@ -1461,6 +1540,7 @@ mod tests {
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
+            redact: Arc::new(|s: &str| s.to_string()),
         });
 
         let bus = event_bus();
@@ -1594,6 +1674,12 @@ mod tests {
         );
         // 提示词与工具行为一致：目标不存在时别再猜路径。
         assert!(p.contains("不要继续猜路径"), "提示词应约束盲目重试: {p}");
+        // 模型必须知道「被批准的操作长什么样」，以及自己看不到审批。
+        assert!(p.contains("[user-approved]"), "提示词应说明批准标记: {p}");
+        assert!(
+            p.contains("无法得知"),
+            "提示词应声明模型看不到审批结果: {p}"
+        );
     }
 
     /// 系统级验证「批准本任务同类操作」：按过 `a` 之后，同类调用不再弹窗。
@@ -1644,6 +1730,7 @@ mod tests {
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
+            redact: Arc::new(|s: &str| s.to_string()),
         });
 
         let bus = event_bus();
@@ -1718,6 +1805,7 @@ mod tests {
             cost_sink: Some(Arc::new(move |cost: f64| {
                 sink.lock().unwrap().push(cost);
             })),
+            redact: Arc::new(|s: &str| s.to_string()),
         };
         // 让 provider 有单价，否则成本算不出来。
         let runtime = AgentRuntime::new(deps);
@@ -1734,6 +1822,240 @@ mod tests {
         assert_eq!(costs.len(), 1, "每轮应上报一次成本，实际 {costs:?}");
         assert!(costs[0] > 0.0, "usage 非零时成本应 > 0，实际 {costs:?}");
         drop(ap_tx);
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// 工具输出里的密钥必须在**回填模型之前**与**落盘之前**被替换。
+    ///
+    /// 回归：`env | grep key` 的完整 key 曾同时进入模型上下文与 jsonl（18 处）。
+    #[tokio::test]
+    async fn tool_output_is_redacted_before_model_and_log() {
+        const SECRET: &str = "sk-leak-value-123456";
+        let tmp =
+            std::env::temp_dir().join(format!("agent-runner-redact-{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+        let (_ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(1);
+
+        let defs = vec![ToolDef {
+            name: "leaky".into(),
+            description: "leaky".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: Arc::new(ScriptedProvider {
+                turns: Mutex::new(vec![
+                    vec![
+                        tool_call(0, "c1", "leaky"),
+                        StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                    ],
+                    vec![
+                        StreamEvent::TextDelta("完成".into()),
+                        StreamEvent::Done(agent_core::provider::FinishReason::Stop),
+                    ],
+                ]),
+            }),
+            provider_name: "scripted".into(),
+            tools: Arc::new(|name: &str| {
+                (name == "leaky").then(|| Arc::new(LeakyTool) as Arc<dyn Tool>)
+            }),
+            tool_defs: defs,
+            perm: Arc::new(AllowAll),
+            store,
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(Mutex::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            per_task_budget: 0.0,
+            cost_sink: None,
+            redact: Arc::new(|s: &str| s.replace(SECRET, "<redacted>")),
+        });
+
+        let bus = event_bus();
+        let mut sub = bus.subscribe();
+        let mut spec = TaskSpec::new("脱敏", ws.display().to_string());
+        spec.max_iterations = 3;
+        let _ = runtime.run(spec, bus, RunControl::new()).await;
+
+        let mut events = Vec::new();
+        while let Ok(ev) = sub.try_recv() {
+            events.push(ev);
+        }
+
+        let output = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ToolCallEnd { output, .. } => output.clone(),
+                _ => None,
+            })
+            .expect("应有工具返回");
+        assert!(output.contains("<redacted>"), "返回应被替换: {output}");
+        assert!(!output.contains(SECRET), "落盘原文里不能有密钥: {output}");
+
+        let model_saw: String = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ContextSnapshot { messages, .. } => Some(messages),
+                _ => None,
+            })
+            .flatten()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            model_saw.contains("<redacted>"),
+            "模型上下文应已脱敏: {model_saw}"
+        );
+        assert!(
+            !model_saw.contains(SECRET),
+            "模型上下文里不能有密钥: {model_saw}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// 审批必须留下「请求 → 决定 → 结果」三件事，且模型能看到「被批准过」。
+    ///
+    /// 回归：只记 `AwaitingApproval` 时，事后无法区分人工放行与自动放行；
+    /// 模型也看不到批准标记，于是把「用户批准过」误判成「权限系统没设防」。
+    #[tokio::test]
+    async fn approval_is_observable_in_log_and_to_model() {
+        let tmp =
+            std::env::temp_dir().join(format!("agent-runner-approval-{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+        let (ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(4);
+
+        let defs = vec![ToolDef {
+            name: "ok_tool".into(),
+            description: "ok".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: Arc::new(ScriptedProvider {
+                turns: Mutex::new(vec![
+                    vec![
+                        tool_call(0, "c1", "ok_tool"),
+                        StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                    ],
+                    vec![
+                        StreamEvent::TextDelta("完成".into()),
+                        StreamEvent::Done(agent_core::provider::FinishReason::Stop),
+                    ],
+                ]),
+            }),
+            provider_name: "scripted".into(),
+            tools: Arc::new(|name: &str| {
+                (name == "ok_tool").then(|| {
+                    Arc::new(FixedTool {
+                        name: "ok_tool",
+                        fail: false,
+                    }) as Arc<dyn Tool>
+                })
+            }),
+            tool_defs: defs,
+            perm: Arc::new(AskAll),
+            store,
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(Mutex::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            per_task_budget: 0.0,
+            cost_sink: None,
+            redact: Arc::new(|s: &str| s.to_string()),
+        });
+
+        let bus = event_bus();
+        let mut watcher = bus.subscribe();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<
+            agent_core::perm::ApprovalRequest,
+        >::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok(ev) = watcher.recv().await {
+                if let Event::AwaitingApproval { req, .. } = ev {
+                    seen2.lock().unwrap().push(req.clone());
+                    let _ = ap_tx
+                        .send((req.id, ApprovalReply::Approve { remember: false }))
+                        .await;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let mut sub = bus.subscribe();
+        let mut spec = TaskSpec::new("审批可观测", ws.display().to_string());
+        spec.max_iterations = 3;
+        let _ = runtime.run(spec, bus, RunControl::new()).await;
+
+        let mut events = Vec::new();
+        while let Ok(ev) = sub.try_recv() {
+            events.push(ev);
+        }
+
+        // 审批请求要带真实原因与来源（不再是固定文案 + null）。
+        let req = seen.lock().unwrap().first().cloned().expect("应有一次审批");
+        assert!(!req.reason.is_empty(), "审批原因不能为空");
+        assert_eq!(
+            req.source,
+            Some(agent_core::perm::ApprovalSource::User),
+            "L3/策略询问的来源应标为 User"
+        );
+
+        // 事件顺序：请求 → 决定 → 结果。
+        let ask_at = events
+            .iter()
+            .position(|e| matches!(e, Event::AwaitingApproval { .. }))
+            .expect("缺少审批请求事件");
+        let decided_at = events
+            .iter()
+            .position(|e| matches!(e, Event::ApprovalDecided { .. }))
+            .expect("缺少审批决定事件");
+        let end_at = events
+            .iter()
+            .position(|e| matches!(e, Event::ToolCallEnd { .. }))
+            .expect("缺少工具结束事件");
+        assert!(
+            ask_at < decided_at && decided_at < end_at,
+            "顺序应为 请求 → 决定 → 结果"
+        );
+        match &events[decided_at] {
+            Event::ApprovalDecided { decision, .. } => {
+                assert_eq!(*decision, ApprovalDecision::Approved { remember: false })
+            }
+            other => panic!("应为 ApprovalDecided，实际 {other:?}"),
+        }
+
+        // 模型侧：工具消息带 [user-approved]。
+        let model_tool: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ContextSnapshot { messages, .. } => Some(messages),
+                _ => None,
+            })
+            .flatten()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.text())
+            .collect();
+        assert!(
+            model_tool.iter().any(|t| t.starts_with("[user-approved]")),
+            "模型应看到批准标记: {model_tool:?}"
+        );
+
+        // 日志侧：ToolCallEnd 保留工具原文（不加标记）。
+        let logged = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ToolCallEnd { output, .. } => output.clone(),
+                _ => None,
+            })
+            .expect("工具应有返回");
+        assert!(
+            !logged.starts_with("[user-approved]"),
+            "日志不该被模型标记污染: {logged}"
+        );
+
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
@@ -1823,6 +2145,7 @@ mod tests {
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
+            redact: Arc::new(|s: &str| s.to_string()),
         });
 
         let mut spec = TaskSpec::new("再把结果写进 README", ws.display().to_string());

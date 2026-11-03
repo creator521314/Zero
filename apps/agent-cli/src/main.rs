@@ -36,7 +36,13 @@ async fn apply_resume(store: &JsonlStore, spec: &mut TaskSpec) -> Result<(), Str
             tracing::info!(task = %id.0, messages = msgs.len(), "resuming task with stored context");
             spec.resume_messages = Some(msgs);
             if let Some(s) = store.task_summary(&id).await {
-                spec.title = s.title;
+                // 话题名默认沿用原任务（避免每次追问都改名），但「你好？」这类
+                // 寒暄不配当标题：遇到第一条有实质内容的指令就换掉。
+                if !title_is_substantive(&s.title) && title_is_substantive(&spec.prompt) {
+                    spec.title = spec.prompt.trim().chars().take(24).collect();
+                } else {
+                    spec.title = s.title;
+                }
             }
             Ok(())
         }
@@ -46,6 +52,35 @@ async fn apply_resume(store: &JsonlStore, spec: &mut TaskSpec) -> Result<(), Str
             Err("该任务没有可用的上下文快照，已按新任务继续。".into())
         }
     }
+}
+
+/// 标题是否包含实质内容（用于「首条寒暄不配当话题名」）。
+///
+/// 规则刻意保守：太短（< 4 字）或纯寒暄/确认词都不算。它只决定「要不要把
+/// 一个寒暄标题换成新指令」，不参与任务匹配等任何语义判断。
+fn title_is_substantive(title: &str) -> bool {
+    const GREETINGS: &[&str] = &[
+        "你好",
+        "您好",
+        "hi",
+        "hello",
+        "在吗",
+        "在不在",
+        "测试",
+        "test",
+        "继续",
+        "好",
+        "嗯",
+        "ok",
+    ];
+    let t = title
+        .trim()
+        .trim_end_matches(['？', '?', '。', '.', '!', '！'])
+        .trim();
+    if t.chars().count() < 4 {
+        return false;
+    }
+    !GREETINGS.iter().any(|g| t.eq_ignore_ascii_case(g))
 }
 
 /// 按 id 或唯一前缀找任务（`/resume` 与任务面板共用）。
@@ -159,6 +194,10 @@ async fn main() -> anyhow::Result<()> {
     // 工具沙箱：默认启动目录，这样「介绍当前项目」才有东西可看。
     let project_root = cfg.agent.resolved_project_root();
 
+    // 工具输出脱敏：从配置与进程环境收集已知密钥值。构造一次、全任务共用。
+    let redactor = Arc::new(agent_providers::SecretRedactor::from_config(&cfg));
+    let redact: agent_runtime::runner::RedactFn = Arc::new(move |s: &str| redactor.redact(s));
+
     // 工具集。搜索后端按 [search] 段解析：未配置时走内置免 key 后端，
     // 保证 web_search 开箱可用。
     let registry = Arc::new(agent_tools::default_tools(
@@ -184,6 +223,14 @@ async fn main() -> anyhow::Result<()> {
     // 存储
     let store = Arc::new(JsonlStore::new(&root));
     store.init().await?;
+    // 过期清理：`transient_retention_days` 此前只是配置里的死字段，临时事件
+    // （含工具输出）永不删除。失败不阻塞启动。
+    if let Err(e) = store
+        .prune_transient(cfg.agent.transient_retention_days)
+        .await
+    {
+        tracing::warn!(error = %e, "transient 事件清理失败（不影响启动）");
+    }
 
     // 全局限量通道：审批应答（单例，被所有任务共享）
     let (ap_tx, ap_rx) = mpsc::channel::<agent_runtime::runner::ApprovalMsg>(16);
@@ -212,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
         let cfg_root = root.clone();
         let proj_root = project_root.clone();
         let max_iter = cfg.agent.max_iterations;
+        let redact2 = redact.clone();
 
         tokio::spawn(async move {
             // 当前运行中的任务：取消令牌 + 句柄。
@@ -317,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
                                     let router = router.clone();
                                     move |cost: f64| router.record_spend(cost)
                                 })),
+                                redact: redact2.clone(),
                             });
 
                         tracing::info!(task = %task_id, provider = %provider_name, "task started");
@@ -594,6 +643,61 @@ mod tests {
             fresh.resume_from.is_none(),
             "续跑失败要清掉标记，避免死循环重试"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn greetings_are_not_substantive_titles() {
+        assert!(!title_is_substantive("你好？"));
+        assert!(!title_is_substantive("在吗"));
+        assert!(!title_is_substantive("继续"));
+        assert!(title_is_substantive("做一个权限探测"));
+        assert!(title_is_substantive("统计文件数"));
+    }
+
+    /// 寒暄当标题的对话，遇到第一条实质指令时应换掉标题（但仍沿用同一任务 id）。
+    #[tokio::test]
+    async fn resume_replaces_greeting_title_with_first_substantive_prompt() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agent-cli-title-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let store = JsonlStore::new(&tmp);
+        let tid = agent_core::ids::TaskId::new();
+        let sid = agent_core::ids::SessionId(tid.0.clone());
+        store
+            .record(
+                &sid,
+                &tid,
+                agent_core::store::Durability::Transient,
+                Event::ContextSnapshot {
+                    id: tid.clone(),
+                    iteration: 1,
+                    model: "m".into(),
+                    messages: vec![agent_core::provider::Message::user("你好？")],
+                    tools: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .touch_task(&tid, "你好？", agent_core::task::TaskState::Done)
+            .await
+            .unwrap();
+
+        let mut spec = TaskSpec::new("做一个权限探测", String::new());
+        spec.resume_from = Some(tid.clone());
+        // 界面切到历史任务时会把旧标题塞进来；apply_resume 负责判断要不要换。
+        spec.title = "你好？".into();
+        apply_resume(&store, &mut spec).await.expect("应能续跑");
+
+        assert_eq!(spec.title, "做一个权限探测", "寒暄标题应被实质指令替换");
+        assert_eq!(spec.id.0, tid.0, "仍沿用原任务 id");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

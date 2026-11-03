@@ -6,12 +6,14 @@
 pub mod budget;
 pub mod config;
 pub mod openai_compat;
+pub mod redact;
 pub mod review;
 pub mod router;
 pub mod wizard;
 
 pub use config::{Budget, ConfigError, ProviderConfig, ProvidersFile, RouterConfig};
 pub use openai_compat::OpenAiCompatProvider;
+pub use redact::SecretRedactor;
 pub use review::LlmReviewer;
 pub use router::ProviderRouter;
 pub use wizard::{ensure_loaded, run_first_time, run_invalid};

@@ -972,6 +972,37 @@ bug 存在时测试反而更容易绿。
 **验证**：`cargo xtask check` 通过（fmt + clippy `-D warnings` 0 warning）；
 `cargo test --workspace` **354 passed / 0 failed / 4 ignored**。
 
+## 设计：权限系统加固（待实现，2026-11-03）
+
+一次真实权限探测（`artifacts/permission_probe_report.md` + 交接文档）的复盘发现：
+那份报告的核心结论**不成立**——审批其实弹了 7 次，但 agent 看不见「已批准」，把
+exit 0 当成了「没设防」。真正要修的是密钥卫生（完整 key 进了模型上下文与 jsonl 日志、
+`transient_retention_days` 是死配置）、审批可观测性（`Decision::AskUser` 丢原因、
+无 `ApprovalDecided` 事件、模型无 `[user-approved]` 信号）、以及 `shell_exec` 旁路、
+审视器不知项目根、批量批准按工具名太粗等语义漏洞。
+
+已把修复整理成**详细设计文档**：见
+[docs/security-hardening-design.md](docs/security-hardening-design.md)（P0 止血 /
+P1 可观测性 / P2 语义，逐项带现状 → 改动 → 验收）。密钥轮换处置见其附录 A。
+
+## 实现：权限系统加固（2026-11-03）
+
+按上述设计全部落地（13 项）。改动面：
+
+| 分组 | 内容 |
+|---|---|
+| 密钥卫生 | `shell_exec` 子进程剥离 `*_API_KEY/_TOKEN/_SECRET/_PASSWORD` 等环境变量；新增 `SecretRedactor`（环境 + 配置收集实际 key 值），runner 在**回填模型前与落盘前**替换为 `<redacted>`；`transient_retention_days` 从死配置变成真正的过期清理（`prune_transient`，重写 jsonl + 原子 rename，损坏行保留） |
+| 审批可观测 | `Decision::AskUser` 携带 `reason/source/matched_rule`；`ApprovalRequest` 透传并新增 `source`；新增 `Event::ApprovalDecided`（批准/拒绝 + remember）；批准过的工具结果给模型加 `[user-approved]`，系统提示词声明「你无法感知审批，不得据此推断权限系统是否设防」；`xtask log` 渲染「✔ 已批准 / ⊘ 已拒绝」 |
+| 语义修正 | 审视器提示词传入 `project_root`（此前只给私有工作区，无法判断越界）；审批弹层显示真实原因与命中的规则；批量批准按「操作类」（`shell:ls`）而非工具名，复合命令退化为一次性；README 明确 `file_*` 有路径边界、`shell_exec` 没有 |
+
+**验证**：`cargo xtask check` 通过（fmt + clippy `-D warnings` 零警告）；
+`cargo test --workspace` **369 passed / 0 failed / 4 ignored**（原 354）。新增回归：
+密钥不出现在子进程环境 / 模型上下文 / 日志；审批「请求 → 决定 → 结果」顺序与模型可见性；
+`class_key` 的同类/复合命令边界；transient 过期清理；`xtask log` id 前缀。
+
+**仍需用户执行**：轮换已泄露的 `DEEPSEEK_API_KEY` 并清理旧的
+`~/agent/logs/62f3b379-*.jsonl`（代码只止血，不会替用户处置历史数据）。
+
 ## 已知限制（一期）
 
 | 限制 | 说明 |

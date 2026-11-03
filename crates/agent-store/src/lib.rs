@@ -244,6 +244,82 @@ impl JsonlStore {
             })
             .collect()
     }
+
+    /// 清理超过保留期的 Transient 事件；Persistent 事件一律保留。
+    ///
+    /// jsonl 是 append-only 的，删除中间行只能重写整个文件：先写临时文件、
+    /// 再原子 rename。损坏行原样保留（宁可留着看不懂的，也不静默丢数据）。
+    /// 返回删除的事件数；日志目录不存在视为无事可做。
+    pub async fn prune_transient(&self, retain_days: u64) -> Result<usize, StoreError> {
+        let days = retain_days.max(1) as i64;
+        let cutoff = chrono::Utc::now().timestamp_millis() - days * 24 * 60 * 60 * 1000;
+        let mut removed = 0usize;
+
+        let mut rd = match tokio::fs::read_dir(self.logs_dir()).await {
+            Ok(rd) => rd,
+            Err(_) => return Ok(0),
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(bytes) = tokio::fs::read(&path).await else {
+                continue;
+            };
+
+            let text = String::from_utf8_lossy(&bytes);
+            let mut kept: Vec<&str> = Vec::new();
+            let mut removed_here = 0usize;
+            let mut max_seq = 0u64;
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<StoredEvent>(line) {
+                    Ok(e) => {
+                        let expired =
+                            e.durability == Durability::Transient && e.clock.wall_ms < cutoff;
+                        if expired {
+                            removed_here += 1;
+                        } else {
+                            max_seq = max_seq.max(e.clock.seq);
+                            kept.push(line);
+                        }
+                    }
+                    // 损坏行保留：清理不该顺手毁掉排查线索。
+                    Err(_) => kept.push(line),
+                }
+            }
+            if removed_here == 0 {
+                continue;
+            }
+
+            let mut body = kept.join("\n");
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            let tmp = path.with_extension("jsonl.tmp");
+            tokio::fs::write(&tmp, body).await?;
+            tokio::fs::rename(&tmp, &path).await?;
+
+            // 缓存按磁盘上的新内容重建；逻辑时钟只进不退——否则清理一次，
+            // 事件序号会从 1 重新开始，二期按 Clock 定序时会出现「新事件排在旧事件前」。
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                let sid = SessionId::from_raw(stem);
+                if let Some(events) = self.cache.lock().await.get_mut(&sid) {
+                    events.retain(|e| {
+                        e.durability == Durability::Persistent || e.clock.wall_ms >= cutoff
+                    });
+                }
+                let mut seq = self.seq.lock().await;
+                let entry = seq.entry(sid).or_insert(0);
+                *entry = (*entry).max(max_seq);
+            }
+            removed += removed_here;
+        }
+        Ok(removed)
+    }
 }
 
 #[async_trait]
@@ -489,6 +565,64 @@ mod tests {
         let listed = store.recent_tasks(10).await;
         assert_eq!(listed.len(), 1, "坏文件应被跳过，而不是让整个列表消失");
         assert_eq!(listed[0].id.0, good.0);
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// `transient_retention_days` 曾经只是配置里的死字段：Transient 事件永不清理，
+    /// 密钥之类的临时数据因此可以永久留在盘上。
+    #[tokio::test]
+    async fn prune_transient_removes_only_expired_transient() {
+        let (store, tmp) = temp_store();
+        store.init().await.unwrap();
+        let sid = SessionId::new();
+        let tid = TaskId::new();
+        let old = chrono::Utc::now().timestamp_millis() - 10 * 24 * 60 * 60 * 1000;
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let ev = |durability: Durability, wall_ms: i64, seq: u64, text: &str| StoredEvent {
+            schema_version: SCHEMA_VERSION,
+            session_id: sid.clone(),
+            task_id: tid.clone(),
+            clock: Clock { wall_ms, seq },
+            durability,
+            payload: Event::TextDelta {
+                id: tid.clone(),
+                text: text.into(),
+            },
+        };
+        store
+            .append_event(&ev(Durability::Transient, old, 1, "旧临时"))
+            .await
+            .unwrap();
+        store
+            .append_event(&ev(Durability::Persistent, old, 2, "旧持久"))
+            .await
+            .unwrap();
+        store
+            .append_event(&ev(Durability::Transient, now, 3, "新临时"))
+            .await
+            .unwrap();
+
+        let removed = store.prune_transient(7).await.unwrap();
+        assert_eq!(removed, 1, "只该删掉过期的那条 Transient");
+
+        let session = store.load_session(&sid).await.unwrap();
+        assert_eq!(session.events.len(), 2, "旧持久 + 新临时 应保留");
+        assert!(
+            session
+                .events
+                .iter()
+                .any(|e| e.durability == Durability::Persistent),
+            "Persistent 永不过期"
+        );
+        assert!(
+            session
+                .events
+                .iter()
+                .any(|e| matches!(&e.payload, Event::TextDelta { text, .. } if text == "新临时")),
+            "未过期的 Transient 必须保留"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }

@@ -88,6 +88,7 @@ async fn resumed_task_really_carries_the_previous_turn() {
         context_cfg: Default::default(),
         per_task_budget: 0.0,
         cost_sink: None,
+        redact: Arc::new(|s: &str| s.to_string()),
     });
 
     // ---- 第一轮：一条普通任务，不调工具，只留下上下文快照 ----

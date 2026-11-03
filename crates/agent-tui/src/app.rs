@@ -442,6 +442,9 @@ impl App {
                     req,
                 });
             }
+            // 审批结果只服务审计（日志/复盘）；界面上的「待审批」在用户按键
+            // 那一刻就已清掉，这里无需再动状态。
+            Event::ApprovalDecided { .. } => {}
             Event::TaskFinished { outcome, .. } => {
                 match &outcome {
                     Outcome::Success { summary, artifacts } => {
@@ -1655,6 +1658,7 @@ mod tests {
                 risk: agent_core::perm::Risk::High,
                 reason: "命中高危命令规则".into(),
                 matched_rule: None,
+                source: None,
             },
         }
     }

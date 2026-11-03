@@ -33,6 +33,8 @@ use async_trait::async_trait;
 const SYSTEM_PROMPT: &str = "你是操作安全审查员，只判断危害，不判断创意。\
                              默认放行；仅当操作可能造成不可逆危害、访问敏感凭据、\
                              把数据外传到不可信地址，或明显是滥用时才 deny。\
+                             读写「项目根」之外的路径作为风险参考（尤其 /etc、~/.ssh 等\
+                             系统或敏感目录），但只在可能造成不可逆危害时才 deny。\
                              与任务相关性只作为判断危害的参考，不单独作为否决理由。\
                              只输出 JSON：{\"decision\":\"allow|deny\",\"risk\":\"low|medium|high\",\"reason\":\"...\",\"confidence\":0.0}，\
                              reason 用中文且不超过 40 字。";
@@ -144,9 +146,15 @@ impl AiReviewer for LlmReviewer {
         static_risk: Risk,
         timeout: Duration,
     ) -> Result<ApprovalResult, String> {
+        // 项目根才是工具真正的读写边界；`workspace` 只是每任务的私有数据目录。
+        // 只给 workspace，审视器根本无从判断「这次操作是否越界」。
+        let root = task
+            .project_root
+            .clone()
+            .unwrap_or_else(|| task.workspace.clone());
         let ctx = format!(
-            "任务目标: {}\n工作区: {}\n静态风险: {:?}\n当前操作: 工具={} 参数={}",
-            task.prompt, task.workspace, static_risk, call.name, call.arguments
+            "任务目标: {}\n工作区: {}\n项目根: {}\n静态风险: {:?}\n当前操作: 工具={} 参数={}",
+            task.prompt, task.workspace, root, static_risk, call.name, call.arguments
         );
         let req = ChatRequest {
             model: String::new(),
@@ -330,6 +338,70 @@ mod tests {
         }
     }
 
+    /// 记录「审视器实际问出去什么」的假 provider。
+    struct CaptureProvider {
+        seen: Arc<std::sync::Mutex<String>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CaptureProvider {
+        fn name(&self) -> &str {
+            "capture"
+        }
+        fn capabilities(&self) -> agent_core::provider::Capabilities {
+            Default::default()
+        }
+        async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
+            let text = req
+                .messages
+                .iter()
+                .map(|m| m.text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            *self.seen.lock().unwrap() = text;
+            Ok(ChatResponse {
+                message: Message::assistant(r#"{"decision":"allow","risk":"low","reason":"只读"}"#),
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+                provider: "capture".into(),
+                model_returned: "m".into(),
+            })
+        }
+        async fn chat_stream(
+            &self,
+            _req: ChatRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError>
+        {
+            Err(LlmError::InvalidRequest("not used".into()))
+        }
+        fn price(&self, _model: &str) -> Option<ModelPrice> {
+            None
+        }
+    }
+
+    /// 审视器必须知道「项目根」——否则它无法判断一次操作是否越界。
+    #[tokio::test]
+    async fn review_context_includes_project_root() {
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let reviewer = LlmReviewer::new(Arc::new(CaptureProvider { seen: seen.clone() }));
+        let mut t = task();
+        t.project_root = Some("/home/u/proj/zero".into());
+        let _ = reviewer
+            .review(
+                &t,
+                &call("shell_exec", json!({"cmd":"ls"})),
+                Risk::High,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+        let ctx = seen.lock().unwrap().clone();
+        assert!(
+            ctx.contains("项目根: /home/u/proj/zero"),
+            "审视器必须知道项目根: {ctx}"
+        );
+        assert!(ctx.contains("工作区: "), "私有工作区仍要保留: {ctx}");
+    }
+
     #[tokio::test]
     async fn high_risk_review_is_downgraded_to_ask() {
         // 模型说 allow 但 risk=high → 仍要问人。这是「误放行比多问一次贵」的落地。
@@ -342,7 +414,7 @@ mod tests {
             .check(&call("shell_exec", json!({"cmd":"ls"})), &task())
             .await;
         assert!(
-            matches!(d, Decision::AskUser),
+            matches!(d, Decision::AskUser { .. }),
             "风险 high 时即便 allow 也要询问，实际 {d:?}"
         );
     }
@@ -395,7 +467,7 @@ mod tests {
             .check(&call("list_dir", json!({"path":"."})), &task())
             .await;
         assert!(
-            matches!(d, Decision::AskUser),
+            matches!(d, Decision::AskUser { .. }),
             "超时应降级为询问，实际 {d:?}"
         );
     }
@@ -411,6 +483,9 @@ mod tests {
         let mut l3 = task();
         l3.tier = PermissionTier::L3;
         let d = eng.check(&call("list_dir", json!({})), &l3).await;
-        assert!(matches!(d, Decision::AskUser), "L3 不因有审视器而放行");
+        assert!(
+            matches!(d, Decision::AskUser { .. }),
+            "L3 不因有审视器而放行"
+        );
     }
 }

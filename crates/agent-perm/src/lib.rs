@@ -9,7 +9,7 @@ pub mod rules;
 
 use std::time::Duration;
 
-use agent_core::perm::{Decision, PermissionTier, Risk};
+use agent_core::perm::{class_key, ApprovalSource, Decision, PermissionTier, Risk};
 use agent_core::provider::ToolCall;
 use agent_core::task::TaskSpec;
 use async_trait::async_trait;
@@ -94,7 +94,11 @@ impl PermissionEngine for PermissionEngineImpl {
                 PermissionTier::L1 => {
                     Decision::Deny(format!("高危操作被静态规则拦截，需人工确认：{rule}"))
                 }
-                PermissionTier::L2 | PermissionTier::L3 => Decision::AskUser,
+                PermissionTier::L2 | PermissionTier::L3 => Decision::AskUser {
+                    reason: format!("高危操作被静态规则拦截：{rule}"),
+                    source: ApprovalSource::Static,
+                    matched_rule: Some(rule),
+                },
             };
         }
 
@@ -105,16 +109,24 @@ impl PermissionEngine for PermissionEngineImpl {
 
         // ---- L3 逐步确认：除已批量批准外一律询问 ----
         if task.tier == PermissionTier::L3 {
-            if self.is_batch_approved(task_id, &call.name).await {
+            if self.is_batch_approved(task_id, &class_key(call)).await {
                 return Decision::Allow;
             }
-            return Decision::AskUser;
+            return Decision::AskUser {
+                reason: "L3 策略：逐项确认".into(),
+                source: ApprovalSource::User,
+                matched_rule: None,
+            };
         }
 
         // ---- L2：AI 审视 ----
         let Some(reviewer) = self.reviewer.as_ref() else {
             // 无审视器可用 → 降级询问（绝不默认放行）
-            return Decision::AskUser;
+            return Decision::AskUser {
+                reason: "无可用 AI 审视器，降级询问".into(),
+                source: ApprovalSource::Ai,
+                matched_rule: None,
+            };
         };
 
         match reviewer
@@ -127,10 +139,19 @@ impl PermissionEngine for PermissionEngineImpl {
             .await
         {
             Ok(r) if r.allow && r.risk != Risk::High => Decision::Allow,
-            Ok(_) => Decision::AskUser,
+            Ok(r) => Decision::AskUser {
+                // 审视器给了理由就照实记下来：日志/弹窗能看出「AI 为什么拿不准」。
+                reason: r.reason,
+                source: r.source,
+                matched_rule: None,
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "AI review failed, downgrade to AskUser");
-                Decision::AskUser
+                Decision::AskUser {
+                    reason: format!("AI 审视失败，降级询问：{e}"),
+                    source: ApprovalSource::Ai,
+                    matched_rule: None,
+                }
             }
         }
     }
@@ -183,7 +204,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(d, Decision::Deny(_) | Decision::AskUser),
+            matches!(d, Decision::Deny(_) | Decision::AskUser { .. }),
             "高危命令不应被 L1 放行"
         );
     }
@@ -197,7 +218,10 @@ mod tests {
                 &task(PermissionTier::L2),
             )
             .await;
-        assert!(matches!(d, Decision::AskUser), "无审视器时必须降级为询问");
+        assert!(
+            matches!(d, Decision::AskUser { ref source, .. } if *source == ApprovalSource::Ai),
+            "无审视器时必须降级为询问，且来源标为 Ai"
+        );
     }
 
     #[tokio::test]
@@ -207,12 +231,51 @@ mod tests {
         let d = eng
             .check(&call("list_dir", serde_json::json!({"path":"."})), &t)
             .await;
-        assert!(matches!(d, Decision::AskUser));
+        assert!(matches!(d, Decision::AskUser { .. }));
         // 批量批准后放行
         eng.approve_for_task(t.id.0.as_str(), "list_dir").await;
         let d = eng
             .check(&call("list_dir", serde_json::json!({"path":"."})), &t)
             .await;
         assert!(matches!(d, Decision::Allow));
+    }
+
+    /// 批量批准必须按「操作类」而不是工具名：批准一次 `ls` 不能顺带放行 `rm`。
+    #[tokio::test]
+    async fn batch_approval_is_scoped_to_the_command_class() {
+        let eng = PermissionEngineImpl::new(StaticRules::default(), PermConfig::default());
+        let t = task(PermissionTier::L3);
+        eng.approve_for_task(
+            t.id.0.as_str(),
+            &class_key(&call("shell_exec", serde_json::json!({"cmd":"ls"}))),
+        )
+        .await;
+
+        let d = eng
+            .check(&call("shell_exec", serde_json::json!({"cmd":"ls -la"})), &t)
+            .await;
+        assert!(matches!(d, Decision::Allow), "同类命令应免问，实际 {d:?}");
+
+        let d = eng
+            .check(
+                &call("shell_exec", serde_json::json!({"cmd":"rm -f x"})),
+                &t,
+            )
+            .await;
+        assert!(
+            matches!(d, Decision::AskUser { .. }),
+            "`rm` 与 `ls` 不同类，仍应询问，实际 {d:?}"
+        );
+
+        let d = eng
+            .check(
+                &call("shell_exec", serde_json::json!({"cmd":"ls && rm x"})),
+                &t,
+            )
+            .await;
+        assert!(
+            matches!(d, Decision::AskUser { .. }),
+            "复合命令不能继承批量授权，实际 {d:?}"
+        );
     }
 }

@@ -31,15 +31,54 @@ const VERBOSE: usize = 4000;
 /// 工具参数摘要长度。
 const ARGS: usize = 160;
 
-/// 定位会话文件：直接给路径，或给任务 ID（自动到 `~/agent/logs/` 下找）。
-pub fn resolve(arg: &str) -> PathBuf {
+/// 定位会话文件：直接给路径，或给任务 ID / 唯一前缀（自动到 `~/agent/logs/` 下找）。
+pub fn resolve(arg: &str) -> Result<PathBuf, String> {
     if arg.ends_with(".jsonl") {
-        return PathBuf::from(arg);
+        return Ok(PathBuf::from(arg));
     }
     let root = ProvidersFile::load(&ProvidersFile::config_path())
         .map(|c| c.agent.resolved_root())
         .unwrap_or_else(|_| expand_home("~/agent"));
-    root.join("logs").join(format!("{arg}.jsonl"))
+    resolve_in(&root.join("logs"), arg)
+}
+
+/// 在给定目录里解析 id / 唯一前缀（拆出来是为了能单测，不依赖真实 `~/agent`）。
+fn resolve_in(logs: &Path, arg: &str) -> Result<PathBuf, String> {
+    let exact = logs.join(format!("{arg}.jsonl"));
+    if exact.exists() {
+        return Ok(exact);
+    }
+
+    let mut hits: Vec<PathBuf> = std::fs::read_dir(logs)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with(arg))
+        })
+        .collect();
+    hits.sort();
+
+    match hits.len() {
+        // 没有匹配：退回 `{arg}.jsonl`，让调用方给出统一的「找不到」提示。
+        0 => Ok(exact),
+        1 => Ok(hits.remove(0)),
+        n => {
+            let names: Vec<String> = hits
+                .iter()
+                .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                .collect();
+            Err(format!(
+                "匹配到 {n} 个会话，请多给几位 id：{}",
+                names.join(", ")
+            ))
+        }
+    }
 }
 
 /// 读取并渲染。
@@ -195,10 +234,31 @@ fn render_events(events: &[StoredEvent], opts: &ViewOpts) -> String {
             Event::AwaitingApproval { req, .. } => {
                 if !opts.errors_only {
                     s.push_str(&format!(
-                        "    ⏸ 等待审批：{}({})\n",
+                        "    ⏸ 等待审批：{}({})\n        原因：{}\n",
                         req.tool,
-                        compact(&req.args)
+                        compact(&req.args),
+                        req.reason
                     ));
+                    if let Some(rule) = &req.matched_rule {
+                        s.push_str(&format!("        规则：{rule}\n"));
+                    }
+                }
+            }
+            Event::ApprovalDecided { decision, .. } => {
+                if !opts.errors_only {
+                    match decision {
+                        agent_core::event::ApprovalDecision::Approved { remember } => {
+                            let extra = if *remember {
+                                "（本任务同类一并批准）"
+                            } else {
+                                ""
+                            };
+                            s.push_str(&format!("    ✔ 已批准{extra}\n"));
+                        }
+                        agent_core::event::ApprovalDecision::Rejected { reason } => {
+                            s.push_str(&format!("    ⊘ 已拒绝：{reason}\n"));
+                        }
+                    }
                 }
             }
             Event::TaskFinished { outcome, .. } => match outcome {
@@ -255,4 +315,33 @@ fn clip(s: &str, max: usize) -> String {
     let head: String = chars[..max * 2 / 3].iter().collect();
     let tail: String = chars[chars.len() - max / 3..].iter().collect();
     format!("{head} …{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_unique_prefix_and_reports_ambiguity() {
+        let dir = std::env::temp_dir().join(format!("xtask-log-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("abc123.jsonl"), "").unwrap();
+        std::fs::write(dir.join("abc456.jsonl"), "").unwrap();
+        std::fs::write(dir.join("xyz.jsonl"), "").unwrap();
+
+        assert_eq!(resolve_in(&dir, "xyz").unwrap(), dir.join("xyz.jsonl"));
+        // 完整 id 优先命中
+        assert_eq!(
+            resolve_in(&dir, "abc123").unwrap(),
+            dir.join("abc123.jsonl")
+        );
+        // 前缀有歧义要说清「几个」，不能随便挑一个
+        let ambiguous = resolve_in(&dir, "abc").unwrap_err();
+        assert!(ambiguous.contains("匹配到 2 个"), "{ambiguous}");
+        // 0 个：回退到 {arg}.jsonl，由调用方统一报「找不到」
+        assert_eq!(resolve_in(&dir, "nope").unwrap(), dir.join("nope.jsonl"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

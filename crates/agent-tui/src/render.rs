@@ -517,7 +517,7 @@ fn scroll_to_position(app: &mut App, row: u16, conv: Rect) {
 /// 拒绝紧邻其右，各 12 列宽。
 fn approval_button_areas(area: Rect) -> (Rect, Rect) {
     let w = area.width.min(72);
-    let h = 11.min(area.height);
+    let h = 13.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let inner_x = x + 1;
@@ -1535,7 +1535,7 @@ fn draw_approval(f: &mut Frame, _app: &App, p: &crate::app::PendingApproval, are
     use agent_core::perm::Risk;
 
     let w = area.width.min(72);
-    let h = 11.min(area.height);
+    let h = 13.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
@@ -1560,9 +1560,16 @@ fn draw_approval(f: &mut Frame, _app: &App, p: &crate::app::PendingApproval, are
     let mut body = vec![
         approval_field("工具", &p.req.tool),
         approval_field("风险", risk),
+        // 为什么被拦：静态规则命中 / AI 拿不准 / L3 策略。没有这一行，用户只能
+        // 看到一个「高危」标签，无法判断该不该放行。
+        approval_field("原因", &p.req.reason),
         approval_field("参数", &args),
         RtLine::from(""),
     ];
+    if let Some(rule) = &p.req.matched_rule {
+        body.push(approval_field("规则", rule));
+        body.push(RtLine::from(""));
+    }
     if high {
         body.push(RtLine::from(Span::styled(
             " ⚠ 该操作可能不可恢复",
@@ -2045,9 +2052,9 @@ mod tests {
     fn approval_button_areas_match_layout() {
         let area = rect(80, 24);
         let (approve, reject) = approval_button_areas(area);
-        // w=72、h=11，居中 → x=4、y=6；内区 x=5、y=7，按钮行 = 7 + 9 - 2 = 14。
-        assert_eq!(approve, Rect::new(5, 14, 12, 1));
-        assert_eq!(reject, Rect::new(17, 14, 12, 1));
+        // w=72、h=13，居中 → x=4、y=5；内区 x=5、y=6，按钮行 = 6 + 11 - 2 = 15。
+        assert_eq!(approve, Rect::new(5, 15, 12, 1));
+        assert_eq!(reject, Rect::new(17, 15, 12, 1));
     }
 
     #[test]
@@ -3355,7 +3362,8 @@ mod tests {
                 args: serde_json::json!({ "command": "rm -rf /" }),
                 risk: agent_core::perm::Risk::High,
                 reason: "命中高危命令规则".into(),
-                matched_rule: None,
+                matched_rule: Some("提权执行".into()),
+                source: Some(agent_core::perm::ApprovalSource::Static),
             },
         });
         app
@@ -3434,6 +3442,8 @@ mod tests {
         let s = squash(&out);
         assert!(s.contains("权限确认"), "应显示弹层标题:\n{out}");
         assert!(s.contains("高危"), "应显示风险等级:\n{out}");
+        assert!(s.contains("命中高危命令规则"), "应显示真实原因:\n{out}");
+        assert!(s.contains("提权执行"), "应显示命中的静态规则:\n{out}");
         assert!(s.contains("批准"), "应显示操作提示:\n{out}");
     }
 

@@ -77,11 +77,20 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
     },
-    /// 等待用户审批（L3 逐步确认 / 高危拦截）。
+    /// 等待用户审批（L3 逐步确认 / 高危拦截 / L2 审视拿不准）。
     AwaitingApproval {
         id: TaskId,
         approval_id: ApprovalId,
         req: ApprovalRequest,
+    },
+    /// 用户对审批请求的最终决定。
+    ///
+    /// 只记「请求」不记「结果」时，事后无法区分「人工批准」与「自动放行」——
+    /// 真实事故里 agent 正是因此把「用户批准过」误判成「权限系统没设防」。
+    ApprovalDecided {
+        id: TaskId,
+        approval_id: ApprovalId,
+        decision: ApprovalDecision,
     },
     TaskFinished {
         id: TaskId,
@@ -121,6 +130,16 @@ pub enum ToolOutcome {
     Denied,
     /// 被用户拒绝，未执行。
     Rejected,
+}
+
+/// 用户对一次审批请求的决定（[`Event::ApprovalDecided`] 的负载）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    /// 批准执行；`remember` 表示「本任务同类操作一并批准」。
+    Approved { remember: bool },
+    /// 拒绝执行，并给出原因（会回填给模型）。
+    Rejected { reason: String },
 }
 
 /// 任务最终结果。

@@ -24,6 +24,32 @@ const SHELL: (&str, &str) = ("/bin/sh", "-c");
 #[cfg(windows)]
 const SHELL: (&str, &str) = ("cmd", "/C");
 
+/// 命中即从子进程环境中移除的变量名后缀。
+///
+/// 子进程默认继承父进程全部环境变量，`env` / `set` 一条命令就能把 API key
+/// 原样打给模型（真实事故：完整 key 进了上下文与 jsonl 日志）。这里按**变量名**
+/// 剥离，比 `env_clear` + 白名单安全得多——`PATH` / `HOME` / `LANG` 等照常保留，
+/// 否则大量命令会立刻失效。
+const DENIED_ENV_SUFFIXES: &[&str] = &[
+    "_API_KEY",
+    "_API_TOKEN",
+    "_TOKEN",
+    "_SECRET",
+    "_SECRET_KEY",
+    "_ACCESS_KEY",
+    "_PASSWORD",
+    "_PASSWD",
+    "_CREDENTIALS",
+];
+
+/// 当前进程环境里名字像密钥的变量名。
+fn sensitive_env_names() -> Vec<String> {
+    std::env::vars()
+        .filter(|(k, _)| DENIED_ENV_SUFFIXES.iter().any(|s| k.ends_with(s)))
+        .map(|(k, _)| k)
+        .collect()
+}
+
 pub struct ShellExec;
 
 /// 把子进程输出解成文本。
@@ -143,6 +169,11 @@ impl Tool for ShellExec {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // 不把凭据交给子进程：`env | grep key` 这类命令不该能读到 API key。
+        for name in sensitive_env_names() {
+            std_cmd.env_remove(name);
+        }
 
         // Windows：给子进程一个自己的（不可见）控制台。
         //
@@ -283,6 +314,45 @@ mod tests {
         assert!(
             out.content.contains("exit code: 3"),
             "实际: {}",
+            out.content
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 回归：子进程曾继承父进程全部环境变量，`env` / `set` 一条命令就能把
+    /// API key 打给模型（真实事故）。变量名命中后缀即剥离；其余变量必须还在。
+    #[tokio::test]
+    async fn secret_env_is_not_inherited_by_child() {
+        const NAME: &str = "AGENT_TEST_SECRET_API_KEY";
+        std::env::set_var(NAME, "sk-should-not-leak");
+        assert!(
+            sensitive_env_names().iter().any(|n| n == NAME),
+            "名字以 _API_KEY 结尾应被识别为敏感变量"
+        );
+
+        let dir = std::env::temp_dir().join("agent-tools-shell-env-test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let cmd = if cfg!(windows) { "set" } else { "env" };
+        let out = ShellExec
+            .execute(json!({ "cmd": cmd }), &ctx(&dir))
+            .await
+            .unwrap();
+        std::env::remove_var(NAME);
+
+        assert!(
+            !out.content.contains("sk-should-not-leak"),
+            "密钥值不能出现在子进程环境里: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains(NAME),
+            "密钥变量名也不应出现: {}",
+            out.content
+        );
+        // 白名单式的 env_clear 会误伤这些，必须仍在。
+        assert!(
+            out.content.contains("PATH="),
+            "PATH 不该被剥掉: {}",
             out.content
         );
         let _ = tokio::fs::remove_dir_all(&dir).await;

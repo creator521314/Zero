@@ -48,7 +48,13 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("  --errors  只看失败项（工具失败 / 被拦 / 报错）");
                 std::process::exit(2);
             };
-            let path = log_view::resolve(target);
+            let path = match log_view::resolve(target) {
+                Ok(p) => p,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    std::process::exit(2);
+                }
+            };
             if !path.exists() {
                 eprintln!("找不到会话文件：{}", path.display());
                 std::process::exit(2);

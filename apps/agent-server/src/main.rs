@@ -80,6 +80,13 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(JsonlStore::new(&root));
     store.init().await?;
+    // 过期清理：临时事件（含工具输出）按 `transient_retention_days` 删除。
+    if let Err(e) = store
+        .prune_transient(cfg.agent.transient_retention_days)
+        .await
+    {
+        tracing::warn!(error = %e, "transient 事件清理失败（不影响启动）");
+    }
 
     let provider = router.resolve(None, None).await?;
     let bus = event_bus();
@@ -110,6 +117,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let (_ap_tx, ap_rx) = mpsc::channel(1);
+    // 工具输出脱敏：headless 同样不能把密钥交给模型或日志。
+    let redactor = std::sync::Arc::new(agent_providers::SecretRedactor::from_config(&cfg));
+    let redact: agent_runtime::runner::RedactFn =
+        std::sync::Arc::new(move |s: &str| redactor.redact(s));
     let runtime = agent_runtime::AgentRuntime::new(agent_runtime::RuntimeDeps {
         provider: provider.clone(),
         provider_name: provider.name().to_string(),
@@ -126,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
             let router = router.clone();
             move |cost: f64| router.record_spend(cost)
         })),
+        redact,
     });
 
     let mut spec = TaskSpec::new(prompt, String::new());
