@@ -151,10 +151,14 @@ impl Tool for ShellExec {
             .get("cmd")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("missing 'cmd'".into()))?;
-        let timeout_secs = args
+        // 超时钳制：模型可以传任意 u64（含 0 或一年），既不能瞬间超时也不能
+        // 无限挂起；再与 ctx.timeout（工具执行预算）取小。
+        let requested = args
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(60);
+        let ctx_cap = ctx.timeout.as_secs().max(1);
+        let timeout_secs = requested.clamp(1, MAX_TIMEOUT_SECS).min(ctx_cap);
 
         let cwd = ctx.sandbox_root();
         tokio::fs::create_dir_all(&cwd).await?;
@@ -191,18 +195,36 @@ impl Tool for ShellExec {
         let mut command = tokio::process::Command::from(std_cmd);
         command.kill_on_drop(true);
 
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|e| ToolError::Failed(format!("spawn failed: {e}")))?;
+        let mut child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ToolError::Failed("child stdout missing".into()))?;
+        let mut child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ToolError::Failed("child stderr missing".into()))?;
 
-        let fut = async {
-            let out = child.wait_with_output().await?;
-            let stdout = decode_output(&out.stdout);
-            let stderr = decode_output(&out.stderr);
-            Ok::<_, std::io::Error>((out.status, stdout, stderr))
+        // 输出上限：只捕获前 MAX_CAPTURE 字节，其余边读边丢——但**必须继续读**，
+        // 否则管道写满会把子进程堵死（`yes` 一条就能让整个任务卡在超时上）。
+        // 之前用 wait_with_output 全量缓冲，死循环刷屏可以打爆内存。
+        let fut = async move {
+            let (out, err) = tokio::join!(
+                read_capped(&mut child_stdout, MAX_CAPTURE_PER_STREAM),
+                read_capped(&mut child_stderr, MAX_CAPTURE_PER_STREAM),
+            );
+            let status = child.wait().await?;
+            let (stdout, stdout_truncated) = out?;
+            let (stderr, stderr_truncated) = err?;
+            Ok::<_, std::io::Error>((status, stdout, stdout_truncated, stderr, stderr_truncated))
         };
 
-        let result: Result<Result<(std::process::ExitStatus, String, String), std::io::Error>, _> = tokio::select! {
+        let result: Result<
+            Result<(std::process::ExitStatus, Vec<u8>, bool, Vec<u8>, bool), std::io::Error>,
+            _,
+        > = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
             r = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut) => r,
@@ -211,8 +233,22 @@ impl Tool for ShellExec {
         match result {
             Err(_) => Err(ToolError::Timeout),
             Ok(Err(e)) => Err(ToolError::Io(e)),
-            Ok(Ok((status, stdout, stderr))) => {
+            Ok(Ok((status, stdout_raw, stdout_truncated, stderr_raw, stderr_truncated))) => {
                 let code = status.code().unwrap_or(-1);
+                let mut stdout = decode_output(&stdout_raw);
+                let mut stderr = decode_output(&stderr_raw);
+                if stdout_truncated {
+                    stdout.push_str(&format!(
+                        "\n[输出已截断：仅保留前 {} 字节]",
+                        MAX_CAPTURE_PER_STREAM
+                    ));
+                }
+                if stderr_truncated {
+                    stderr.push_str(&format!(
+                        "\n[stderr 已截断：仅保留前 {} 字节]",
+                        MAX_CAPTURE_PER_STREAM
+                    ));
+                }
                 let mut body = String::new();
                 if !stdout.is_empty() {
                     body.push_str(&stdout);
@@ -233,6 +269,39 @@ impl Tool for ShellExec {
             }
         }
     }
+}
+
+/// 单个输出流最多捕获的字节数（超出部分丢弃但继续读完，避免堵死管道）。
+pub const MAX_CAPTURE_PER_STREAM: usize = 1024 * 1024;
+
+/// 命令超时的硬上限（秒）：超过即按此值执行，防止模型传一个巨大值把任务挂死。
+pub const MAX_TIMEOUT_SECS: u64 = 600;
+
+/// 读取 `limit` 字节后继续排空剩余数据（丢弃），返回 (已捕获内容, 是否截断)。
+async fn read_capped<R>(reader: &mut R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut captured = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if captured.len() < limit {
+            let take = (limit - captured.len()).min(n);
+            captured.extend_from_slice(&chunk[..take]);
+            if take < n {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+    Ok((captured, truncated))
 }
 
 #[cfg(test)]
@@ -266,8 +335,7 @@ mod tests {
     }
 
     /// 中文必须活着回来：`echo` 按本地 OEM 代码页（中文 Windows = GBK）
-    /// 输出，以前硬按 UTF-8 解就是一堆 `U+FFFD`。
-    #[tokio::test]
+    /// 输出，以前硬按 UTF-8 解就是一堆 `U+FFFD`。    #[tokio::test]
     async fn chinese_output_from_builtin_is_readable() {
         let dir = std::env::temp_dir().join("agent-tools-shell-gbk-test");
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -366,5 +434,49 @@ mod tests {
         } else {
             assert!(d.contains("/bin/sh"), "Unix 上要说清是 sh 语法: {d}");
         }
+    }
+
+    /// 输出超限必须截断并标注，且**不能**因停止读取把子进程堵死。
+    /// 回归：wait_with_output 全量缓冲，`yes` 类死循环输出可打爆内存。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_output_is_capped_and_labeled() {
+        let dir = std::env::temp_dir().join("agent-tools-shell-cap-test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let out = ShellExec
+            .execute(
+                json!({ "cmd": "yes x | head -c 2000000", "timeout_secs": 30 }),
+                &ctx(&dir),
+            )
+            .await
+            .expect("应正常结束");
+        assert!(
+            out.content.len() < MAX_CAPTURE_PER_STREAM + 512,
+            "捕获量应被钳制，实际 {} 字节",
+            out.content.len()
+        );
+        assert!(
+            out.content.contains("输出已截断") || out.content.contains("已截断"),
+            "截断必须有明确标注"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// timeout_secs 传 0 或巨大值都必须被钳制：0 不能秒失败，巨大值不能挂死。
+    #[tokio::test]
+    async fn timeout_is_clamped_not_trusted() {
+        let dir = std::env::temp_dir().join("agent-tools-shell-timeout-test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        for secs in [0u64, u64::MAX] {
+            let out = ShellExec
+                .execute(
+                    json!({ "cmd": "echo ok", "timeout_secs": secs }),
+                    &ctx(&dir),
+                )
+                .await
+                .expect("钳制后应正常执行");
+            assert!(out.content.contains("ok"), "secs={secs}: {}", out.content);
+        }
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
