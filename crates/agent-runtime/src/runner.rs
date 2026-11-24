@@ -377,8 +377,13 @@ impl AgentRuntime {
                 usage: out.usage,
             });
 
-            // 成本累计（简化：按 provider 单价）
-            if let Some(price) = self.deps.provider.price("") {
+            // 成本累计（简化：按 provider 单价）。
+            // 传本轮**实际请求的模型**：task.model 指定了具体模型时必须按它
+            // 计价；未指定时空串是约定值，表示 provider 的默认模型
+            // （见 LlmProvider::price 文档）。原先硬编码 ""，按模型定价的
+            // provider 会把指定模型的成本静默算成默认模型的价。
+            let price_model = task.model.clone().unwrap_or_default();
+            if let Some(price) = self.deps.provider.price(&price_model) {
                 let cost = (out.usage.input_tokens as f64 / 1000.0) * price.input_per_1k
                     + (out.usage.output_tokens as f64 / 1000.0) * price.output_per_1k;
                 spent += cost;
@@ -919,6 +924,39 @@ mod tests {
             Some(ModelPrice {
                 input_per_1k: 0.002,
                 output_per_1k: 0.004,
+            })
+        }
+    }
+
+    /// 按模型定价的 provider：只认请求里指定的模型名，别的返回 None。
+    /// 记录 price() 收到的模型名，验证执行循环传的是实际请求的模型。
+    struct ModelPricedProvider {
+        inner: ScriptedProvider,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ModelPricedProvider {
+        fn name(&self) -> &str {
+            "model-priced"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
+            self.inner.chat(req).await
+        }
+        async fn chat_stream(
+            &self,
+            req: ChatRequest,
+        ) -> Result<BoxStream<Result<StreamEvent, LlmError>>, LlmError> {
+            self.inner.chat_stream(req).await
+        }
+        fn price(&self, model: &str) -> Option<ModelPrice> {
+            self.seen.lock().unwrap().push(model.to_string());
+            (model == "premium").then_some(ModelPrice {
+                input_per_1k: 0.01,
+                output_per_1k: 0.02,
             })
         }
     }
@@ -1857,6 +1895,69 @@ mod tests {
         assert_eq!(costs.len(), 1, "每轮应上报一次成本，实际 {costs:?}");
         assert!(costs[0] > 0.0, "usage 非零时成本应 > 0，实际 {costs:?}");
         drop(ap_tx);
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// 定价必须按**本轮实际请求的模型**查：指定了 premium 模型却传空串，
+    /// 按模型定价的 provider 会返回 None，成本静默不计、月度熔断失效。
+    #[tokio::test]
+    async fn cost_uses_the_requested_model_name() {
+        let tmp =
+            std::env::temp_dir().join(format!("agent-runner-model-price-{}", std::process::id()));
+        let ws = tmp.join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let reported = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let sink = reported.clone();
+        let (_ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(1);
+
+        let mut spec = TaskSpec::new("模型计价", ws.display().to_string());
+        spec.model = Some("premium".into());
+        spec.max_iterations = 2;
+
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: Arc::new(ModelPricedProvider {
+                inner: ScriptedProvider {
+                    turns: Mutex::new(vec![vec![
+                        StreamEvent::Usage(Usage {
+                            input_tokens: 1_000,
+                            output_tokens: 100,
+                            reasoning_tokens: None,
+                            cached_tokens: None,
+                        }),
+                        StreamEvent::Done(agent_core::provider::FinishReason::Stop),
+                    ]]),
+                },
+                seen: seen.clone(),
+            }),
+            provider_name: "model-priced".into(),
+            tools: Arc::new(|_| None),
+            tool_defs: vec![],
+            perm: Arc::new(AskAll),
+            store,
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(Mutex::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            per_task_budget: 0.0,
+            cost_sink: Some(Arc::new(move |c: f64| {
+                sink.lock().unwrap().push(c);
+            })),
+            redact: Arc::new(|s: &str| s.to_string()),
+        });
+
+        let _ = runtime.run(spec, event_bus(), RunControl::new()).await;
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["premium"],
+            "price() 应收到请求里的模型名"
+        );
+        let costs = reported.lock().unwrap().clone();
+        assert_eq!(costs.len(), 1, "成本必须计入账本: {costs:?}");
+        assert!(costs[0] > 0.0, "{costs:?}");
+
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 

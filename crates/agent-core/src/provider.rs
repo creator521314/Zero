@@ -280,5 +280,8 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<BoxStream<Result<StreamEvent, LlmError>>, LlmError>;
 
     /// 定价查询，用于成本估算。无定价信息返回 None。
+    ///
+    /// `model` 为本轮实际请求的模型名；空串表示「使用 provider 默认模型」
+    /// （请求里没指定模型时，provider 会回落到配置里的 `model`）。
     fn price(&self, model: &str) -> Option<ModelPrice>;
 }
