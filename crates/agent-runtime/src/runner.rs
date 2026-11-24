@@ -28,6 +28,10 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::context::{ContextConfig, ContextManager};
 
+/// 工具参数解析失败时的标记键：模型发来的 args 不是合法 JSON 对象时，
+/// 执行循环据此回填一条明确错误（而不是把 Null 当「没传参数」静默执行）。
+const MALFORMED_ARGS_KEY: &str = "__malformed_args_error";
+
 /// 审批应答。
 #[derive(Debug, Clone)]
 pub enum ApprovalReply {
@@ -198,7 +202,23 @@ impl AgentRuntime {
         let mut calls = Vec::new();
         for (_idx, (id, name, args)) in tool_acc {
             let Some(name) = name else { continue };
-            let arguments = serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
+            // 非法/截断的 JSON 不能静默变 Null：Null 会被工具当成「没传参数」，
+            // 模型永远不知道自己发错了格式，只会反复撞同一条 InvalidArgs。
+            // 保留原文并打上标记，执行阶段据此回填一条明确的错误结果。
+            let arguments = match serde_json::from_str::<serde_json::Value>(&args) {
+                Ok(v) if v.is_object() => v,
+                Ok(v) => {
+                    serde_json::json!({
+                        MALFORMED_ARGS_KEY: format!("参数不是 JSON 对象：{v}")
+                    })
+                }
+                Err(e) => {
+                    let raw: String = args.chars().take(300).collect();
+                    serde_json::json!({
+                        MALFORMED_ARGS_KEY: format!("JSON 解析失败：{e}；原文：{raw}")
+                    })
+                }
+            };
             calls.push(ToolCall {
                 id: id.unwrap_or_else(ToolCallId::new),
                 name,
@@ -443,6 +463,42 @@ impl AgentRuntime {
             let mut finish_summary: Option<String> = None;
             for call in &out.calls {
                 let call_id = call.id.clone();
+
+                // 参数解析失败的调用：不执行工具，回填明确错误让模型重发。
+                if let Some(reason) = call
+                    .arguments
+                    .get(MALFORMED_ARGS_KEY)
+                    .and_then(|v| v.as_str())
+                {
+                    let content = format!(
+                        "[error] 工具参数不是合法 JSON，未执行：{reason}\n\
+                         请重新完整输出合法的 JSON 参数。"
+                    );
+                    let _ = bus.send(Event::ToolCallStart {
+                        id: task_id.clone(),
+                        call_id: call_id.clone(),
+                        name: call.name.clone(),
+                        args: call.arguments.clone(),
+                    });
+                    let _ = bus.send(Event::ToolCallEnd {
+                        id: task_id.clone(),
+                        call_id: call_id.clone(),
+                        outcome: ToolOutcome::Failed,
+                        ms: 0,
+                        detail: Some("malformed JSON arguments".to_string()),
+                        output: Some(content.clone()),
+                    });
+                    tool_messages.push(Message {
+                        role: Role::Tool,
+                        content: vec![ContentPart::text(content)],
+                        tool_calls: vec![],
+                        tool_call_id: Some(call_id),
+                        reasoning: None,
+                    });
+                    progressed = true;
+                    continue;
+                }
+
                 let _ = bus.send(Event::ToolCallStart {
                     id: task_id.clone(),
                     call_id: call_id.clone(),
@@ -958,6 +1014,35 @@ mod tests {
                 input_per_1k: 0.01,
                 output_per_1k: 0.02,
             })
+        }
+    }
+
+    /// 会记录执行次数的固定输出工具（验证「不该执行时确实没执行」）。
+    struct CountingTool {
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            "shell_exec"
+        }
+        fn description(&self) -> &str {
+            "计数工具"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn risk_level(&self) -> Risk {
+            Risk::Low
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutput::ok("ran"))
         }
     }
 
@@ -1957,6 +2042,89 @@ mod tests {
         let costs = reported.lock().unwrap().clone();
         assert_eq!(costs.len(), 1, "成本必须计入账本: {costs:?}");
         assert!(costs[0] > 0.0, "{costs:?}");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// 模型发来的工具参数是截断/非法 JSON 时：工具不得执行，模型必须收到
+    /// 明确的错误结果（而不是把 Null 当「没传参数」闷头跑一遍）。
+    #[tokio::test]
+    async fn malformed_tool_args_are_reported_not_silently_nulled() {
+        let tmp =
+            std::env::temp_dir().join(format!("agent-runner-badargs-{}", std::process::id()));
+        let ws = tmp.join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+        let (_ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(1);
+
+        let executed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executed_for_tool = executed.clone();
+
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: Arc::new(ScriptedProvider {
+                turns: Mutex::new(vec![
+                    vec![
+                        // 截断的 JSON：{"cmd": "ls
+                        tool_call_args(0, "c1", "shell_exec", "{\"cmd\": \"ls"),
+                        StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                    ],
+                    vec![
+                        StreamEvent::TextDelta("好".into()),
+                        StreamEvent::Done(agent_core::provider::FinishReason::Stop),
+                    ],
+                ]),
+            }),
+            provider_name: "scripted".into(),
+            tools: Arc::new(move |name: &str| {
+                if name != "shell_exec" {
+                    return None;
+                }
+                Some(Arc::new(CountingTool {
+                    hits: executed_for_tool.clone(),
+                }) as Arc<dyn Tool>)
+            }),
+            tool_defs: vec![ToolDef {
+                name: "shell_exec".into(),
+                description: "shell".into(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }],
+            perm: Arc::new(AllowAll),
+            store,
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(Mutex::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            per_task_budget: 0.0,
+            cost_sink: None,
+            redact: Arc::new(|s: &str| s.to_string()),
+        });
+
+        let bus = event_bus();
+        let mut sub = bus.subscribe();
+        let mut spec = TaskSpec::new("坏参数", ws.display().to_string());
+        spec.max_iterations = 3;
+        let _ = runtime.run(spec, bus, RunControl::new()).await;
+
+        let mut events = Vec::new();
+        while let Ok(ev) = sub.try_recv() {
+            events.push(ev);
+        }
+        // 工具返回里必须是明确的「参数不是合法 JSON」，不能是 Null 正常执行。
+        let tool_out = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ToolCallEnd { output, .. } => output.clone(),
+                _ => None,
+            })
+            .expect("应有工具结束事件");
+        assert!(
+            tool_out.contains("不是合法 JSON"),
+            "应明确报参数错误: {tool_out}"
+        );
+        assert_eq!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "坏参数不应执行工具"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
