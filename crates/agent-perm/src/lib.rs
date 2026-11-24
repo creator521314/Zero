@@ -87,18 +87,16 @@ impl PermissionEngine for PermissionEngineImpl {
     async fn check(&self, call: &ToolCall, task: &TaskSpec) -> Decision {
         let task_id = task.id.0.as_str();
 
-        // ---- 第一层：静态规则（先跑、不可绕过）----
+        // ---- 第一层：静态规则（先跑、优先级最高）----
         if let RuleMatch::Hit { rule, .. } = self.rules.match_call(call) {
-            return match task.tier {
-                // L1 已授权的高危任务仍需人工确认（记审计由上层负责）
-                PermissionTier::L1 => {
-                    Decision::Deny(format!("高危操作被静态规则拦截，需人工确认：{rule}"))
-                }
-                PermissionTier::L2 | PermissionTier::L3 => Decision::AskUser {
-                    reason: format!("高危操作被静态规则拦截：{rule}"),
-                    source: ApprovalSource::Static,
-                    matched_rule: Some(rule),
-                },
+            // 命中即询问用户，与档位无关：
+            // - L1 的语义是「普通操作自动放行」，不是「高危操作无人值守」。
+            //   此前 L1 直接 Deny，用户即使愿意也无法确认，任务只能换档重跑；
+            // - L2/L3 本来就要问，保持同一条路径。
+            return Decision::AskUser {
+                reason: format!("高危操作被静态规则拦截：{rule}"),
+                source: ApprovalSource::Static,
+                matched_rule: Some(rule),
             };
         }
 
@@ -196,17 +194,20 @@ mod tests {
     #[tokio::test]
     async fn l1_blocked_by_static_rule() {
         let eng = PermissionEngineImpl::new(StaticRules::default(), PermConfig::default());
-        // 即使 L1 全自动，rm -rf / 也必须拦截
+        // 即使 L1 全自动，rm -rf / 也必须问人——L1 是「普通操作免问」，
+        // 不是「高危操作无人值守」。Deny 会让用户连确认的机会都没有。
         let d = eng
             .check(
                 &call("shell_exec", serde_json::json!({"cmd":"rm -rf /"})),
                 &task(PermissionTier::L1),
             )
             .await;
-        assert!(
-            matches!(d, Decision::Deny(_) | Decision::AskUser { .. }),
-            "高危命令不应被 L1 放行"
-        );
+        match d {
+            Decision::AskUser { source, .. } => {
+                assert_eq!(source, ApprovalSource::Static, "来源应是静态规则");
+            }
+            other => panic!("高危命令在 L1 下必须询问用户，实际: {other:?}"),
+        }
     }
 
     #[tokio::test]
