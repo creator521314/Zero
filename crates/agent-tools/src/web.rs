@@ -57,17 +57,14 @@ impl Tool for WebFetch {
 
         let parsed = reqwest::Url::parse(url)
             .map_err(|e| ToolError::InvalidArgs(format!("bad url: {e}")))?;
-        // SSRF 防护：禁内网/非 http(s)
-        if agent_net::is_blocked_host(&parsed) {
-            return Err(ToolError::Blocked(format!(
-                "url blocked (private/localhost/non-http): {url}"
-            )));
-        }
 
+        // SSRF 守卫：禁内网/非 http(s)，重定向逐跳手动跟随并校验，
+        // 域名解析结果逐一检查并钉死连接目标（防 rebinding）。
         let resp = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
-            r = self.client.get(parsed).send() => r.map_err(|e| ToolError::Failed(format!("fetch failed: {e}")))?,
+            r = agent_net::guarded_get(&self.client, parsed, &ctx.cancel) =>
+                r.map_err(ToolError::Failed)?,
         };
         let status = resp.status();
         let bytes = resp
@@ -291,21 +288,19 @@ impl WebSearch {
         ctx: &ToolCtx,
     ) -> Result<Vec<SearchHit>, String> {
         let url = backend.build_url(query)?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(format!("不支持的协议：{}", url.scheme()));
-        }
-        let req = self
-            .client
-            .get(url.clone())
-            .header(reqwest::header::ACCEPT, backend.accept())
+        // SSRF 守卫与 web_fetch 同一套：SearXNG 端点虽是用户自配，
+        // 但 URL/DNS 校验照样做，重定向也逐跳过检。
+        let extra_headers = [
+            (reqwest::header::ACCEPT, backend.accept()),
             // 依赖未开启 gzip/brotli 解压特性，索性显式要求服务端不压缩，
             // 否则抓回来的可能是二进制正文，解析出零结果却查不出原因。
-            .header(reqwest::header::ACCEPT_ENCODING, "identity");
-
+            (reqwest::header::ACCEPT_ENCODING, "identity"),
+        ];
         let resp = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => return Err("已取消".to_string()),
-            r = req.send() => r.map_err(|e| format!("请求失败：{e}"))?,
+            r = agent_net::guarded_get_with(&self.client, url, &extra_headers, &ctx.cancel) =>
+                r.map_err(|e| format!("请求失败：{e}"))?,
         };
         let status = resp.status();
         let bytes = resp

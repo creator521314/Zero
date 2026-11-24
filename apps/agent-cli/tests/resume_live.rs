@@ -64,7 +64,6 @@ async fn resumed_task_really_carries_the_previous_turn() {
     agent_store::spawn_event_sink(bus.clone(), store.clone(), Default::default(), None);
 
     let registry = Arc::new(agent_tools::default_tools(
-        client.clone(),
         SearchBackend::resolve(None, None),
     ));
     let reg = registry.clone();

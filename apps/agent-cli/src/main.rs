@@ -201,7 +201,6 @@ async fn main() -> anyhow::Result<()> {
     // 工具集。搜索后端按 [search] 段解析：未配置时走内置免 key 后端，
     // 保证 web_search 开箱可用。
     let registry = Arc::new(agent_tools::default_tools(
-        client.clone(),
         agent_tools::SearchBackend::resolve(
             cfg.search.backend.as_deref(),
             cfg.search.searxng_endpoint.as_deref(),

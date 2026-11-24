@@ -56,7 +56,13 @@ impl ToolRegistry {
 ///
 /// `search_backends` 由 [`SearchBackend::resolve`] 产出：为空表示配置了关闭搜索，
 /// 此时 `web_search` 仍在工具列表里但只会返回一条明确的「已关闭」提示。
-pub fn default_tools(client: reqwest::Client, search_backends: Vec<SearchBackend>) -> ToolRegistry {
+///
+/// 网络类工具统一使用**守卫客户端**（禁自动重定向，配合
+/// `agent_net::guarded_get` 做逐跳 SSRF 校验）；LLM provider 等可信端点
+/// 仍走普通 [`agent_net::build_client`]，两者互不影响。
+pub fn default_tools(search_backends: Vec<SearchBackend>) -> ToolRegistry {
+    let client = agent_net::build_guarded_client(&agent_net::HttpClientConfig::default())
+        .expect("守卫 HTTP 客户端构建失败");
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(FileRead));
     reg.register(Arc::new(FileWrite));

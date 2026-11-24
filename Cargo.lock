@@ -49,6 +49,7 @@ dependencies = [
  "agent-core",
  "reqwest",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

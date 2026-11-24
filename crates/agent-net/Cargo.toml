@@ -8,3 +8,4 @@ license.workspace = true
 agent-core.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true

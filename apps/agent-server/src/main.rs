@@ -59,7 +59,6 @@ async fn main() -> anyhow::Result<()> {
 
     let root = cfg.agent.resolved_root();
     let registry = Arc::new(agent_tools::default_tools(
-        client.clone(),
         agent_tools::SearchBackend::resolve(
             cfg.search.backend.as_deref(),
             cfg.search.searxng_endpoint.as_deref(),

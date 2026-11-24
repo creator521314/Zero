@@ -20,7 +20,7 @@
 //! 但只要能连上，副产物不成立（解析出零结果、内容不对）就算失败。
 
 use agent_core::tool::{ToolCtx, ToolError, ToolOutput};
-use agent_net::HttpClientConfig;
+
 use agent_tools::{default_tools, SearchBackend, ToolRegistry};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -88,8 +88,8 @@ impl Drop for Sandbox {
 /// 搜索后端特意用 `resolve(None, None)`（即未配置 `[search]`）——这是默认配置、
 /// 模板、配置向导都会落到的状态，也正是 `web_search` 曾经 100% 失败的场景。
 fn harness(tag: &str) -> (ToolRegistry, ToolCtx, Sandbox) {
-    let client = agent_net::build_client(&HttpClientConfig::default()).expect("客户端应能构建");
-    let reg = default_tools(client, SearchBackend::resolve(None, None));
+    // default_tools 内部自建守卫客户端（禁自动重定向 + 逐跳 SSRF 校验）。
+    let reg = default_tools(SearchBackend::resolve(None, None));
     let sb = Sandbox::new(tag);
     let ctx = ToolCtx {
         workspace: sb.private(),
