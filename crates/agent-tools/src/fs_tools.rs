@@ -554,7 +554,8 @@ mod tests {
 
     /// M2：新建文件（不存在）不应产生空快照。
     #[tokio::test]
-    async fn file_write_creates_no_snapshot_for_new_file() {        let base = std::env::temp_dir().join("agent-tools-fs-snap-new-test");
+    async fn file_write_creates_no_snapshot_for_new_file() {
+        let base = std::env::temp_dir().join("agent-tools-fs-snap-new-test");
         let proj = base.join("proj");
         let ws = base.join("workspace").join("t1");
         tokio::fs::create_dir_all(&proj).await.unwrap();

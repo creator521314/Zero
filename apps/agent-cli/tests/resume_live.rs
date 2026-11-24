@@ -20,7 +20,7 @@ use agent_runtime::runner::ApprovalMsg;
 use agent_runtime::AgentRuntime;
 use agent_store::JsonlStore;
 use agent_tools::SearchBackend;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 #[tokio::test]
 #[ignore = "真实 LLM 调用：cargo test -p agent-cli --test resume_live -- --ignored"]
@@ -63,9 +63,9 @@ async fn resumed_task_really_carries_the_previous_turn() {
     let bus = event_bus();
     agent_store::spawn_event_sink(bus.clone(), store.clone(), Default::default(), None);
 
-    let registry = Arc::new(agent_tools::default_tools(
-        SearchBackend::resolve(None, None),
-    ));
+    let registry = Arc::new(agent_tools::default_tools(SearchBackend::resolve(
+        None, None,
+    )));
     let reg = registry.clone();
     let lookup: agent_runtime::runner::ToolLookup = Arc::new(move |n: &str| reg.get(n));
     // 无人值守：不需要审批弹层，任何询问都当拒绝（这条用例本身不用工具）。

@@ -127,9 +127,7 @@ pub async fn guarded_get_with(
 
 fn check_url(url: &reqwest::Url) -> Result<(), String> {
     if is_blocked_host(url) {
-        return Err(format!(
-            "url blocked (private/localhost/non-http): {url}"
-        ));
+        return Err(format!("url blocked (private/localhost/non-http): {url}"));
     }
     Ok(())
 }
@@ -166,7 +164,10 @@ pub async fn resolve_checked(url: &reqwest::Url) -> Result<(), String> {
         return Err("URL 缺少主机名".to_string());
     };
     // IPv6 字面量在 host_str 里带方括号（url crate 行为），剥掉再判。
-    let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
     if host.parse::<IpAddr>().is_ok() {
         return Ok(());
     }
@@ -245,12 +246,12 @@ mod tests {
     fn blocks_ipv6_internal_ranges() {
         // 回归：v6 早期只拦 loopback/unspecified，ULA / 链路本地 / v4-mapped 全放行。
         for s in [
-            "http://[::1]/x",                     // loopback
-            "http://[fc00::1]/x",                 // ULA fc00::/7
-            "http://[fd12:3456::1]/x",            // ULA（fd00::/8，本地指派）
-            "http://[fe80::1]/x",                 // 链路本地
-            "http://[::ffff:10.0.0.1]/x",         // IPv4-mapped 私网
-            "http://[::ffff:127.0.0.1]/x",        // IPv4-mapped loopback
+            "http://[::1]/x",              // loopback
+            "http://[fc00::1]/x",          // ULA fc00::/7
+            "http://[fd12:3456::1]/x",     // ULA（fd00::/8，本地指派）
+            "http://[fe80::1]/x",          // 链路本地
+            "http://[::ffff:10.0.0.1]/x",  // IPv4-mapped 私网
+            "http://[::ffff:127.0.0.1]/x", // IPv4-mapped loopback
         ] {
             let u = reqwest::Url::parse(s).unwrap();
             assert!(is_blocked_host(&u), "{s} should be blocked");

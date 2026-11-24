@@ -899,16 +899,13 @@ impl AgentRuntime {
         // ToolCtx.timeout 必须真正施加：此前只是填了字段，没有任何一处
         // 用它包住 execute，一个卡住的工具（网络挂起 / 子进程不退）能把
         // 整个任务无限挂住。超时按「工具失败」回填，模型能换策略重试。
-        let executed = tokio::time::timeout(ctx.timeout, tool.execute(call.arguments.clone(), &ctx))
-            .await;
+        let executed =
+            tokio::time::timeout(ctx.timeout, tool.execute(call.arguments.clone(), &ctx)).await;
         let out = match executed {
             Ok(r) => r.map_err(AgentError::Tool)?,
             Err(_) => {
                 return Ok(ToolExecuted {
-                    content: format!(
-                        "[error] 工具执行超时（{}s），已中止",
-                        ctx.timeout.as_secs()
-                    ),
+                    content: format!("[error] 工具执行超时（{}s），已中止", ctx.timeout.as_secs()),
                     is_error: true,
                     artifacts: vec![],
                 })
@@ -2109,8 +2106,7 @@ mod tests {
     /// 明确的错误结果（而不是把 Null 当「没传参数」闷头跑一遍）。
     #[tokio::test]
     async fn malformed_tool_args_are_reported_not_silently_nulled() {
-        let tmp =
-            std::env::temp_dir().join(format!("agent-runner-badargs-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("agent-runner-badargs-{}", std::process::id()));
         let ws = tmp.join("ws");
         tokio::fs::create_dir_all(&ws).await.unwrap();
         let store = Arc::new(JsonlStore::new(&tmp));
@@ -2201,9 +2197,14 @@ mod tests {
         tx.send((b.clone(), ApprovalReply::Approve { remember: false }))
             .await
             .unwrap();
-        tx.send((a.clone(), ApprovalReply::Reject { reason: "no".into() }))
-            .await
-            .unwrap();
+        tx.send((
+            a.clone(),
+            ApprovalReply::Reject {
+                reason: "no".into(),
+            },
+        ))
+        .await
+        .unwrap();
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let ra = inbox.recv_for(&a, &cancel).await.expect("A 应拿到拒绝");
@@ -2309,8 +2310,8 @@ mod tests {
     #[tokio::test]
     async fn externalized_output_is_redacted_before_disk_write() {
         const SECRET: &str = "sk-leak-value-123456";
-        let tmp = std::env::temp_dir()
-            .join(format!("agent-runner-redact-ext-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("agent-runner-redact-ext-{}", uuid::Uuid::new_v4()));
         let ws = tmp.join("ws");
         tokio::fs::create_dir_all(&ws).await.unwrap();
         let store = Arc::new(JsonlStore::new(&tmp));

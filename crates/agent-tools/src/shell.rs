@@ -335,7 +335,8 @@ mod tests {
     }
 
     /// 中文必须活着回来：`echo` 按本地 OEM 代码页（中文 Windows = GBK）
-    /// 输出，以前硬按 UTF-8 解就是一堆 `U+FFFD`。    #[tokio::test]
+    /// 输出，以前硬按 UTF-8 解就是一堆 `U+FFFD`。
+    #[tokio::test]
     async fn chinese_output_from_builtin_is_readable() {
         let dir = std::env::temp_dir().join("agent-tools-shell-gbk-test");
         tokio::fs::create_dir_all(&dir).await.unwrap();

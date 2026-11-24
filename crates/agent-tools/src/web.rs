@@ -333,12 +333,13 @@ impl WebSearch {
                 r.map_err(|e| format!("请求失败：{e}"))?,
         };
         let status = resp.status();
-        let (bytes, _truncated) = read_body_capped(resp, MAX_FETCH_BYTES)
-            .await
-            .map_err(|e| match e {
-                ToolError::Failed(m) => m,
-                other => format!("{other:?}"),
-            })?;
+        let (bytes, _truncated) =
+            read_body_capped(resp, MAX_FETCH_BYTES)
+                .await
+                .map_err(|e| match e {
+                    ToolError::Failed(m) => m,
+                    other => format!("{other:?}"),
+                })?;
         let body = String::from_utf8_lossy(&bytes);
 
         if !status.is_success() {

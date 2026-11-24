@@ -47,15 +47,16 @@ pub fn resolve_in(base: &Path, roots: &[PathBuf], raw: &str) -> Result<PathBuf, 
     // 把已存在的最深前缀 canonicalize（跟随后符号链接）后复核；
     // 尚不存在的后缀没有链接可逃逸，词法拼接即可。
     let real = canonicalize_existing(&normalized).map_err(|e| {
-        ToolError::PathEscape(format!("path resolution failed for {}: {e}", normalized.display()))
+        ToolError::PathEscape(format!(
+            "path resolution failed for {}: {e}",
+            normalized.display()
+        ))
     })?;
     let allowed_real: Vec<PathBuf> = roots
         .iter()
         .map(|r| canonicalize_existing(r))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            ToolError::PathEscape(format!("sandbox root resolution failed: {e}"))
-        })?;
+        .map_err(|e| ToolError::PathEscape(format!("sandbox root resolution failed: {e}")))?;
     if !allowed_real.iter().any(|r| is_under(&real, r)) {
         return Err(ToolError::PathEscape(format!(
             "path escapes sandbox (symlink?): {} -> {} (allowed: {})",
@@ -219,12 +220,12 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("/etc/passwd", root.join("innocent")).unwrap();
 
-        let r = resolve_in(&root, &[root.clone()], "innocent");
+        let r = resolve_in(&root, std::slice::from_ref(&root), "innocent");
         assert!(r.is_err(), "symlink 逃逸必须被拒: {r:?}");
 
         // 指向沙箱内的链接应放行。
         std::os::unix::fs::symlink("real.txt", root.join("inside")).unwrap();
-        let ok = resolve_in(&root, &[root.clone()], "inside").unwrap();
+        let ok = resolve_in(&root, std::slice::from_ref(&root), "inside").unwrap();
         assert!(ok.starts_with(std::fs::canonicalize(&root).unwrap()));
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -236,7 +237,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("agent-paths-new-{}", std::process::id()));
         let root = base.join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        let got = resolve_in(&root, &[root.clone()], "sub/new.txt").unwrap();
+        let got = resolve_in(&root, std::slice::from_ref(&root), "sub/new.txt").unwrap();
         assert!(got.ends_with("sub/new.txt"), "实际: {got:?}");
         std::fs::remove_dir_all(&base).unwrap();
     }
