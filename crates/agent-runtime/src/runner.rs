@@ -32,6 +32,9 @@ use crate::context::{ContextConfig, ContextManager};
 /// 执行循环据此回填一条明确错误（而不是把 Null 当「没传参数」静默执行）。
 const MALFORMED_ARGS_KEY: &str = "__malformed_args_error";
 
+/// 单个工具调用的执行超时。超过即按失败回填，模型可换策略。
+const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// 审批应答。
 #[derive(Debug, Clone)]
 pub enum ApprovalReply {
@@ -889,14 +892,28 @@ impl AgentRuntime {
             workspace: std::path::PathBuf::from(&task.workspace),
             project_root: task.project_root.as_ref().map(std::path::PathBuf::from),
             task_id: task.id.0.clone(),
-            timeout: Duration::from_secs(120),
+            timeout: TOOL_TIMEOUT,
             cancel: cancel.clone(),
         };
 
-        let out = tool
-            .execute(call.arguments.clone(), &ctx)
-            .await
-            .map_err(AgentError::Tool)?;
+        // ToolCtx.timeout 必须真正施加：此前只是填了字段，没有任何一处
+        // 用它包住 execute，一个卡住的工具（网络挂起 / 子进程不退）能把
+        // 整个任务无限挂住。超时按「工具失败」回填，模型能换策略重试。
+        let executed = tokio::time::timeout(ctx.timeout, tool.execute(call.arguments.clone(), &ctx))
+            .await;
+        let out = match executed {
+            Ok(r) => r.map_err(AgentError::Tool)?,
+            Err(_) => {
+                return Ok(ToolExecuted {
+                    content: format!(
+                        "[error] 工具执行超时（{}s），已中止",
+                        ctx.timeout.as_secs()
+                    ),
+                    is_error: true,
+                    artifacts: vec![],
+                })
+            }
+        };
 
         let arts: Vec<String> = out.side_effects.iter().map(|a| a.path.clone()).collect();
 
