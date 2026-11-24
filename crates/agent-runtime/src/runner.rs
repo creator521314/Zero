@@ -797,20 +797,25 @@ impl AgentRuntime {
 
         let arts: Vec<String> = out.side_effects.iter().map(|a| a.path.clone()).collect();
 
+        // 脱敏必须在外置落盘**之前**：外置文件写的是原文的话，明文密钥
+        // 会永久留在 ctx/*.txt，而下游只对回填模型的 500 字符摘要做脱敏，
+        // 外置文件本身永远不会过脱敏管道。先脱敏，再外置。
+        let redacted = (self.deps.redact)(&out.content);
+
         // 大输出外置
-        let content = if cm.should_externalize(out.content.len()) {
+        let content = if cm.should_externalize(redacted.len()) {
             let ctxdir = std::path::Path::new(&task.workspace).join("ctx");
             let _ = tokio::fs::create_dir_all(&ctxdir).await;
             let fname = format!("{}.txt", uuid::Uuid::new_v4());
             let fpath = ctxdir.join(&fname);
-            let _ = tokio::fs::write(&fpath, out.content.as_bytes()).await;
-            let snippet: String = out.content.chars().take(500).collect();
+            let _ = tokio::fs::write(&fpath, redacted.as_bytes()).await;
+            let snippet: String = redacted.chars().take(500).collect();
             format!(
                 "[输出已外置到 ctx/{fname}，共 {} 字节] 摘要：{snippet}",
-                out.content.len()
+                redacted.len()
             )
         } else {
-            out.content.clone()
+            redacted.clone()
         };
 
         let content = if out.is_error {
@@ -1000,6 +1005,36 @@ mod tests {
             _ctx: &ToolCtx,
         ) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::ok("token=sk-leak-value-123456 done"))
+        }
+    }
+
+    /// 输出超过外置阈值（8KB）的泄漏工具：验证外置文件也经过脱敏。
+    struct HugeLeakyTool;
+
+    #[async_trait]
+    impl Tool for HugeLeakyTool {
+        fn name(&self) -> &str {
+            "huge_leaky"
+        }
+        fn description(&self) -> &str {
+            "返回一段超长且带密钥的文本"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn risk_level(&self) -> Risk {
+            Risk::Low
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            // 9KB 填充 + 末尾的密钥行：外置后密钥只存在于文件里，不在摘要里。
+            let filler = "x".repeat(9 * 1024);
+            Ok(ToolOutput::ok(format!(
+                "{filler}\ntoken=sk-leak-value-123456"
+            )))
         }
     }
 
@@ -1911,6 +1946,79 @@ mod tests {
             !model_saw.contains(SECRET),
             "模型上下文里不能有密钥: {model_saw}"
         );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// 外置到 ctx/*.txt 的大输出也必须先脱敏再落盘。
+    ///
+    /// 回归：外置发生在脱敏之前，超阈值输出把明文密钥写进外置文件，
+    /// 而下游只对回填模型的摘要脱敏——文件里的密钥永不清理。
+    #[tokio::test]
+    async fn externalized_output_is_redacted_before_disk_write() {
+        const SECRET: &str = "sk-leak-value-123456";
+        let tmp = std::env::temp_dir()
+            .join(format!("agent-runner-redact-ext-{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+        let (_ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(1);
+
+        let defs = vec![ToolDef {
+            name: "huge_leaky".into(),
+            description: "huge_leaky".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: Arc::new(ScriptedProvider {
+                turns: Mutex::new(vec![
+                    vec![
+                        tool_call(0, "c1", "huge_leaky"),
+                        StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                    ],
+                    vec![
+                        StreamEvent::TextDelta("完成".into()),
+                        StreamEvent::Done(agent_core::provider::FinishReason::Stop),
+                    ],
+                ]),
+            }),
+            provider_name: "scripted".into(),
+            tools: Arc::new(|name: &str| {
+                (name == "huge_leaky").then(|| Arc::new(HugeLeakyTool) as Arc<dyn Tool>)
+            }),
+            tool_defs: defs,
+            perm: Arc::new(AllowAll),
+            store,
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(Mutex::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            per_task_budget: 0.0,
+            cost_sink: None,
+            redact: Arc::new(|s: &str| s.replace(SECRET, "<redacted>")),
+        });
+
+        let bus = event_bus();
+        let mut spec = TaskSpec::new("外置脱敏", ws.display().to_string());
+        spec.max_iterations = 3;
+        let _ = runtime.run(spec, bus, RunControl::new()).await;
+
+        // 外置目录里必须有文件，且任何文件都不含明文密钥。
+        let ctxdir = ws.join("ctx");
+        let mut found_any = false;
+        let mut rd = tokio::fs::read_dir(&ctxdir).await.expect("ctx 目录应存在");
+        while let Some(entry) = rd.next_entry().await.unwrap() {
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("txt") {
+                continue;
+            }
+            found_any = true;
+            let body = tokio::fs::read_to_string(entry.path()).await.unwrap();
+            assert!(
+                !body.contains(SECRET),
+                "外置文件 {} 里有明文密钥",
+                entry.path().display()
+            );
+        }
+        assert!(found_any, "应有外置文件产生");
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
