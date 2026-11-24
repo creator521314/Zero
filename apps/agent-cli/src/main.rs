@@ -17,7 +17,7 @@ use agent_providers::ProviderRouter;
 use agent_providers::ProvidersFile;
 use agent_store::JsonlStore;
 use agent_tui::{run_tui, App};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 /// 把「从哪个历史任务接上」落成实际上下文。
 ///
@@ -233,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 全局限量通道：审批应答（单例，被所有任务共享）
     let (ap_tx, ap_rx) = mpsc::channel::<agent_runtime::runner::ApprovalMsg>(16);
-    let approvals = Arc::new(Mutex::new(ap_rx));
+    let approvals = Arc::new(agent_runtime::runner::ApprovalInbox::new(ap_rx));
 
     let bus = event_bus();
 

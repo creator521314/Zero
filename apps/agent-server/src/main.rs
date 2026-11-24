@@ -16,7 +16,7 @@ use agent_providers::wizard;
 use agent_providers::ProviderRouter;
 use agent_providers::ProvidersFile;
 use agent_store::JsonlStore;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
         perm,
         store: store.clone(),
         log_cfg: cfg.log.clone(),
-        approvals: Arc::new(Mutex::new(ap_rx)),
+        approvals: Arc::new(agent_runtime::runner::ApprovalInbox::new(ap_rx)),
         context_cfg: Default::default(),
         per_task_budget: router.per_task_limit(),
         // 每轮成本报到账本，月度熔断才有数据可判。

@@ -61,6 +61,82 @@ pub type ApprovalMsg = (ApprovalId, ApprovalReply);
 /// 流式解析中累积的工具调用参数。
 type ToolAccum = std::collections::BTreeMap<usize, (Option<ToolCallId>, Option<String>, String)>;
 
+/// 审批应答收件箱。
+///
+/// 多任务共用一条应答通道，应答可能以**任意顺序**到达（用户在任务 A 的
+/// 弹窗上点了「批准」而任务 B 正在等自己的应答）。直接把 ID 不匹配的
+/// 应答丢掉会让它对应的任务永远等待——这里改为暂存到 pending，
+/// 由后续 `recv_for(同一 ID)` 取走。
+pub struct ApprovalInbox {
+    rx: Mutex<mpsc::Receiver<ApprovalMsg>>,
+    /// 已到达但对应任务还没来取的应答（ID → 应答）。
+    pending: Mutex<std::collections::HashMap<ApprovalId, ApprovalReply>>,
+}
+
+impl ApprovalInbox {
+    pub fn new(rx: mpsc::Receiver<ApprovalMsg>) -> Self {
+        Self {
+            rx: Mutex::new(rx),
+            pending: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 等待 `id` 对应的应答；先前被「错配」暂存的应答会被优先取走。
+    pub async fn recv_for(
+        &self,
+        id: &ApprovalId,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<ApprovalReply, AgentError> {
+        // 先看暂存区：错配到达过的应答不能再错过。
+        if let Some(reply) = self.pending.lock().await.remove(id) {
+            tracing::info!(approval = %id.0, "approval reply taken from pending buffer");
+            return Ok(reply);
+        }
+
+        let mut rx = self.rx.lock().await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    tracing::warn!(approval = %id.0, "approval wait cancelled");
+                    return Err(AgentError::Cancelled);
+                }
+                msg = rx.recv() => {
+                    match msg {
+                        Some((got, reply)) if got == *id => {
+                            tracing::info!(
+                                approval = %id.0,
+                                reply = ?reply,
+                                "approval reply received"
+                            );
+                            return Ok(reply);
+                        }
+                        Some((got, reply)) => {
+                            // 应答属于另一个审批：暂存，等那个任务来取。
+                            tracing::warn!(
+                                got = %got.0,
+                                want = %id.0,
+                                "approval reply buffered for another approval"
+                            );
+                            let mut pending = self.pending.lock().await;
+                            // 上限保护：应答都有时效，超量时整体清空即可。
+                            if pending.len() >= 64 {
+                                pending.clear();
+                            }
+                            pending.insert(got, reply);
+                            continue;
+                        }
+                        None => {
+                            tracing::error!(approval = %id.0, "approval channel closed");
+                            return Err(AgentError::Internal("approval channel closed".into()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// 运行时依赖。
 pub struct RuntimeDeps {
     pub provider: Arc<dyn LlmProvider>,
@@ -72,8 +148,8 @@ pub struct RuntimeDeps {
     pub store: Arc<JsonlStore>,
     /// 审计日志落盘策略：决定上下文快照与逐字增量的去留。
     pub log_cfg: LogConfig,
-    /// 审批应答接收端（一次一个，由前端回填）。
-    pub approvals: Arc<Mutex<mpsc::Receiver<ApprovalMsg>>>,
+    /// 审批应答收件箱（多任务共用，错配应答会被暂存而不是丢弃）。
+    pub approvals: Arc<ApprovalInbox>,
     pub context_cfg: ContextConfig,
     /// 单任务预算（USD）；`<= 0` 表示不限。
     pub per_task_budget: f64,
@@ -790,41 +866,7 @@ impl AgentRuntime {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<ApprovalReply, AgentError> {
         tracing::info!(approval = %approval_id.0, "waiting for approval reply");
-        let mut rx = self.deps.approvals.lock().await;
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    tracing::warn!(approval = %approval_id.0, "approval wait cancelled");
-                    return Err(AgentError::Cancelled);
-                }
-                msg = rx.recv() => {
-                    match msg {
-                        Some((id, reply)) if id == *approval_id => {
-                            tracing::info!(
-                                approval = %approval_id.0,
-                                reply = ?reply,
-                                "approval reply received"
-                            );
-                            return Ok(reply);
-                        }
-                        Some((id, _)) => {
-                            // 通常意味着前端把应答发给了另一个审批（ID 错配）。
-                            tracing::warn!(
-                                got = %id.0,
-                                want = %approval_id.0,
-                                "stale approval reply dropped"
-                            );
-                            continue;
-                        }
-                        None => {
-                            tracing::error!(approval = %approval_id.0, "approval channel closed");
-                            return Err(AgentError::Internal("approval channel closed".into()));
-                        }
-                    }
-                }
-            }
-        }
+        self.deps.approvals.recv_for(approval_id, cancel).await
     }
 
     /// 执行工具（含外置与超时）。
@@ -1281,7 +1323,7 @@ mod tests {
             perm: Arc::new(AllowAll),
             store: store.clone(),
             log_cfg,
-            approvals: Arc::new(Mutex::new(ap_rx)),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
@@ -1337,7 +1379,7 @@ mod tests {
             perm: Arc::new(AllowAll),
             store: store.clone(),
             log_cfg: LogConfig::default(),
-            approvals: Arc::new(Mutex::new(ap_rx)),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
@@ -1694,7 +1736,7 @@ mod tests {
             perm: Arc::new(AskAll),
             store: store.clone(),
             log_cfg: LogConfig::default(),
-            approvals: Arc::new(Mutex::new(ap_rx)),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
@@ -1884,7 +1926,7 @@ mod tests {
             perm: engine,
             store,
             log_cfg: LogConfig::default(),
-            approvals: Arc::new(Mutex::new(ap_rx)),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
@@ -1957,7 +1999,7 @@ mod tests {
             perm: Arc::new(AskAll),
             store,
             log_cfg: LogConfig::default(),
-            approvals: Arc::new(Mutex::new(ap_rx)),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: Some(Arc::new(move |cost: f64| {
@@ -2023,7 +2065,7 @@ mod tests {
             perm: Arc::new(AskAll),
             store,
             log_cfg: LogConfig::default(),
-            approvals: Arc::new(Mutex::new(ap_rx)),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: Some(Arc::new(move |c: f64| {
@@ -2091,7 +2133,7 @@ mod tests {
             perm: Arc::new(AllowAll),
             store,
             log_cfg: LogConfig::default(),
-            approvals: Arc::new(Mutex::new(ap_rx)),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
@@ -2127,6 +2169,30 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// 应答顺序与等待顺序错配时：错配应答必须暂存，等对应任务来取——
+    /// 直接丢弃会让那个任务永远等下去（多任务共用一个通道时的真实竞态）。
+    #[tokio::test]
+    async fn mismatched_approval_reply_is_buffered_not_lost() {
+        let (tx, rx) = mpsc::channel::<ApprovalMsg>(4);
+        let inbox = ApprovalInbox::new(rx);
+        let a = ApprovalId("approval-a".into());
+        let b = ApprovalId("approval-b".into());
+
+        // B 的应答先到，而 A 在等：A 不能把 B 的应答当成自己的，也不能丢掉。
+        tx.send((b.clone(), ApprovalReply::Approve { remember: false }))
+            .await
+            .unwrap();
+        tx.send((a.clone(), ApprovalReply::Reject { reason: "no".into() }))
+            .await
+            .unwrap();
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ra = inbox.recv_for(&a, &cancel).await.expect("A 应拿到拒绝");
+        assert!(matches!(ra, ApprovalReply::Reject { .. }), "{ra:?}");
+        let rb = inbox.recv_for(&b, &cancel).await.expect("B 的应答应已暂存");
+        assert!(matches!(rb, ApprovalReply::Approve { .. }), "{rb:?}");
     }
 
     /// 工具输出里的密钥必须在**回填模型之前**与**落盘之前**被替换。
@@ -2168,7 +2234,7 @@ mod tests {
             perm: Arc::new(AllowAll),
             store,
             log_cfg: LogConfig::default(),
-            approvals: Arc::new(Mutex::new(ap_rx)),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
@@ -2259,7 +2325,7 @@ mod tests {
             perm: Arc::new(AllowAll),
             store,
             log_cfg: LogConfig::default(),
-            approvals: Arc::new(Mutex::new(ap_rx)),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
@@ -2336,7 +2402,7 @@ mod tests {
             perm: Arc::new(AskAll),
             store,
             log_cfg: LogConfig::default(),
-            approvals: Arc::new(Mutex::new(ap_rx)),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,
@@ -2518,7 +2584,7 @@ mod tests {
             perm: Arc::new(AllowAll),
             store: store.clone(),
             log_cfg: LogConfig::default(),
-            approvals: Arc::new(Mutex::new(ap_rx)),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
             context_cfg: ContextConfig::default(),
             per_task_budget: 0.0,
             cost_sink: None,

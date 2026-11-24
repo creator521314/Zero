@@ -83,7 +83,7 @@ async fn resumed_task_really_carries_the_previous_turn() {
         perm,
         store: store.clone(),
         log_cfg: Default::default(),
-        approvals: Arc::new(Mutex::new(ap_rx)),
+        approvals: Arc::new(agent_runtime::runner::ApprovalInbox::new(ap_rx)),
         context_cfg: Default::default(),
         per_task_budget: 0.0,
         cost_sink: None,
