@@ -4,7 +4,7 @@
 //! 2. 摘要层：更早轮次滚动摘要（本期实现为按轮次裁剪 + 系统固定区）；
 //! 3. 文件外置层：超大工具输出写入 ctx/，上下文只留摘要 + 路径。
 
-use agent_core::provider::Message;
+use agent_core::provider::{Message, Role};
 
 /// 上下文配置。
 #[derive(Debug, Clone)]
@@ -79,7 +79,17 @@ impl ContextManager {
             return;
         }
         // 需要裁掉的最旧对话消息条数
-        let to_drop = dialog_count - self.cfg.keep_recent;
+        let mut to_drop = dialog_count - self.cfg.keep_recent;
+        // 裁剪点不能落在 assistant(tool_calls) 与其 tool 结果之间：孤儿 tool
+        // 消息会让下一轮请求被 OpenAI 兼容端点直接 400（tool 消息找不到
+        // 对应的 assistant tool_call）。若裁剪点正好是 tool 消息，向前回退
+        // 到配对的 assistant，把整组留在保留窗口里。
+        while to_drop > 0 && self.messages[1 + to_drop].role == Role::Tool {
+            to_drop -= 1;
+        }
+        if to_drop == 0 {
+            return;
+        }
         // 从索引 1 开始裁剪，保留最后 keep_recent 条
         let drained: Vec<Message> = self.messages.drain(1..1 + to_drop).collect();
         let mut digest = String::new();
@@ -141,5 +151,69 @@ mod tests {
         assert!(sys.contains("历史摘要"));
         // 保留下来的最近消息数
         assert!(cm.messages().len() <= 3);
+    }
+
+    /// 裁剪点落在 assistant(tool_calls) 与其 tool 结果之间时，必须整组保留。
+    ///
+    /// 回归：按条数硬裁会产生「孤儿 tool 消息」——下一轮请求里 tool 消息
+    /// 找不到对应的 assistant.tool_calls，OpenAI 兼容端点直接 400。
+    #[test]
+    fn compress_never_orphans_tool_messages() {
+        use agent_core::ids::ToolCallId;
+        use agent_core::provider::{ContentPart, ToolCall};
+
+        let cfg = ContextConfig {
+            keep_recent: 1,
+            ..Default::default()
+        };
+        let mut cm = ContextManager::new(cfg, "SYS");
+        cm.push(Message::user("u1"));
+        // assistant 发起工具调用 + 两条 tool 结果
+        let call_a = ToolCallId::new();
+        let call_b = ToolCallId::new();
+        cm.push(Message {
+            role: Role::Assistant,
+            content: vec![],
+            tool_calls: vec![
+                ToolCall {
+                    id: call_a.clone(),
+                    name: "t".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: call_b.clone(),
+                    name: "t".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+            tool_call_id: None,
+            reasoning: None,
+        });
+        for id in [&call_a, &call_b] {
+            cm.push(Message {
+                role: Role::Tool,
+                content: vec![ContentPart::text("ok")],
+                tool_calls: vec![],
+                tool_call_id: Some(id.clone()),
+                reasoning: None,
+            });
+        }
+        cm.push(Message::user("u2"));
+        cm.push(Message::assistant("a2"));
+
+        cm.compress();
+
+        let msgs = cm.messages();
+        // 压缩后第一条对话消息不能是 tool（否则就是孤儿）。
+        assert_ne!(msgs[1].role, Role::Tool, "裁剪点切在了 tool 消息之前");
+        // 每个 tool 消息都能在保留窗口里找到配对的 assistant tool_call。
+        let kept_ids: Vec<_> = msgs
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().map(|c| c.id.clone()))
+            .collect();
+        for m in msgs.iter().filter(|m| m.role == Role::Tool) {
+            let id = m.tool_call_id.as_ref().expect("tool 消息应有 tool_call_id");
+            assert!(kept_ids.contains(id), "孤儿 tool 消息: {id:?}");
+        }
     }
 }
