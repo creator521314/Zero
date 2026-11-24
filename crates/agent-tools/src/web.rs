@@ -7,6 +7,33 @@ use serde_json::json;
 
 use crate::paths::resolve_in_ctx;
 
+/// web_fetch 单次响应体上限（字节）：超出即截断，不把大文件整读进内存。
+const MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
+
+/// 流式读取响应体，最多 `limit` 字节；返回 `(内容, 是否截断)`。
+///
+/// 用 `chunk()` 增量读取而不是 `bytes()` 全量缓冲：后者会先把整个响应体读进
+/// 内存再截断，恶意服务器返回一个大文件就能把进程内存打满。
+async fn read_body_capped(
+    mut resp: reqwest::Response,
+    limit: usize,
+) -> Result<(Vec<u8>, bool), ToolError> {
+    let mut out = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| ToolError::Failed(format!("read body: {e}")))?
+    {
+        if out.len() + chunk.len() > limit {
+            let take = limit - out.len();
+            out.extend_from_slice(&chunk[..take]);
+            return Ok((out, true));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok((out, false))
+}
+
 /// 抓取网页正文（简化：取纯文本，去除标签）。
 pub struct WebFetch {
     client: reqwest::Client,
@@ -53,7 +80,9 @@ impl Tool for WebFetch {
         let max_bytes = args
             .get("max_bytes")
             .and_then(|v| v.as_u64())
-            .unwrap_or(200_000) as usize;
+            .unwrap_or(200_000)
+            // 模型可传任意值：过小读不到正文，过大等于没有上限。
+            .clamp(1_024, MAX_FETCH_BYTES as u64) as usize;
 
         let parsed = reqwest::Url::parse(url)
             .map_err(|e| ToolError::InvalidArgs(format!("bad url: {e}")))?;
@@ -67,18 +96,19 @@ impl Tool for WebFetch {
                 r.map_err(ToolError::Failed)?,
         };
         let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| ToolError::Failed(format!("read body: {e}")))?;
-        let truncated = &bytes[..bytes.len().min(max_bytes)];
-        let text = String::from_utf8_lossy(truncated);
+        // 流式读取到上限即停：`resp.bytes()` 会先把整个响应读进内存再截断，
+        // 恶意服务器（或一个大的二进制文件）可以直接把进程内存打满。
+        let (bytes, body_truncated) = read_body_capped(resp, max_bytes).await?;
+        let text = String::from_utf8_lossy(&bytes);
         let plain = strip_html(&text);
 
-        let body = format!(
+        let mut body = format!(
             "HTTP {status}\nURL: {url}\n\n{}",
             plain.chars().take(8000).collect::<String>()
         );
+        if body_truncated {
+            body.push_str(&format!("\n\n[响应超过 {max_bytes} 字节，已截断]"));
+        }
 
         let mut out = ToolOutput::ok(body);
         if let Some(save) = args.get("save_as").and_then(|v| v.as_str()) {
@@ -303,10 +333,12 @@ impl WebSearch {
                 r.map_err(|e| format!("请求失败：{e}"))?,
         };
         let status = resp.status();
-        let bytes = resp
-            .bytes()
+        let (bytes, _truncated) = read_body_capped(resp, MAX_FETCH_BYTES)
             .await
-            .map_err(|e| format!("读取响应失败：{e}"))?;
+            .map_err(|e| match e {
+                ToolError::Failed(m) => m,
+                other => format!("{other:?}"),
+            })?;
         let body = String::from_utf8_lossy(&bytes);
 
         if !status.is_success() {
