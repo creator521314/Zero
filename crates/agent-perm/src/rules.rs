@@ -87,6 +87,7 @@ impl StaticRules {
         tool_risk.insert("web_search", Risk::Low);
         tool_risk.insert("file_write", Risk::Medium);
         tool_risk.insert("file_edit", Risk::Medium);
+        tool_risk.insert("file_restore", Risk::Medium);
         tool_risk.insert("web_fetch", Risk::Medium);
         tool_risk.insert("shell_exec", Risk::High);
 
@@ -129,8 +130,11 @@ impl StaticRules {
             }
         }
 
-        // 2) 受保护路径写入
-        if matches!(call.name.as_str(), "file_write" | "file_edit") {
+        // 2) 受保护路径写入（file_restore 恢复目标同样算写入）
+        if matches!(
+            call.name.as_str(),
+            "file_write" | "file_edit" | "file_restore"
+        ) {
             if let Some(p) = call.arguments.get("path").and_then(|v| v.as_str()) {
                 if self.is_protected(p) {
                     return RuleMatch::Hit {

@@ -1,4 +1,4 @@
-//! 文件系统工具：file_read / file_write / file_edit / list_dir。
+//! 文件系统工具：file_read / file_write / file_edit / file_restore / list_dir。
 
 use agent_core::perm::Risk;
 use agent_core::tool::{Artifact, Tool, ToolCtx, ToolError, ToolOutput};
@@ -258,6 +258,143 @@ impl Tool for ListDir {
     }
 }
 
+/// 把 `path` 相对沙箱根的路径编码成快照名的 label 部分。
+///
+/// 目录分隔符替换成 `_`（快照名必须是单级文件名），截断到 80 字符防超长。
+/// `file_restore` 按同样的规则重建 label 来匹配某文件的快照。
+fn snapshot_label(ctx: &ToolCtx, target: &std::path::Path) -> String {
+    let base = target.strip_prefix(
+        ctx.project_root
+            .as_deref()
+            .unwrap_or(ctx.workspace.as_path()),
+    );
+    let base = base.unwrap_or(target);
+    let label: String = base
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .collect::<String>()
+        .chars()
+        .take(80)
+        .collect();
+    if label.is_empty() {
+        "file".to_string()
+    } else {
+        label
+    }
+}
+
+/// 快照回滚：把某文件在 `snapshots/` 里的备份写回原位置。
+///
+/// 用法：`{"path": "README.md"}` 恢复到最近一次覆写前的版本；
+/// `{"path": "README.md", "snapshot": "README.md.171...3"}` 恢复到指定版本。
+/// 恢复动作本身也会先把**当前内容**快照，所以回滚是可逆的。
+pub struct FileRestore;
+
+/// 快照名（`label.ts.seq`）按时间排序用的时间戳：取倒数第二段数字。
+fn snapshot_ts(name: &str) -> u128 {
+    name.rsplit('.')
+        .nth(1)
+        .and_then(|s| s.parse::<u128>().ok())
+        .unwrap_or(0)
+}
+
+#[async_trait]
+impl Tool for FileRestore {
+    fn name(&self) -> &str {
+        "file_restore"
+    }
+    fn description(&self) -> &str {
+        "把文件恢复到某次覆写前的快照版本（file_write/file_edit 覆写前的旧内容会自动备份到 snapshots/）。不带 snapshot 参数时恢复最近一次备份。"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "要恢复的文件路径（相对工作区/项目根）" },
+                "snapshot": { "type": "string", "description": "具体快照文件名（可选；缺省=最近一次）。可先 list_dir \"snapshots/\" 查看" }
+            },
+            "required": ["path"]
+        })
+    }
+    fn risk_level(&self) -> Risk {
+        Risk::Medium
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidArgs("missing 'path'".into()))?;
+        let target = resolve_in_ctx(ctx, path)?;
+
+        let dir = ctx.workspace.join("snapshots");
+        let label = snapshot_label(ctx, &target);
+
+        // 收集该文件的所有快照，按时间从旧到新。
+        let snaps: Vec<String> = match tokio::fs::read_dir(&dir).await {
+            Ok(mut rd) => {
+                let mut v = Vec::new();
+                while let Some(e) = rd.next_entry().await? {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with(&format!("{label}.")) {
+                        v.push(name);
+                    }
+                }
+                v.sort_by_key(|n| snapshot_ts(n));
+                v
+            }
+            Err(_) => Vec::new(),
+        };
+        if snaps.is_empty() {
+            return Ok(ToolOutput::err(format!(
+                "{path} 没有任何快照（只有 file_write/file_edit 覆写已存在的文件时才会产生备份）"
+            )));
+        }
+
+        // 选快照：指定名必须存在；否则取最新。
+        let chosen = match args.get("snapshot").and_then(|v| v.as_str()) {
+            Some(name) => {
+                if !snaps.iter().any(|s| s == name) {
+                    return Ok(ToolOutput::err(format!(
+                        "快照 {name} 不存在。{path} 的可用快照：\n{}",
+                        snaps.join("\n")
+                    )));
+                }
+                name.to_string()
+            }
+            None => snaps.last().unwrap().clone(),
+        };
+
+        let snap_path = dir.join(&chosen);
+        let old = tokio::fs::read(&snap_path)
+            .await
+            .map_err(|e| ToolError::Failed(format!("read snapshot: {e}")))?;
+
+        // 恢复前把当前内容也快照：误恢复可再滚回去。
+        if let Ok(cur) = tokio::fs::read(&target).await {
+            snapshot_before_write(ctx, &target, &cur).await?;
+        }
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&target, &old).await?;
+
+        let mut msg = format!(
+            "restored {path} from snapshot {chosen} ({} bytes); 剩余 {} 个更早的快照可继续回滚",
+            old.len(),
+            snaps.iter().position(|s| *s == chosen).unwrap_or(0)
+        );
+        // 提示可用 list_dir 自己看快照目录。
+        msg.push_str("\n可用 list_dir 查看 snapshots/ 目录了解全部备份。");
+        Ok(ToolOutput::ok(msg))
+    }
+}
+
 /// 覆写前把旧内容备份到私有工作区的 `snapshots/`（临时，支持回滚）。
 ///
 /// 快照落在 `ctx.workspace/snapshots/` 而非项目根，避免污染用户仓库。
@@ -277,26 +414,7 @@ async fn snapshot_before_write(
     //   会互相覆盖；
     // - 毫秒时间戳：同一毫秒内的两次覆写会撞名，旧快照被静默覆盖；
     // - 序号兜底保证任何情况下快照不重名。
-    let base = target
-        .strip_prefix(
-            ctx.project_root
-                .as_deref()
-                .unwrap_or(ctx.workspace.as_path()),
-        )
-        .unwrap_or(target);
-    let label: String = base
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
-        .collect::<String>()
-        .chars()
-        .take(80)
-        .collect();
-    let label = if label.is_empty() {
-        "file".to_string()
-    } else {
-        label
-    };
+    let label = snapshot_label(ctx, target);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -574,6 +692,100 @@ mod tests {
             !snap_dir.exists(),
             "新建文件不应产生快照目录: {:?}",
             snap_dir
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// file_restore：默认恢复最近一次覆写前的内容；恢复动作本身也先快照
+    /// （回滚可逆）；再滚一步能拿回被恢复前的那版。
+    #[tokio::test]
+    async fn file_restore_reverts_and_is_itself_reversible() {
+        let base = std::env::temp_dir().join("agent-tools-fs-restore-test");
+        let proj = base.join("proj");
+        let ws = base.join("workspace").join("t1");
+        tokio::fs::create_dir_all(&proj).await.unwrap();
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::write(proj.join("doc.txt"), "v1").await.unwrap();
+
+        let c = ctx(Some(&proj), &ws);
+        FileWrite
+            .execute(json!({ "path": "doc.txt", "content": "v2" }), &c)
+            .await
+            .unwrap();
+        FileWrite
+            .execute(json!({ "path": "doc.txt", "content": "v3" }), &c)
+            .await
+            .unwrap();
+
+        // 无 snapshot 参数 → 恢复到最近一次覆写前（v2）。
+        let out = FileRestore
+            .execute(json!({ "path": "doc.txt" }), &c)
+            .await
+            .unwrap();
+        assert!(out.content.contains("restored"), "{}", out.content);
+        let body = tokio::fs::read_to_string(proj.join("doc.txt"))
+            .await
+            .unwrap();
+        assert_eq!(body, "v2", "应恢复到最近一次覆写前的 v2");
+
+        // 再滚一步（恢复动作先快照了 v3，所以有 3 份快照：v1/v2/v3），
+        // 指定最早的快照 → 回到 v1。
+        let mut snaps: Vec<String> = Vec::new();
+        let mut rd = tokio::fs::read_dir(ws.join("snapshots")).await.unwrap();
+        while let Some(e) = rd.next_entry().await.unwrap() {
+            snaps.push(e.file_name().to_string_lossy().to_string());
+        }
+        assert_eq!(snaps.len(), 3, "v1/v2 快照 + 恢复时对 v3 的快照: {snaps:?}");
+        snaps.sort_by_key(|n| snapshot_ts(n));
+        let oldest = snaps.first().unwrap().clone();
+        FileRestore
+            .execute(json!({ "path": "doc.txt", "snapshot": oldest }), &c)
+            .await
+            .unwrap();
+        let body = tokio::fs::read_to_string(proj.join("doc.txt"))
+            .await
+            .unwrap();
+        assert_eq!(body, "v1", "指定快照应恢复到最早的 v1");
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// 没有快照时给出可操作的错误，而不是泛泛的 not found。
+    #[tokio::test]
+    async fn file_restore_without_snapshots_explains_why() {
+        let base = std::env::temp_dir().join("agent-tools-fs-restore-none-test");
+        let proj = base.join("proj");
+        let ws = base.join("workspace").join("t1");
+        tokio::fs::create_dir_all(&proj).await.unwrap();
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::write(proj.join("a.txt"), "x").await.unwrap();
+
+        let c = ctx(Some(&proj), &ws);
+        let out = FileRestore
+            .execute(json!({ "path": "a.txt" }), &c)
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("没有任何快照") && out.content.contains("a.txt"),
+            "错误要说明原因: {}",
+            out.content
+        );
+
+        // 指定不存在的快照名 → 列出可用快照。
+        tokio::fs::write(proj.join("a.txt"), "y").await.unwrap();
+        FileWrite
+            .execute(json!({ "path": "a.txt", "content": "z" }), &c)
+            .await
+            .unwrap();
+        let out = FileRestore
+            .execute(json!({ "path": "a.txt", "snapshot": "nope.0.0" }), &c)
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("可用快照"),
+            "应列出可用快照: {}",
+            out.content
         );
 
         let _ = tokio::fs::remove_dir_all(&base).await;

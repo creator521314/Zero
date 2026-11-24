@@ -7,7 +7,7 @@ use agent_core::provider::ToolDef;
 use agent_core::tool::Tool;
 
 use crate::finish::Finish;
-use crate::fs_tools::{FileEdit, FileRead, FileWrite, ListDir};
+use crate::fs_tools::{FileEdit, FileRead, FileRestore, FileWrite, ListDir};
 use crate::shell::ShellExec;
 use crate::web::{SearchBackend, WebFetch, WebSearch};
 
@@ -67,6 +67,7 @@ pub fn default_tools(search_backends: Vec<SearchBackend>) -> ToolRegistry {
     reg.register(Arc::new(FileRead));
     reg.register(Arc::new(FileWrite));
     reg.register(Arc::new(FileEdit));
+    reg.register(Arc::new(FileRestore));
     reg.register(Arc::new(ListDir));
     reg.register(Arc::new(ShellExec));
     reg.register(Arc::new(WebFetch::new(client.clone())));

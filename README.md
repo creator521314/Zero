@@ -182,11 +182,12 @@ save_stream_deltas = false   # 逐字增量（开着日志会大一数量级）
 
 ## 工具
 
-内置 8 个工具：
+内置 9 个工具：
 
 | 工具 | 用途 |
 |---|---|
 | `file_read` / `file_write` / `file_edit` | 读写/编辑文件；覆写前自动快照 |
+| `file_restore` | 把文件恢复到某次覆写前的快照版本（回滚） |
 | `list_dir` | 列目录（读目录时提示改用此工具） |
 | `shell_exec` | 执行命令 |
 | `web_fetch` / `web_search` | 联网抓取 / 搜索 |
@@ -204,7 +205,11 @@ save_stream_deltas = false   # 逐字增量（开着日志会大一数量级）
   工具输出在回填模型与落盘前还会按已知密钥值做一次替换（`<redacted>`）。
 - `file_write` / `file_edit` 覆写前把旧内容备份到私有工作区 `snapshots/`
   （`<相对路径>.<纳秒>.<序号>`，不同目录同名文件、同毫秒连续写都不会互相
-  覆盖），误写后可从快照手工恢复；新建文件不产生空快照。
+  覆盖）；误写可用 `file_restore` 回滚到任一快照，恢复前的当前内容也会
+  先入快照（回滚可逆）；新建文件不产生空快照。
+- 工具输出在回填模型与落盘前做两层脱敏：已知密钥值精确替换 +
+  常见密钥**形态识别**（`sk-`、`ghp_`、AWS AKIA、JWT、`key = "..."` 等），
+  从未见过的第三方密钥也会被替换成 `<redacted>`。
 - `finish` 是显式终止信号：模型在 `summary` 里给总结、在 `artifacts` 里登记
   交付物路径。它无副作用，调用后跳过权限裁决直接执行，并立即结束本轮任务
   —— 任务完成不会被 L3 的审批弹窗打断。
@@ -283,7 +288,7 @@ TUI 只发送差分（ratatui 的机制），物理屏幕一旦被外部改动�
 ```bash
 cargo test           # 全量测试
 cargo xtask check    # fmt + clippy + test 一站式检查
-cargo xtask smoke    # 工具端到端冒烟：真实跑一遍 8 个工具
+cargo xtask smoke    # 工具端到端冒烟：真实跑一遍 9 个工具
 
 # 真实模型用例（--ignored，需要配置 provider，会花少量 token）
 cargo test -p agent-cli --test resume_live -- --ignored --nocapture   # 续跑：模型记得上一轮

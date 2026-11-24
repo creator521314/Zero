@@ -81,6 +81,7 @@ dependencies = [
  "directories",
  "eventsource-stream",
  "futures",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

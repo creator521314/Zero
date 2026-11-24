@@ -29,9 +29,10 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// 一期的全部工具名。改名/删除工具时这里会红，用来逼人同步文档与注册处。
-const EXPECTED_TOOLS: [&str; 8] = [
+const EXPECTED_TOOLS: [&str; 9] = [
     "file_edit",
     "file_read",
+    "file_restore",
     "file_write",
     "finish",
     "list_dir",
@@ -170,6 +171,7 @@ fn samples() -> Vec<(&'static str, Value)> {
             json!({ "path": NOTES, "old_str": "第二行", "new_str": "改过的第二行" }),
         ),
         ("list_dir", json!({ "path": "." })),
+        ("file_restore", json!({ "path": NOTES })),
         ("shell_exec", json!({ "cmd": "echo smoke-ok" })),
         ("web_fetch", json!({ "url": "https://example.com/" })),
         (
