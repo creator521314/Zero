@@ -27,6 +27,7 @@ pub enum Preset {
     DeepSeek,
     Qwen,
     Ollama,
+    Workbuddy,
     Custom,
 }
 
@@ -36,6 +37,7 @@ impl Preset {
             Preset::DeepSeek => "DeepSeek (云端；默认档，需 DEEPSEEK_API_KEY)",
             Preset::Qwen => "通义千问 (云端；需 DASHSCOPE_API_KEY)",
             Preset::Ollama => "Ollama (本地；http://localhost:11434，无需 key)",
+            Preset::Workbuddy => "WorkBuddy (OpenAI 兼容网关；需 WORKBUDDY_API_KEY)",
             Preset::Custom => "自定义 OpenAI 兼容端点 (需 key)",
         }
     }
@@ -45,6 +47,7 @@ impl Preset {
             Preset::DeepSeek => "deepseek",
             Preset::Qwen => "qwen",
             Preset::Ollama => "ollama",
+            Preset::Workbuddy => "workbuddy",
             Preset::Custom => "custom",
         }
     }
@@ -89,6 +92,21 @@ impl Preset {
                 reasoning: false,
                 vision: false,
                 max_context: 32_000,
+                input_per_1k: 0.0,
+                output_per_1k: 0.0,
+            },
+            // WorkBuddy 网关：OpenAI 兼容协议，base_url/model 因部署而异，
+            // 向导里引导填写；鉴权统一走 Bearer，key 记环境变量名。
+            Preset::Workbuddy => ProviderConfig {
+                kind: "openai_compat".into(),
+                base_url: String::new(),
+                api_key_env: Some("WORKBUDDY_API_KEY".into()),
+                api_key: None,
+                model: String::new(),
+                tools: true,
+                reasoning: false,
+                vision: false,
+                max_context: 128_000,
                 input_per_1k: 0.0,
                 output_per_1k: 0.0,
             },
@@ -215,10 +233,11 @@ fn pick_presets() -> anyhow::Result<Vec<Preset>> {
         Preset::DeepSeek,
         Preset::Qwen,
         Preset::Ollama,
+        Preset::Workbuddy,
         Preset::Custom,
     ];
     let labels: Vec<&str> = items.iter().map(|p| p.label()).collect();
-    let defaults = vec![true, false, false, false];
+    let defaults = vec![true, false, false, false, false];
 
     let picks = MultiSelect::new()
         .with_prompt("勾选要启用的 provider（空格切换，回车确认；至少 1 个）")
@@ -249,6 +268,22 @@ fn collect_providers(presets: &[Preset]) -> anyhow::Result<HashMap<String, Provi
         } else {
             preset.default_name().to_string()
         };
+
+        if matches!(preset, Preset::Workbuddy) {
+            // WorkBuddy 网关部署各自不同（端口 / 路径 / 模型名），引导用户填写。
+            pc.base_url = Input::new()
+                .with_prompt("WorkBuddy 网关 base_url (OpenAI 兼容，以 /v1 结尾)")
+                .interact_text()?;
+            if pc.base_url.trim().is_empty() {
+                anyhow::bail!("base_url 不能为空");
+            }
+            pc.model = Input::new()
+                .with_prompt("WorkBuddy 模型名 (须与网关侧完全一致，区分大小写)")
+                .interact_text()?;
+            if pc.model.trim().is_empty() {
+                anyhow::bail!("model 不能为空");
+            }
+        }
 
         if matches!(preset, Preset::Custom) {
             pc.base_url = Input::new()
@@ -402,6 +437,19 @@ mod tests {
     fn preset_template_ollama_has_no_key() {
         let p = Preset::Ollama.template();
         assert!(p.api_key_env.is_none());
+    }
+
+    #[test]
+    fn preset_template_workbuddy_uses_bearer_env_and_openai_compat() {
+        let p = Preset::Workbuddy.template();
+        assert_eq!(Preset::Workbuddy.default_name(), "workbuddy");
+        assert_eq!(p.kind, "openai_compat");
+        assert_eq!(p.api_key_env.as_deref(), Some("WORKBUDDY_API_KEY"));
+        assert!(p.api_key.is_none());
+        // base_url / model 因部署而异，留空由向导引导填写
+        assert!(p.base_url.is_empty());
+        assert!(p.model.is_empty());
+        assert!(p.tools);
     }
 
     #[test]

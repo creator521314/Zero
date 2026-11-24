@@ -177,7 +177,7 @@ save_stream_deltas = false   # 逐字增量（开着日志会大一数量级）
 
 > 注意：TOML **没有 `null` 字面量**。「无需 API key」的表达方式是省略 `api_key_env` 这一行。
 
-- **已适配**：DeepSeek / 通义（兼容模式）/ OpenAI / Ollama（本地）—— 均走同一个 `openai_compat` 适配器。
+- **已适配**：DeepSeek / 通义（兼容模式）/ OpenAI / Ollama（本地）/ WorkBuddy（OpenAI 兼容网关，`WORKBUDDY_API_KEY`）—— 均走同一个 `openai_compat` 适配器。
 - **本地模型**：配置 `base_url = "http://localhost:11434/v1"` 即接入 Ollama（无需 key）。
 
 ## 工具

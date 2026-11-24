@@ -70,6 +70,21 @@ max_context     = 32000
 input_per_1k    = 0.0
 output_per_1k   = 0.0
 
+# WorkBuddy 网关（OpenAI 兼容协议，Bearer 鉴权）。
+# base_url / model 因部署而异，按你的实例填写；密钥形式通常为 wbk_*。
+# 同时支持 Authorization: Bearer 与 x-api-key 两种头，本适配器走标准 Bearer。
+[providers.workbuddy]
+kind            = "openai_compat"
+base_url        = "http://127.0.0.1:7864/v1"     # ← 改成你的 WorkBuddy 网关地址
+api_key_env     = "WORKBUDDY_API_KEY"            # ← export WORKBUDDY_API_KEY=wbk_xxxx
+model           = "workbuddy-pro"                # ← 须与网关侧模型名完全一致
+tools           = true
+reasoning       = false
+vision          = false
+max_context     = 128000
+input_per_1k    = 0.0
+output_per_1k   = 0.0
+
 # ============================================================
 #  🔀  router —— 任务 → provider 的路由
 # ============================================================
