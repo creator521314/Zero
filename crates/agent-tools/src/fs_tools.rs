@@ -266,17 +266,43 @@ async fn snapshot_before_write(
     target: &std::path::Path,
     old: &[u8],
 ) -> Result<(), ToolError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let dir = ctx.workspace.join("snapshots");
     tokio::fs::create_dir_all(&dir).await?;
+
+    // 快照名 = 目标相对沙箱根的路径 + 纳秒时间戳 + 进程内序号。
+    // - 只取文件名：不同目录下的同名文件（a/config.toml、b/config.toml）
+    //   会互相覆盖；
+    // - 毫秒时间戳：同一毫秒内的两次覆写会撞名，旧快照被静默覆盖；
+    // - 序号兜底保证任何情况下快照不重名。
     let base = target
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
+        .strip_prefix(
+            ctx.project_root
+                .as_deref()
+                .unwrap_or(ctx.workspace.as_path()),
+        )
+        .unwrap_or(target);
+    let label: String = base
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .collect::<String>()
+        .chars()
+        .take(80)
+        .collect();
+    let label = if label.is_empty() {
+        "file".to_string()
+    } else {
+        label
+    };
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let snap = dir.join(format!("{base}.{ts}"));
+    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    let snap = dir.join(format!("{label}.{ts}.{seq}"));
     tokio::fs::write(&snap, old).await?;
     Ok(())
 }
@@ -462,10 +488,73 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
+    /// 快照不能互相覆盖：不同目录下的同名文件、同一文件的连续两次覆写，
+    /// 每次都必须留下独立的快照。
+    ///
+    /// 回归：快照名曾只用 `<文件名>.<毫秒>`——`a/config.toml` 与
+    /// `b/config.toml` 同名，同一毫秒内的两次写也同名，旧快照被静默覆盖。
+    #[tokio::test]
+    async fn snapshots_never_overwrite_each_other() {
+        let base = std::env::temp_dir().join("agent-tools-fs-snap-collide-test");
+        let proj = base.join("proj");
+        let ws = base.join("workspace").join("t1");
+        tokio::fs::create_dir_all(proj.join("a")).await.unwrap();
+        tokio::fs::create_dir_all(proj.join("b")).await.unwrap();
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::write(proj.join("a/config.toml"), "A1")
+            .await
+            .unwrap();
+        tokio::fs::write(proj.join("b/config.toml"), "B1")
+            .await
+            .unwrap();
+
+        let c = ctx(Some(&proj), &ws);
+        for (path, content) in [
+            ("a/config.toml", "A2"),
+            ("b/config.toml", "B2"),
+            // 同一文件连续覆写两次：两份不同的旧内容都要留档
+            ("a/config.toml", "A3"),
+        ] {
+            FileWrite
+                .execute(json!({ "path": path, "content": content }), &c)
+                .await
+                .unwrap();
+        }
+
+        let mut names = Vec::new();
+        let mut bodies = Vec::new();
+        let mut entries = tokio::fs::read_dir(ws.join("snapshots")).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            names.push(e.file_name().to_string_lossy().to_string());
+            bodies.push(tokio::fs::read_to_string(e.path()).await.unwrap());
+        }
+        assert_eq!(names.len(), 3, "三次覆写应留下三份快照: {names:?}");
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "快照名不能重复: {names:?}");
+        for want in ["A1", "B1", "A2"] {
+            assert!(
+                bodies.iter().any(|b| b == want),
+                "缺少旧内容 {want} 的快照: {bodies:?}"
+            );
+        }
+        // 路径进入快照名：不同目录的同名文件可区分。
+        assert!(
+            names.iter().any(|n| n.contains("a_config.toml")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("b_config.toml")),
+            "{names:?}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
     /// M2：新建文件（不存在）不应产生空快照。
     #[tokio::test]
-    async fn file_write_creates_no_snapshot_for_new_file() {
-        let base = std::env::temp_dir().join("agent-tools-fs-snap-new-test");
+    async fn file_write_creates_no_snapshot_for_new_file() {        let base = std::env::temp_dir().join("agent-tools-fs-snap-new-test");
         let proj = base.join("proj");
         let ws = base.join("workspace").join("t1");
         tokio::fs::create_dir_all(&proj).await.unwrap();
