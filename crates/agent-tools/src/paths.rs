@@ -27,6 +27,7 @@ pub fn resolve_in(base: &Path, roots: &[PathBuf], raw: &str) -> Result<PathBuf, 
         base.join(raw_path)
     };
 
+    // 第一道：词法校验（不访问文件系统），快速拒绝 `..` 逃逸。
     let normalized = normalize(&candidate);
     let allowed: Vec<PathBuf> = roots.iter().map(|r| normalize(r)).collect();
     if !allowed.iter().any(|r| is_under(&normalized, r)) {
@@ -40,7 +41,59 @@ pub fn resolve_in(base: &Path, roots: &[PathBuf], raw: &str) -> Result<PathBuf, 
                 .join(", ")
         )));
     }
-    Ok(normalized)
+
+    // 第二道：真实路径校验。词法上「在沙箱内」不代表真的在沙箱内——
+    // 项目根下的软链 `link -> /etc/passwd` 词法校验照样通过。
+    // 把已存在的最深前缀 canonicalize（跟随后符号链接）后复核；
+    // 尚不存在的后缀没有链接可逃逸，词法拼接即可。
+    let real = canonicalize_existing(&normalized).map_err(|e| {
+        ToolError::PathEscape(format!("path resolution failed for {}: {e}", normalized.display()))
+    })?;
+    let allowed_real: Vec<PathBuf> = roots
+        .iter()
+        .map(|r| canonicalize_existing(r))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            ToolError::PathEscape(format!("sandbox root resolution failed: {e}"))
+        })?;
+    if !allowed_real.iter().any(|r| is_under(&real, r)) {
+        return Err(ToolError::PathEscape(format!(
+            "path escapes sandbox (symlink?): {} -> {} (allowed: {})",
+            normalized.display(),
+            real.display(),
+            allowed_real
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    // 返回真实路径：后续读写都落在 canonical 位置上，且已验证在沙箱内。
+    Ok(real)
+}
+
+/// 把路径解析成「真实位置」：对已存在的最深祖先做 `canonicalize`
+/// （解析全部符号链接），不存在的尾部按词法拼接。
+///
+/// 例：`/a/link/x/y.txt`（`link -> /b`，`/b/x/y.txt` 不存在）
+///   → canonicalize(`/a/link`) = `/b`，拼上 `x/y.txt` → `/b/x/y.txt`。
+fn canonicalize_existing(p: &Path) -> std::io::Result<PathBuf> {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return Ok(c);
+    }
+    // 逐级向上找第一个真实存在的祖先。
+    let mut anc = p.parent();
+    while let Some(a) = anc {
+        if let Ok(c) = std::fs::canonicalize(a) {
+            let suffix = p.strip_prefix(a).unwrap_or(Path::new(""));
+            return Ok(c.join(suffix));
+        }
+        anc = a.parent();
+    }
+    // 连根都不存在（测试里的假盘符路径、未初始化的沙箱）——退回词法路径。
+    // 与修复前行为一致：后续真实 IO 时自然会因文件不存在而失败。
+    Ok(p.to_path_buf())
 }
 
 /// 工具入口：按执行上下文解析（相对路径基于项目根）。
@@ -152,5 +205,39 @@ mod tests {
         )
         .unwrap();
         assert!(got2.to_string_lossy().ends_with("Cargo.toml"));
+    }
+
+    /// 符号链接指向沙箱外：词法校验放行、真实路径校验必须拦下。
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape() {
+        let base = std::env::temp_dir().join(format!("agent-paths-{}", std::process::id()));
+        let root = base.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("real.txt"), "hi").unwrap();
+        // 沙箱内的链接 → /etc/passwd（词法上完全在沙箱内）。
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc/passwd", root.join("innocent")).unwrap();
+
+        let r = resolve_in(&root, &[root.clone()], "innocent");
+        assert!(r.is_err(), "symlink 逃逸必须被拒: {r:?}");
+
+        // 指向沙箱内的链接应放行。
+        std::os::unix::fs::symlink("real.txt", root.join("inside")).unwrap();
+        let ok = resolve_in(&root, &[root.clone()], "inside").unwrap();
+        assert!(ok.starts_with(std::fs::canonicalize(&root).unwrap()));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 不存在的新文件（常规创建路径）：真实路径校验不得误伤。
+    #[test]
+    fn accepts_new_file_inside() {
+        let base = std::env::temp_dir().join(format!("agent-paths-new-{}", std::process::id()));
+        let root = base.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let got = resolve_in(&root, &[root.clone()], "sub/new.txt").unwrap();
+        assert!(got.ends_with("sub/new.txt"), "实际: {got:?}");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
