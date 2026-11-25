@@ -29,4 +29,4 @@ pub use store::{Clock, Session, Store, StoreError, StoredEvent, TaskSummary};
 pub use subagent::{SubagentPort, SubtaskResult, SubtaskSpec};
 pub use sync::{SyncEndpoint, SyncError};
 pub use task::{AgentRunner, RunControl, TaskSpec, TaskState};
-pub use tool::{Tool, ToolCtx, ToolError, ToolOutput};
+pub use tool::{MalformedArgs, Tool, ToolCtx, ToolError, ToolErrorCode, ToolOutput};

@@ -58,6 +58,9 @@ pub struct ToolOutput {
     pub is_error: bool,
     #[serde(default)]
     pub side_effects: Vec<Artifact>,
+    /// 稳定错误码（仅 is_error=true 时有意义）。旧日志没有 → None。
+    #[serde(default)]
+    pub error_code: Option<ToolErrorCode>,
 }
 
 impl ToolOutput {
@@ -66,6 +69,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             side_effects: Vec::new(),
+            error_code: None,
         }
     }
     pub fn err(content: impl Into<String>) -> Self {
@@ -73,6 +77,17 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             side_effects: Vec::new(),
+            error_code: None,
+        }
+    }
+    /// 带稳定错误码的失败。content 里**不要**自己写 `[error]` 前缀：
+    /// execute_tool 会统一加，模型可见内容再替换成 `[error:<code>]`。
+    pub fn err_code(code: ToolErrorCode, content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            side_effects: Vec::new(),
+            error_code: Some(code),
         }
     }
     pub fn with_artifacts(mut self, a: Vec<Artifact>) -> Self {
@@ -97,6 +112,131 @@ pub enum ToolError {
     Blocked(String),
     #[error("execution failed: {0}")]
     Failed(String),
+}
+
+/// 稳定的工具错误码。
+///
+/// 模型可以据此采取不同策略：timeout 换策略重试、invalid_args 修参数、
+/// denied / approval_rejected 不要再试、not_permitted 换工具。
+/// 不要在这些码里塞人类可读的中文说明——说明放 message。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolErrorCode {
+    InvalidArgs,
+    PathEscape,
+    Io,
+    Timeout,
+    Cancelled,
+    Blocked,
+    ToolFailed,
+    UnknownTool,
+    MalformedArgs,
+    NotPermitted,
+    Denied,
+    ApprovalRejected,
+    UnsupportedOption,
+    DelegationFailed,
+}
+
+impl ToolErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidArgs => "invalid_args",
+            Self::PathEscape => "path_escape",
+            Self::Io => "io",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::Blocked => "blocked",
+            Self::ToolFailed => "tool_failed",
+            Self::UnknownTool => "unknown_tool",
+            Self::MalformedArgs => "malformed_args",
+            Self::NotPermitted => "not_permitted",
+            Self::Denied => "denied",
+            Self::ApprovalRejected => "approval_rejected",
+            Self::UnsupportedOption => "unsupported_option",
+            Self::DelegationFailed => "delegation_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for ToolErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ToolError {
+    /// 稳定错误码映射：新增 ToolError 变体时必须同步这里（match 是穷尽的，
+    /// 编译器会强制你补）。
+    pub fn code(&self) -> ToolErrorCode {
+        match self {
+            Self::InvalidArgs(_) => ToolErrorCode::InvalidArgs,
+            Self::PathEscape(_) => ToolErrorCode::PathEscape,
+            Self::Io(_) => ToolErrorCode::Io,
+            Self::Timeout => ToolErrorCode::Timeout,
+            Self::Cancelled => ToolErrorCode::Cancelled,
+            Self::Blocked(_) => ToolErrorCode::Blocked,
+            Self::Failed(_) => ToolErrorCode::ToolFailed,
+        }
+    }
+}
+
+/// 「模型发来的参数不是合法 JSON 对象」的标记。
+///
+/// 收口成类型的原因：原先 `__malformed_args_error` 是个散落在 runner 里的
+/// 魔法字符串，任何想判断「这次调用参数坏了」的代码都得自己拼这个键。
+#[derive(Debug, Clone, Copy)]
+pub struct MalformedArgs;
+
+impl MalformedArgs {
+    pub const KEY: &'static str = "__malformed_args_error";
+
+    pub fn marker(reason: impl Into<String>) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            Self::KEY.to_string(),
+            serde_json::Value::String(reason.into()),
+        );
+        serde_json::Value::Object(m)
+    }
+
+    pub fn reason(args: &serde_json::Value) -> Option<&str> {
+        args.get(Self::KEY).and_then(|v| v.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_error_codes_are_stable() {
+        assert_eq!(ToolError::Timeout.code().as_str(), "timeout");
+        assert_eq!(
+            ToolError::InvalidArgs("x".into()).code(),
+            ToolErrorCode::InvalidArgs
+        );
+        assert_eq!(
+            ToolErrorCode::UnsupportedOption.as_str(),
+            "unsupported_option"
+        );
+        assert_eq!(format!("{}", ToolErrorCode::NotPermitted), "not_permitted");
+        let out = ToolOutput::err_code(ToolErrorCode::Blocked, "被挡了");
+        assert!(out.is_error);
+        assert_eq!(out.error_code, Some(ToolErrorCode::Blocked));
+    }
+
+    #[test]
+    fn malformed_args_roundtrip() {
+        let v = MalformedArgs::marker("bad json");
+        assert_eq!(MalformedArgs::reason(&v), Some("bad json"));
+        assert_eq!(
+            MalformedArgs::reason(&serde_json::json!({"path": "a.txt"})),
+            None,
+            "正常参数不能被误判为 malformed"
+        );
+        assert_eq!(v[MalformedArgs::KEY], serde_json::json!("bad json"));
+    }
 }
 
 /// 工具 trait。name/description/JSON-Schema 与 MCP 语义对齐，便于二期接入 MCP。

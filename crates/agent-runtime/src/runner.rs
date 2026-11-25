@@ -21,7 +21,7 @@ use agent_core::provider::{
 };
 use agent_core::store::LogConfig;
 use agent_core::task::{AgentRunner, RunControl, TaskSpec, TaskState};
-use agent_core::tool::{Tool, ToolCtx};
+use agent_core::tool::{Tool, ToolCtx, ToolErrorCode};
 use agent_store::JsonlStore;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
@@ -346,6 +346,8 @@ struct ToolExecuted {
     /// 工具自报失败（如 `web_search` 所有后端都没搜到结果）。
     is_error: bool,
     artifacts: Vec<String>,
+    /// 稳定错误码；run_inner 据此把 `[error] ` 替换成 `[error:<code>] `。
+    error_code: Option<ToolErrorCode>,
 }
 
 #[async_trait]
@@ -738,12 +740,16 @@ impl AgentRuntime {
                         // 明文 API key（`env`、`cat config.toml`），一旦进了
                         // 上下文或 jsonl 就收不回来了。
                         let redacted = (self.deps.redact)(&r.content);
-                        // 只给模型加「被人工批准」标记：日志保留工具原文（已脱敏），
-                        // 便于区分「工具说了什么」与「模型看到了什么」。
-                        let model_content = if user_approved {
-                            format!("[user-approved] {redacted}")
-                        } else {
-                            redacted.clone()
+                        // 稳定错误码只进「模型可见内容」，不进 output 原文：
+                        // output 是事后审计「工具到底返回了什么」的唯一依据，
+                        // 已有测试断言它的字面值，不能被前缀污染。
+                        let model_content = match (r.error_code, user_approved) {
+                            (Some(code), _) => {
+                                let s = redacted.strip_prefix("[error] ").unwrap_or(&redacted);
+                                format!("[error:{code}] {s}")
+                            }
+                            (None, true) => format!("[user-approved] {redacted}"),
+                            (None, false) => redacted.clone(),
                         };
                         if terminating {
                             finish_summary = Some(if redacted.is_empty() {
@@ -792,9 +798,17 @@ impl AgentRuntime {
                         });
                     }
                     Err(e) => {
+                        let code = match &e {
+                            AgentError::Tool(t) => Some(t.code()),
+                            _ => None,
+                        };
+                        let text = match code {
+                            Some(c) => format!("[error:{c}] {e}"),
+                            None => format!("[error] {e}"),
+                        };
                         tool_messages.push(Message {
                             role: Role::Tool,
-                            content: vec![ContentPart::text(format!("[error] {e}"))],
+                            content: vec![ContentPart::text(text)],
                             tool_calls: vec![],
                             tool_call_id: Some(call_id.clone()),
                             reasoning: None,
@@ -804,7 +818,10 @@ impl AgentRuntime {
                             call_id: call_id.clone(),
                             outcome: ToolOutcome::Failed,
                             ms,
-                            detail: Some(e.to_string()),
+                            detail: Some(match code {
+                                Some(c) => format!("[{c}] {e}"),
+                                None => e.to_string(),
+                            }),
                             output: None,
                         });
                     }
@@ -899,6 +916,7 @@ impl AgentRuntime {
                 content: format!("[error] unknown tool: {}", call.name),
                 is_error: true,
                 artifacts: vec![],
+                error_code: Some(ToolErrorCode::UnknownTool),
             });
         };
 
@@ -926,6 +944,7 @@ impl AgentRuntime {
                     content: format!("[error] 工具执行超时（{}s），已中止", ctx.timeout.as_secs()),
                     is_error: true,
                     artifacts: vec![],
+                    error_code: Some(ToolErrorCode::Timeout),
                 })
             }
         };
@@ -953,6 +972,12 @@ impl AgentRuntime {
             redacted.clone()
         };
 
+        let error_code = out.error_code.or(if out.is_error {
+            Some(ToolErrorCode::ToolFailed)
+        } else {
+            None
+        });
+
         let content = if out.is_error {
             format!("[error] {content}")
         } else {
@@ -965,6 +990,7 @@ impl AgentRuntime {
             content,
             is_error: out.is_error,
             artifacts: arts,
+            error_code,
         })
     }
 }
@@ -1458,6 +1484,26 @@ mod tests {
             name: Some(name.to_string()),
             args_delta: args.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_has_stable_error_code() {
+        let (runtime, _store, _tmp) = make_runtime(vec![], LogConfig::default());
+        let task = TaskSpec::new("t", "/tmp/ws");
+        let call = ToolCall {
+            id: agent_core::ids::ToolCallId::new(),
+            name: "no_such_tool".into(),
+            arguments: serde_json::json!({}),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut cm = ContextManager::new(ContextConfig::default(), "sys");
+        let r = runtime
+            .execute_tool(&call, &task, &cancel, &mut cm)
+            .await
+            .unwrap();
+        assert!(r.is_error);
+        assert_eq!(r.error_code, Some(ToolErrorCode::UnknownTool));
+        assert!(r.content.starts_with("[error]"));
     }
 
     #[tokio::test]
