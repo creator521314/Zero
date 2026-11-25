@@ -2656,4 +2656,147 @@ mod tests {
         );
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
+
+    /// 委派闭环：父上下文里只有一条工具结果，子任务写的文件父任务能读。
+    #[tokio::test]
+    async fn delegate_end_to_end_shares_workspace_and_isolates_context() {
+        use agent_core::subagent::SubagentPort;
+        use agent_core::tool::Tool;
+        use agent_tools::DelegateTool;
+
+        /// 一个「真的往共享项目根写文件」的假 port：
+        /// 绕开子 Runner，直接验证 DelegateTool → 回填 → 父 file_read 的链路。
+        struct WritingPort {
+            project_root: PathBuf,
+        }
+        #[async_trait]
+        impl SubagentPort for WritingPort {
+            async fn run_subtask(
+                &self,
+                _parent: &str,
+                spec: agent_core::subagent::SubtaskSpec,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) -> Result<agent_core::subagent::SubtaskResult, agent_core::error::AgentError>
+            {
+                tokio::fs::create_dir_all(self.project_root.join("artifacts"))
+                    .await
+                    .ok();
+                tokio::fs::write(self.project_root.join("artifacts/child.md"), &spec.goal)
+                    .await
+                    .ok();
+                Ok(agent_core::subagent::SubtaskResult {
+                    child_id: agent_core::ids::TaskId::from_raw("child-1"),
+                    outcome: Outcome::Success {
+                        summary: "子任务内部过程，不应出现在父上下文".into(),
+                        artifacts: vec!["artifacts/child.md".into()],
+                    },
+                    summary: "结论：方案 A 更省 token".into(),
+                    artifacts: vec!["artifacts/child.md".into()],
+                    cost_usd: 0.0,
+                })
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!("zero-delegate-e2e-{}", uuid::Uuid::new_v4()));
+        let proj = tmp.join("proj");
+        let ws = tmp.join("workspace");
+        tokio::fs::create_dir_all(&proj).await.unwrap();
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+
+        let port = Arc::new(WritingPort {
+            project_root: proj.clone(),
+        });
+        let delegate = Arc::new(DelegateTool::new(port.clone())) as Arc<dyn Tool>;
+        let file_read = Arc::new(agent_tools::fs_tools::FileRead) as Arc<dyn Tool>;
+        let finish = Arc::new(agent_tools::finish::Finish) as Arc<dyn Tool>;
+
+        let defs = [delegate.clone(), file_read.clone(), finish.clone()]
+            .iter()
+            .map(|t| agent_core::provider::ToolDef {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters(),
+            })
+            .collect::<Vec<_>>();
+        let d2 = delegate.clone();
+        let lookup: ToolLookup = Arc::new(move |name: &str| match name {
+            "delegate" => Some(d2.clone()),
+            "file_read" => Some(Arc::new(agent_tools::fs_tools::FileRead) as Arc<dyn Tool>),
+            "finish" => Some(Arc::new(agent_tools::finish::Finish) as Arc<dyn Tool>),
+            _ => None,
+        });
+        let (_tx, rx) = mpsc::channel::<ApprovalMsg>(1);
+
+        // 剧本：第 1 轮委派；第 2 轮读回子任务写的文件；第 3 轮收尾。
+        let turns = vec![
+            vec![tool_call_args(
+                0,
+                "c1",
+                "delegate",
+                r#"{"goal":"写一份草稿"}"#,
+            )],
+            vec![tool_call_args(
+                0,
+                "c2",
+                "file_read",
+                r#"{"path":"artifacts/child.md"}"#,
+            )],
+            vec![
+                StreamEvent::TextDelta("全部完成".into()),
+                StreamEvent::Done(FinishReason::Stop),
+            ],
+        ];
+
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: Arc::new(ScriptedProvider {
+                turns: Mutex::new(turns),
+            }),
+            provider_name: "scripted".into(),
+            tools: lookup,
+            tool_defs: defs,
+            perm: Arc::new(AllowAll),
+            store,
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(ApprovalInbox::new(rx)),
+            context_cfg: ContextConfig::default(),
+            per_task_budget: 0.0,
+            cost_sink: None,
+            redact: Arc::new(|s: &str| s.to_string()),
+        });
+
+        let mut spec = TaskSpec::new("主任务", ws.display().to_string());
+        spec.project_root = Some(proj.display().to_string());
+        spec.max_iterations = 5;
+        let bus = event_bus();
+        let mut sub = bus.subscribe();
+        let outcome = runtime.run(spec, bus, RunControl::new()).await.unwrap();
+        assert!(
+            matches!(outcome, Outcome::Success { .. }),
+            "实际: {outcome:?}"
+        );
+
+        // 共享空间：父任务能读到子任务写出的文件。
+        let written = tokio::fs::read_to_string(proj.join("artifacts/child.md"))
+            .await
+            .unwrap();
+        assert_eq!(written, "写一份草稿");
+
+        // 上下文隔离：快照里不得出现「子任务内部过程」这段文本。
+        let mut leaked = false;
+        while let Ok(ev) = sub.try_recv() {
+            if let Event::ContextSnapshot { messages, .. } = ev {
+                for m in messages {
+                    if m.text().contains("子任务内部过程，不应出现在父上下文") {
+                        leaked = true;
+                    }
+                }
+            }
+        }
+        assert!(!leaked, "子任务内部 summary 泄漏进了父上下文");
+        assert!(tokio::fs::read_to_string(proj.join("artifacts/child.md"))
+            .await
+            .is_ok());
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
 }
