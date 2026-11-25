@@ -50,6 +50,28 @@ pub enum Decision {
     },
 }
 
+/// 静态规则闸门的输出：类型上不允许被后续 AI 审视覆盖。
+///
+/// 元组字段私有，外部只能 `into_decision()`，没有「改成 Allow」的入口。
+/// 这就是 dsh「ToolGuard 返回类型不含 allow」在 Zero 里的等价物。
+#[derive(Debug, Clone)]
+pub struct StaticVerdict(Decision);
+
+impl StaticVerdict {
+    pub fn ask(rule: impl Into<String>) -> Self {
+        let rule = rule.into();
+        Self(Decision::AskUser {
+            reason: format!("高危操作被静态规则拦截：{rule}"),
+            source: ApprovalSource::Static,
+            matched_rule: Some(rule),
+        })
+    }
+
+    pub fn into_decision(self) -> Decision {
+        self.0
+    }
+}
+
 /// 待审批请求（发给 TUI 展示）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {

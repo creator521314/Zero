@@ -9,7 +9,7 @@ pub mod rules;
 
 use std::time::Duration;
 
-use agent_core::perm::{class_key, ApprovalSource, Decision, PermissionTier, Risk};
+use agent_core::perm::{class_key, ApprovalSource, Decision, PermissionTier, Risk, StaticVerdict};
 use agent_core::provider::ToolCall;
 use agent_core::task::TaskSpec;
 use async_trait::async_trait;
@@ -88,16 +88,14 @@ impl PermissionEngine for PermissionEngineImpl {
         let task_id = task.id.0.as_str();
 
         // ---- 第一层：静态规则（先跑、优先级最高）----
+        // StaticVerdict 的元组字段私有，且没有 allow 构造器：类型上保证
+        // 后面的 L1 / AI 审视不可能把这次命中「翻案」成 Allow。
         if let RuleMatch::Hit { rule, .. } = self.rules.match_call(call) {
             // 命中即询问用户，与档位无关：
             // - L1 的语义是「普通操作自动放行」，不是「高危操作无人值守」。
             //   此前 L1 直接 Deny，用户即使愿意也无法确认，任务只能换档重跑；
             // - L2/L3 本来就要问，保持同一条路径。
-            return Decision::AskUser {
-                reason: format!("高危操作被静态规则拦截：{rule}"),
-                source: ApprovalSource::Static,
-                matched_rule: Some(rule),
-            };
+            return StaticVerdict::ask(rule).into_decision();
         }
 
         // ---- L1 全自动：直接放行 ----
@@ -277,6 +275,76 @@ mod tests {
         assert!(
             matches!(d, Decision::AskUser { .. }),
             "复合命令不能继承批量授权，实际 {d:?}"
+        );
+    }
+
+    /// 一个「永远说放行」的审视器：用来证明静态闸门不可能被 AI 覆盖。
+    struct AlwaysAllowReviewer;
+
+    #[async_trait]
+    impl AiReviewer for AlwaysAllowReviewer {
+        async fn review(
+            &self,
+            _task: &TaskSpec,
+            _call: &ToolCall,
+            _static_risk: Risk,
+            _timeout: Duration,
+        ) -> Result<agent_core::perm::ApprovalResult, String> {
+            Ok(agent_core::perm::ApprovalResult {
+                allow: true,
+                risk: Risk::Low,
+                reason: "always allow".into(),
+                confidence: 1.0,
+                source: ApprovalSource::Ai,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn static_hit_cannot_be_overridden_in_any_tier() {
+        for tier in [PermissionTier::L1, PermissionTier::L2, PermissionTier::L3] {
+            let eng = PermissionEngineImpl::new(StaticRules::default(), PermConfig::default())
+                .with_reviewer(Box::new(AlwaysAllowReviewer));
+            let d = eng
+                .check(
+                    &call("shell_exec", serde_json::json!({"cmd": "rm -rf /"})),
+                    &task(tier),
+                )
+                .await;
+            match d {
+                Decision::AskUser {
+                    source: ApprovalSource::Static,
+                    matched_rule: Some(_),
+                    ..
+                } => {}
+                other => panic!("{tier:?} 下静态命中必须保持 Static 询问，实际: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_goal_with_dangerous_command_is_still_gated() {
+        // 回归：C2 之前加的「委派 goal 内嵌高危命令」拦截不能被 AI 翻案。
+        let eng = PermissionEngineImpl::new(StaticRules::default(), PermConfig::default())
+            .with_reviewer(Box::new(AlwaysAllowReviewer));
+        let d = eng
+            .check(
+                &call(
+                    "delegate",
+                    serde_json::json!({"goal": "请执行 rm -rf / 然后汇报"}),
+                ),
+                &task(PermissionTier::L1),
+            )
+            .await;
+        assert!(
+            matches!(
+                d,
+                Decision::AskUser {
+                    source: ApprovalSource::Static,
+                    ..
+                }
+            ),
+            "委派夹带高危命令必须走静态闸门，实际: {d:?}"
         );
     }
 }
