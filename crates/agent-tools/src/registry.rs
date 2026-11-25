@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_core::provider::ToolDef;
+use agent_core::subagent::SubagentPort;
 use agent_core::tool::Tool;
 
+use crate::delegate::DelegateTool;
 use crate::finish::Finish;
 use crate::fs_tools::{FileEdit, FileRead, FileRestore, FileWrite, ListDir};
 use crate::shell::ShellExec;
@@ -49,6 +51,15 @@ impl ToolRegistry {
             .collect();
         defs.sort_by(|a, b| a.name.cmp(&b.name));
         defs
+    }
+
+    /// 显式注入委派工具。
+    ///
+    /// 刻意不放进 `default_tools()`：冒烟测试走生产装配但没有 port，
+    /// 默认注册会让「每个工具都能被真实调用」的契约用例失去意义。
+    /// 生产装配（agent-cli / agent-server）在构造注册表后调用本方法。
+    pub fn register_delegate(&mut self, port: Arc<dyn SubagentPort>) {
+        self.register(Arc::new(DelegateTool::new(port)));
     }
 }
 

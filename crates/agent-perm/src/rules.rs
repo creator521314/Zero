@@ -89,6 +89,7 @@ impl StaticRules {
         tool_risk.insert("file_edit", Risk::Medium);
         tool_risk.insert("file_restore", Risk::Medium);
         tool_risk.insert("web_fetch", Risk::Medium);
+        tool_risk.insert("delegate", Risk::Medium);
         tool_risk.insert("shell_exec", Risk::High);
 
         Self {
@@ -112,6 +113,28 @@ impl StaticRules {
 
     /// 对一次调用做静态检查。
     pub fn match_call(&self, call: &ToolCall) -> RuleMatch {
+        // 委派参数里夹带高危命令：静态规则同样要拦，否则模型可以把
+        // `rm -rf /` 写进 goal，借子任务绕过第一层防线。
+        if call.name == "delegate" {
+            let mut blob = String::new();
+            for key in ["goal", "context", "expected_output"] {
+                if let Some(s) = call.arguments.get(key).and_then(|v| v.as_str()) {
+                    blob.push_str(s);
+                    blob.push('\n');
+                }
+            }
+            let hits: Vec<usize> = self.shell.matches(&blob).iter().collect();
+            if let Some(&i) = hits.first() {
+                return RuleMatch::Hit {
+                    risk: Risk::High,
+                    rule: format!(
+                        "委派目标含高危命令：{}",
+                        self.shell_labels.get(i).copied().unwrap_or("高危命令")
+                    ),
+                };
+            }
+        }
+
         // 1) shell 命令模式匹配
         if call.name == "shell_exec" {
             if let Some(cmd) = call.arguments.get("cmd").and_then(|v| v.as_str()) {
@@ -180,6 +203,26 @@ mod tests {
             name: tool.into(),
             arguments: args,
         }
+    }
+
+    #[test]
+    fn delegate_goal_with_dangerous_command_is_flagged() {
+        let r = StaticRules::new();
+        let m = r.match_call(&call(
+            "delegate",
+            serde_json::json!({"goal": "请执行 rm -rf / 然后汇报"}),
+        ));
+        assert!(matches!(m, RuleMatch::Hit { .. }), "高危 goal 必须拦");
+    }
+
+    #[test]
+    fn normal_delegate_goal_is_allowed() {
+        let r = StaticRules::new();
+        let m = r.match_call(&call(
+            "delegate",
+            serde_json::json!({"goal": "读取 src 目录并归纳模块职责"}),
+        ));
+        assert!(matches!(m, RuleMatch::Miss), "正常 goal 不该被拦");
     }
 
     #[test]
