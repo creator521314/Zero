@@ -217,7 +217,13 @@ impl AgentRuntime {
         let req = ChatRequest {
             model: task.model.clone().unwrap_or_default(),
             messages: cm.messages().to_vec(),
-            tools: self.deps.tool_defs.clone(),
+            tools: self
+                .deps
+                .tool_defs
+                .iter()
+                .filter(|d| task.allows_tool(&d.name))
+                .cloned()
+                .collect(),
             temperature: Some(0.3),
             max_tokens: None,
             stream: true,
@@ -447,7 +453,13 @@ impl AgentRuntime {
                     iteration: iteration as u32,
                     model: model.clone(),
                     messages: cm.messages().to_vec(),
-                    tools: self.deps.tool_defs.iter().map(|t| t.name.clone()).collect(),
+                    tools: self
+                        .deps
+                        .tool_defs
+                        .iter()
+                        .filter(|d| task.allows_tool(&d.name))
+                        .map(|d| d.name.clone())
+                        .collect(),
                 });
             }
 
@@ -897,6 +909,20 @@ impl AgentRuntime {
         cancel: &tokio_util::sync::CancellationToken,
         cm: &mut ContextManager,
     ) -> Result<ToolExecuted, AgentError> {
+        // 模型可见性（stream_once 过滤 tool_defs）与可执行性（这里）共用同一规则。
+        // 即使模型从别处猜到工具名并硬调用，也过不了这一关。
+        if !task.allows_tool(&call.name) {
+            return Ok(ToolExecuted {
+                content: format!(
+                    "[error] 工具 {} 不在本任务允许的工具集内，未执行",
+                    call.name
+                ),
+                is_error: true,
+                artifacts: vec![],
+                error_code: Some(ToolErrorCode::NotPermitted),
+            });
+        }
+
         let Some(tool) = (self.deps.tools)(&call.name) else {
             return Ok(ToolExecuted {
                 content: format!("[error] unknown tool: {}", call.name),
@@ -1479,6 +1505,26 @@ mod tests {
         assert!(v.is_object());
         // 正常参数绝不能被误判
         assert!(MalformedArgs::reason(&serde_json::json!({"cmd": "ls"})).is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_allowlist_blocks_execution_with_stable_code() {
+        let (runtime, _store, _tmp) = make_runtime(vec![], LogConfig::default());
+        let mut task = TaskSpec::new("t", "/tmp/ws");
+        task.tool_allowlist = Some(vec!["ok_tool".into()]);
+        let call = ToolCall {
+            id: agent_core::ids::ToolCallId::new(),
+            name: "fail_tool".into(),
+            arguments: serde_json::json!({}),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut cm = ContextManager::new(ContextConfig::default(), "sys");
+        let r = runtime
+            .execute_tool(&call, &task, &cancel, &mut cm)
+            .await
+            .unwrap();
+        assert!(r.is_error);
+        assert_eq!(r.error_code, Some(ToolErrorCode::NotPermitted));
     }
 
     #[tokio::test]

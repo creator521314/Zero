@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::runner::ToolLookup;
 use agent_core::error::AgentError;
 use agent_core::event::{Event, EventBus, Outcome};
 use agent_core::ids::TaskId;
@@ -180,18 +179,20 @@ impl RuntimeSubagent {
                 .push_str(&format!("\n\n【期望交付物】{clipped}"));
         }
 
-        // ---- 子 deps：Clone 之后只覆写工具集与预算 ----
+        // ---- 子 deps：Clone 之后只覆写预算；工具集用统一的 allowlist 规则 ----
         let mut child_deps: RuntimeDeps = parent.deps.clone();
-        child_deps.tool_defs.retain(|d| d.name != "delegate");
-        let inner: ToolLookup = parent.deps.tools.clone();
-        child_deps.tools = Arc::new(move |name: &str| {
-            // 递归防护第二道闸：子任务连工具都查不到 delegate。
-            if name == "delegate" {
-                None
-            } else {
-                inner(name)
-            }
-        });
+        // 递归防护：子任务看不到、也调不到 delegate。
+        // 刻意不再在子 deps 里硬编码过滤——stream_once / execute_tool 会用
+        // 同一条 TaskSpec::allows_tool 规则处理，避免两处逻辑漂移。
+        child.tool_allowlist = Some(
+            parent
+                .deps
+                .tool_defs
+                .iter()
+                .map(|d| d.name.clone())
+                .filter(|n| n != "delegate")
+                .collect(),
+        );
         if let Some(cap) = child.budget_usd {
             if cap > 0.0 {
                 child_deps.per_task_budget = cap;
@@ -390,6 +391,33 @@ mod tests {
         assert!(matches!(result.outcome, Outcome::Success { .. }));
         assert!(!result.summary.is_empty());
         let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn child_tool_allowlist_excludes_delegate() {
+        // 用 C1 已有的测试夹具思路：直接构造最小 deps，跑一次 run_subtask
+        // 太重；这里只验证规则本身——run_child 用的是同一段表达式。
+        let defs = [
+            agent_core::provider::ToolDef {
+                name: "delegate".into(),
+                description: "".into(),
+                parameters: serde_json::json!({}),
+            },
+            agent_core::provider::ToolDef {
+                name: "file_read".into(),
+                description: "".into(),
+                parameters: serde_json::json!({}),
+            },
+        ];
+        let allow: Vec<String> = defs
+            .iter()
+            .map(|d| d.name.clone())
+            .filter(|n| n != "delegate")
+            .collect();
+        let mut task = TaskSpec::new("child", "/tmp/ws");
+        task.tool_allowlist = Some(allow);
+        assert!(!task.allows_tool("delegate"));
+        assert!(task.allows_tool("file_read"));
     }
 
     #[tokio::test]

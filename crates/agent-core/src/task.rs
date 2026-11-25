@@ -65,6 +65,10 @@ pub struct TaskSpec {
     /// 委派深度：顶层 0，子任务 1。硬上限 1（一期）。
     #[serde(default)]
     pub depth: u8,
+    /// 本任务可见/可执行的工具白名单。None = 不限制（默认，兼容旧日志）。
+    /// 子任务由 RuntimeSubagent 设为「父工具集去掉 delegate」。
+    #[serde(default)]
+    pub tool_allowlist: Option<Vec<String>>,
 }
 
 impl TaskSpec {
@@ -85,7 +89,15 @@ impl TaskSpec {
             resume_messages: None,
             parent_id: None,
             depth: 0,
+            tool_allowlist: None,
         }
+    }
+
+    /// 工具是否对本任务可见/可执行。None = 全放行。
+    pub fn allows_tool(&self, name: &str) -> bool {
+        self.tool_allowlist
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|n| n == name))
     }
 }
 
@@ -117,4 +129,36 @@ pub trait AgentRunner: Send + Sync {
         bus: EventBus,
         ctl: RunControl,
     ) -> Result<Outcome, AgentError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_allowlist_defaults_to_unrestricted_and_filters_when_set() {
+        let mut t = TaskSpec::new("t", "/tmp/ws");
+        assert!(t.allows_tool("anything"));
+        t.tool_allowlist = Some(vec!["file_read".into(), "delegate".into()]);
+        assert!(t.allows_tool("file_read"));
+        assert!(!t.allows_tool("shell_exec"));
+    }
+
+    #[test]
+    fn legacy_task_spec_without_allowlist_deserializes() {
+        // 用真实 JSON 形态：旧日志里没有这个字段
+        let json = serde_json::json!({
+            "id": "t-1",
+            "title": "老任务",
+            "prompt": "hi",
+            "tier": "L2",
+            "workspace": "/tmp/ws",
+            "model": null,
+            "max_iterations": 25,
+            "budget_usd": null
+        });
+        let t: TaskSpec = serde_json::from_value(json).expect("旧日志仍可反序列化");
+        assert!(t.tool_allowlist.is_none());
+        assert!(t.allows_tool("shell_exec"));
+    }
 }

@@ -165,6 +165,12 @@ pub enum Outcome {
 }
 
 /// 外界 → Agent 的命令。
+///
+/// `SubmitTask` 直接按值携带 `TaskSpec`（含若干 Option<Vec<_>> 字段，体积较大）。
+/// 这是 mpsc 通道里的低频消息（每次提交任务一条），boxing 会改动装配层的
+/// 所有权写法而收益极小；C3 加了 `tool_allowlist` 后 TaskSpec 跨过了
+/// clippy 的体积阈值，这里显式豁免而不是为了消警告去改接口。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Command {
     SubmitTask(TaskSpec),
