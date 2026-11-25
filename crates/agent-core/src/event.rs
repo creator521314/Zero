@@ -115,6 +115,13 @@ pub enum Event {
         title: String,
         events: Vec<Event>,
     },
+    /// 委派关系：谁派生了谁。子任务自己的 TaskStarted/TaskFinished 照常发，
+    /// 由 TUI 按 id 过滤；本事件专门把父子关系写进 jsonl，供二期同步还原任务树。
+    SubtaskLinked {
+        parent_id: TaskId,
+        child_id: TaskId,
+        goal: String,
+    },
 }
 
 /// 工具调用的终结状态（[`Event::ToolCallEnd`] 的细分）。
@@ -196,6 +203,27 @@ pub fn event_bus() -> EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtask_linked_roundtrip_and_legacy_events_still_parse() {
+        let legacy = r#"{"type":"task_started","id":"t-1","title":"老任务"}"#;
+        assert!(matches!(
+            serde_json::from_str::<Event>(legacy).expect("旧日志仍可反序列化"),
+            Event::TaskStarted { .. }
+        ));
+
+        let ev = Event::SubtaskLinked {
+            parent_id: TaskId::from_raw("p-1"),
+            child_id: TaskId::from_raw("c-1"),
+            goal: "跑一遍测试".into(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains("subtask_linked"));
+        assert!(matches!(
+            serde_json::from_str::<Event>(&s).unwrap(),
+            Event::SubtaskLinked { .. }
+        ));
+    }
 
     #[test]
     fn tool_call_end_roundtrip_keeps_outcome_and_detail() {

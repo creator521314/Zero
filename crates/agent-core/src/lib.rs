@@ -11,6 +11,7 @@ pub mod ids;
 pub mod perm;
 pub mod provider;
 pub mod store;
+pub mod subagent;
 pub mod sync;
 pub mod task;
 pub mod tool;
@@ -25,6 +26,7 @@ pub use provider::{
     Message, ModelPrice, Role, StreamEvent, ToolCall, ToolDef, Usage,
 };
 pub use store::{Clock, Session, Store, StoreError, StoredEvent, TaskSummary};
+pub use subagent::{SubagentPort, SubtaskResult, SubtaskSpec};
 pub use sync::{SyncEndpoint, SyncError};
 pub use task::{AgentRunner, RunControl, TaskSpec, TaskState};
 pub use tool::{Tool, ToolCtx, ToolError, ToolOutput};

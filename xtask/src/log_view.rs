@@ -286,6 +286,12 @@ fn render_events(events: &[StoredEvent], opts: &ViewOpts) -> String {
             }
             // 逐字增量默认不落盘；即便落了也不进时间线（内容已在整轮回复里）。
             Event::TextDelta { .. } | Event::ReasoningDelta { .. } => {}
+            // 委派关系：在时间线上标一行，便于人工核对谁派生了谁。
+            Event::SubtaskLinked { child_id, goal, .. } => {
+                if !opts.errors_only {
+                    s.push_str(&format!("↳ 委派 {}：{}\n", child_id.0, clip(goal, limit)));
+                }
+            }
             // 纯界面事件不落盘，也不会出现在审计日志里。
             Event::TaskList { .. } | Event::TaskOpened { .. } => {}
         }

@@ -1848,14 +1848,19 @@ mod tests {
         // 实测在宽 98 下，textwrap 算 3 行、ratatui 实际渲染 4 行。
         let para = "**它是干什么的**：一个个人独占使用、跑在自己设备上、\
                     能实际动手干活的通用 AI Agent（personal-agent，当前处于 M1 骨架阶段）。";
+        let id = TaskId::new();
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
         for _ in 0..8 {
             app.apply_event(Event::TextDelta {
-                id: TaskId::new(),
+                id: id.clone(),
                 text: format!("{para}{para}\n"),
             });
         }
         app.apply_event(Event::TextDelta {
-            id: TaskId::new(),
+            id,
             text: "  - 收尾标记 ZZZEND".into(),
         });
 
@@ -2092,9 +2097,14 @@ mod tests {
     fn scrollbar_click_jumps_to_position() {
         use agent_core::ids::TaskId;
         let mut app = App::default();
+        let id = TaskId::new();
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
         for i in 0..60 {
             app.apply_event(Event::TextDelta {
-                id: TaskId::new(),
+                id: id.clone(),
                 text: format!("第 {i} 行\n"),
             });
         }
@@ -2508,8 +2518,13 @@ mod tests {
         use agent_core::ids::TaskId;
 
         let mut app = App::default();
+        let id = TaskId::new();
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
         app.apply_event(Event::TextDelta {
-            id: TaskId::new(),
+            id,
             text: "## 小结\n\n- **要点**：先跑测试\n".into(),
         });
         let rows = build_conversation_lines(&app.lines, 60);
@@ -2544,8 +2559,13 @@ mod tests {
         use agent_core::ids::TaskId;
 
         let mut app = App::default();
+        let id = TaskId::new();
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
         app.apply_event(Event::TextDelta {
-            id: TaskId::new(),
+            id,
             text: "```\ncode();\n```\n\n之后的正文\n".into(),
         });
         let rows = build_conversation_lines(&app.lines, 60);
@@ -2574,8 +2594,13 @@ mod tests {
         use agent_core::ids::TaskId;
 
         let mut app = App::default();
+        let id = TaskId::new();
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
         app.apply_event(Event::TaskFinished {
-            id: TaskId::new(),
+            id,
             outcome: Outcome::Success {
                 summary: "done".into(),
                 artifacts: vec![],
@@ -3513,6 +3538,10 @@ mod tests {
         let mut app = App::default();
         let id = TaskId::new();
         let text = "项目介绍：一个个人独占的 Agent。";
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
         app.apply_event(Event::TextDelta {
             id: id.clone(),
             text: text.into(),

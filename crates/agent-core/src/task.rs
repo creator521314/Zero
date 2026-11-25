@@ -59,6 +59,12 @@ pub struct TaskSpec {
     /// 所以「当初要做什么」不会因为续跑而丢失。
     #[serde(default)]
     pub resume_messages: Option<Vec<crate::provider::Message>>,
+    /// 父任务 id；None = 顶层任务。用于委派关系与审计回放。
+    #[serde(default)]
+    pub parent_id: Option<TaskId>,
+    /// 委派深度：顶层 0，子任务 1。硬上限 1（一期）。
+    #[serde(default)]
+    pub depth: u8,
 }
 
 impl TaskSpec {
@@ -77,6 +83,8 @@ impl TaskSpec {
             budget_usd: None,
             resume_from: None,
             resume_messages: None,
+            parent_id: None,
+            depth: 0,
         }
     }
 }

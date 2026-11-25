@@ -28,6 +28,9 @@ pub fn classify(ev: &Event, cfg: &LogConfig) -> Option<(TaskId, Durability)> {
         | Event::TaskFinished { id, .. }
         | Event::Error { id, .. } => Some((id.clone(), Durability::Persistent)),
 
+        // 委派关系：长期保留，落在子任务自己的 session，供二期还原任务树。
+        Event::SubtaskLinked { child_id, .. } => Some((child_id.clone(), Durability::Persistent)),
+
         // 过程信息：量大、可重建，超期清理。
         Event::ToolCallStart { id, .. }
         | Event::ToolCallEnd { id, .. }

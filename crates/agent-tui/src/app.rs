@@ -348,23 +348,43 @@ impl App {
     pub fn apply_event(&mut self, ev: Event) {
         match ev {
             Event::TaskStarted { id, title } => {
-                self.active_task = Some(id.clone());
-                self.status = format!("执行中: {title}");
-                // 对话区从此归这条任务：后续输入沿用它当任务 id 续跑。
-                self.viewing = Some((id, title.clone()));
-                self.panel_open = false;
-                self.lines
-                    .push(Line::System(format!("▶ 任务开始: {title}")));
-                self.scroll_to_bottom();
+                // 子任务（id 与当前活跃任务不同）不抢 active_task / viewing，
+                // 只在对话区插一条折叠提示。
+                if self.active_task.as_ref().is_some_and(|a| a != &id) {
+                    self.lines
+                        .push(Line::System(format!("↳ 子任务开始: {title}")));
+                    self.auto_scroll();
+                } else {
+                    self.active_task = Some(id.clone());
+                    self.status = format!("执行中: {title}");
+                    // 对话区从此归这条任务：后续输入沿用它当任务 id 续跑。
+                    self.viewing = Some((id, title.clone()));
+                    self.panel_open = false;
+                    self.lines
+                        .push(Line::System(format!("▶ 任务开始: {title}")));
+                    self.scroll_to_bottom();
+                }
             }
-            Event::TextDelta { text, .. } => {
+            Event::SubtaskLinked { goal, .. } => {
+                self.lines
+                    .push(Line::System(format!("↳ 委派子任务：{goal}")));
+                self.auto_scroll();
+            }
+            Event::TextDelta { id, text } => {
+                // 子任务的流式增量不进主对话区（runtime 侧还会主动抑制广播，双保险）。
+                if self.active_task.as_ref() != Some(&id) {
+                    return;
+                }
                 match self.lines.last_mut() {
                     Some(Line::Assistant(s)) => s.push_str(&text),
                     _ => self.lines.push(Line::Assistant(text)),
                 }
                 self.auto_scroll();
             }
-            Event::ReasoningDelta { text, .. } => {
+            Event::ReasoningDelta { id, text } => {
+                if self.active_task.as_ref() != Some(&id) {
+                    return;
+                }
                 match self.lines.last_mut() {
                     Some(Line::Reasoning(s)) => s.push_str(&text),
                     _ => self.lines.push(Line::Reasoning(text)),
@@ -445,7 +465,15 @@ impl App {
             // 审批结果只服务审计（日志/复盘）；界面上的「待审批」在用户按键
             // 那一刻就已清掉，这里无需再动状态。
             Event::ApprovalDecided { .. } => {}
-            Event::TaskFinished { outcome, .. } => {
+            Event::TaskFinished { id, outcome } => {
+                // 子任务收尾：只插一行状态，绝不碰 active_task / status。
+                if self.active_task.as_ref() != Some(&id) {
+                    self.lines
+                        .push(Line::System(format!("↳ 子任务结束: {outcome:?}")));
+                    self.auto_scroll();
+                    return;
+                }
+
                 match &outcome {
                     Outcome::Success { summary, artifacts } => {
                         self.lines.push(Line::Done("✔ 任务完成。".into()));
@@ -1435,6 +1463,10 @@ mod tests {
     fn stream_deltas_merge_into_one_line() {
         let mut app = App::default();
         let id = TaskId::new();
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
         for t in ["Hel", "lo", " world"] {
             app.apply_event(Event::TextDelta {
                 id: id.clone(),
@@ -1561,6 +1593,10 @@ mod tests {
         let mut app = App::default();
         let id = TaskId::new();
         let text = "## 项目介绍\n\n一个个人独占、跑在自有设备上的 Agent。";
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
         app.apply_event(Event::TextDelta {
             id: id.clone(),
             text: text.into(),
@@ -1595,8 +1631,13 @@ mod tests {
     #[test]
     fn task_finished_shows_summary_that_was_never_streamed() {
         let mut app = App::default();
+        let id = TaskId::new();
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
         app.apply_event(Event::TaskFinished {
-            id: TaskId::new(),
+            id,
             outcome: Outcome::Success {
                 summary: "连续 4 轮没有产生新的文件或有效输出，任务可能已停滞。".into(),
                 artifacts: vec!["artifacts/report.md".into()],
@@ -1621,8 +1662,13 @@ mod tests {
     fn task_failed_is_rendered_as_error() {
         // 失败不该和普通系统提示一样灰着划过去。
         let mut app = App::default();
+        let id = TaskId::new();
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
         app.apply_event(Event::TaskFinished {
-            id: TaskId::new(),
+            id,
             outcome: Outcome::Failed {
                 reason: "provider 超时".into(),
             },
