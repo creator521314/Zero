@@ -124,6 +124,7 @@ dependencies = [
  "anyhow",
  "directories",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

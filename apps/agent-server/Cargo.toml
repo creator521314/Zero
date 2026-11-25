@@ -17,6 +17,7 @@ agent-providers.workspace = true
 agent-store.workspace = true
 agent-net.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

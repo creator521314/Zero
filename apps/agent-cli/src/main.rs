@@ -198,14 +198,26 @@ async fn main() -> anyhow::Result<()> {
     let redactor = Arc::new(agent_providers::SecretRedactor::from_config(&cfg));
     let redact: agent_runtime::runner::RedactFn = Arc::new(move |s: &str| redactor.redact(s));
 
+    // 任务树共享预算单元：父/子 deps 的 cost_sink 都 charge 它。
+    //
+    // 这里刻意保留**具体类型**再另做一次向上转型：`register` / `unregister`
+    // 是装配层职责（登记父任务上下文），不属于 `SubagentPort` 的能力面
+    // （tools 只需要 `run_subtask`）。把登记塞进端口 trait 会让 agent-core
+    // 反向依赖 RuntimeDeps 这类实现细节。
+    let budget_cell = agent_runtime::subagent::BudgetCell::default();
+    let subagent_impl = Arc::new(agent_runtime::subagent::RuntimeSubagent::new(
+        budget_cell.clone(),
+    ));
+    let subagent_port: Arc<dyn agent_core::subagent::SubagentPort> = subagent_impl.clone();
+
     // 工具集。搜索后端按 [search] 段解析：未配置时走内置免 key 后端，
     // 保证 web_search 开箱可用。
-    let registry = Arc::new(agent_tools::default_tools(
-        agent_tools::SearchBackend::resolve(
-            cfg.search.backend.as_deref(),
-            cfg.search.searxng_endpoint.as_deref(),
-        ),
+    let mut registry = agent_tools::default_tools(agent_tools::SearchBackend::resolve(
+        cfg.search.backend.as_deref(),
+        cfg.search.searxng_endpoint.as_deref(),
     ));
+    registry.register_delegate(subagent_port.clone());
+    let registry = Arc::new(registry);
     let reg_for_lookup = registry.clone();
     let lookup: agent_runtime::runner::ToolLookup =
         Arc::new(move |name: &str| reg_for_lookup.get(name));
@@ -259,6 +271,8 @@ async fn main() -> anyhow::Result<()> {
         let proj_root = project_root.clone();
         let max_iter = cfg.agent.max_iterations;
         let redact2 = redact.clone();
+        let port2 = subagent_impl.clone();
+        let budget_cell2 = budget_cell.clone();
 
         tokio::spawn(async move {
             // 当前运行中的任务：取消令牌 + 句柄。
@@ -338,6 +352,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         };
 
+                        let cap = router.per_task_limit();
                         let ctl = RunControl::new();
                         let cancel = ctl.cancel.clone();
                         let bus_task = bus.clone();
@@ -347,27 +362,42 @@ async fn main() -> anyhow::Result<()> {
                         // 「批准本任务同类操作」的登记由执行循环直接 await 引擎完成
                         // （曾经过一个同步回调再 spawn，会在登记落定前就查下一次，
                         // 用户按了 `a` 仍被再问一次）。
-                        let runtime =
-                            agent_runtime::AgentRuntime::new(agent_runtime::RuntimeDeps {
-                                provider: provider.clone(),
-                                provider_name: provider_name.clone(),
-                                tools: lookup2.clone(),
-                                tool_defs: tool_defs2.clone(),
-                                perm: perm2.clone(),
-                                store: store.clone(),
-                                log_cfg: log_cfg2.clone(),
-                                approvals: approvals2.clone(),
-                                context_cfg: Default::default(),
-                                per_task_budget: router.per_task_limit(),
-                                // 每轮成本报到账本，月度熔断才有数据可判。
-                                cost_sink: Some(Arc::new({
-                                    let router = router.clone();
-                                    move |cost: f64| router.record_spend(cost)
-                                })),
-                                redact: redact2.clone(),
-                            });
+                        let deps = agent_runtime::RuntimeDeps {
+                            provider: provider.clone(),
+                            provider_name: provider_name.clone(),
+                            tools: lookup2.clone(),
+                            tool_defs: tool_defs2.clone(),
+                            perm: perm2.clone(),
+                            store: store.clone(),
+                            log_cfg: log_cfg2.clone(),
+                            approvals: approvals2.clone(),
+                            context_cfg: Default::default(),
+                            per_task_budget: router.per_task_limit(),
+                            // 每轮成本：报月度账本 + 记入任务树共享预算；
+                            // 合计超额直接取消令牌，由执行循环已有的
+                            // cancel.cancelled() 分支收尾（父子一起停）。
+                            cost_sink: Some(Arc::new({
+                                let router = router.clone();
+                                let cell = budget_cell2.clone();
+                                let gate_cancel = cancel.clone();
+                                move |cost: f64| {
+                                    router.record_spend(cost);
+                                    cell.charge(cost);
+                                    if cap > 0.0 && cell.spent_usd() > cap {
+                                        gate_cancel.cancel();
+                                    }
+                                }
+                            })),
+                            redact: redact2.clone(),
+                        };
+                        // 登记父任务上下文：委派时实现方按 parent_task_id 取它。
+                        port2
+                            .register(spec.clone(), deps.clone(), bus_task.clone())
+                            .await;
+                        let runtime = agent_runtime::AgentRuntime::new(deps);
 
                         tracing::info!(task = %task_id, provider = %provider_name, "task started");
+                        let port3 = port2.clone();
                         let handle = tokio::spawn(async move {
                             match runtime.run(spec, bus_task, ctl).await {
                                 Ok(_) => tracing::info!(task = %task_id, "task run finished"),
@@ -375,6 +405,7 @@ async fn main() -> anyhow::Result<()> {
                                     tracing::error!(task = %task_id, error = %e, "task run failed")
                                 }
                             }
+                            port3.unregister(&task_id).await;
                         });
                         current = Some((cancel, handle));
                     }

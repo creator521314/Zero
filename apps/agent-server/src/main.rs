@@ -58,12 +58,22 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let root = cfg.agent.resolved_root();
-    let registry = Arc::new(agent_tools::default_tools(
-        agent_tools::SearchBackend::resolve(
-            cfg.search.backend.as_deref(),
-            cfg.search.searxng_endpoint.as_deref(),
-        ),
+    // 任务树共享预算单元 + 委派端口。
+    //
+    // 保留具体类型句柄：`register` 是装配层职责，不属于 `SubagentPort`
+    // 的能力面（tools 只需要 `run_subtask`）。
+    let budget_cell = agent_runtime::subagent::BudgetCell::default();
+    let subagent_impl = Arc::new(agent_runtime::subagent::RuntimeSubagent::new(
+        budget_cell.clone(),
     ));
+    let subagent_port: Arc<dyn agent_core::subagent::SubagentPort> = subagent_impl.clone();
+
+    let mut registry = agent_tools::default_tools(agent_tools::SearchBackend::resolve(
+        cfg.search.backend.as_deref(),
+        cfg.search.searxng_endpoint.as_deref(),
+    ));
+    registry.register_delegate(subagent_port.clone());
+    let registry = Arc::new(registry);
     let reg_for_lookup = registry.clone();
     let lookup: agent_runtime::runner::ToolLookup =
         Arc::new(move |name: &str| reg_for_lookup.get(name));
@@ -120,7 +130,11 @@ async fn main() -> anyhow::Result<()> {
     let redactor = std::sync::Arc::new(agent_providers::SecretRedactor::from_config(&cfg));
     let redact: agent_runtime::runner::RedactFn =
         std::sync::Arc::new(move |s: &str| redactor.redact(s));
-    let runtime = agent_runtime::AgentRuntime::new(agent_runtime::RuntimeDeps {
+    // 预算熔断必须取消**执行循环正在监听**的那个令牌，因此先建好再交给
+    // RunControl；自建一个没人监听的令牌等于没有熔断。
+    let task_cancel = tokio_util::sync::CancellationToken::new();
+    let cap = router.per_task_limit();
+    let deps = agent_runtime::RuntimeDeps {
         provider: provider.clone(),
         provider_name: provider.name().to_string(),
         tools: lookup,
@@ -131,13 +145,22 @@ async fn main() -> anyhow::Result<()> {
         approvals: Arc::new(agent_runtime::runner::ApprovalInbox::new(ap_rx)),
         context_cfg: Default::default(),
         per_task_budget: router.per_task_limit(),
-        // 每轮成本报到账本，月度熔断才有数据可判。
+        // 每轮成本：报月度账本 + 记入任务树共享预算；合计超额取消令牌。
         cost_sink: Some(Arc::new({
             let router = router.clone();
-            move |cost: f64| router.record_spend(cost)
+            let cell = budget_cell.clone();
+            let gate_cancel = task_cancel.clone();
+            move |cost: f64| {
+                router.record_spend(cost);
+                cell.charge(cost);
+                if cap > 0.0 && cell.spent_usd() > cap {
+                    gate_cancel.cancel();
+                }
+            }
         })),
         redact,
-    });
+    };
+    let runtime = agent_runtime::AgentRuntime::new(deps.clone());
 
     let mut spec = TaskSpec::new(prompt, String::new());
     spec.tier = PermissionTier::L1; // headless 无人值守，默认全自动
@@ -147,10 +170,23 @@ async fn main() -> anyhow::Result<()> {
     spec.workspace = ws.display().to_string();
     // 工具沙箱 = 项目根（默认启动目录）；私有工作区只放系统数据。
     spec.project_root = Some(cfg.agent.resolved_project_root().display().to_string());
+    // headless 单任务：登记一次即可，不需要 unregister。
+    subagent_impl
+        .register(spec.clone(), deps, bus.clone())
+        .await;
 
     // 注意：不再在此手写 `TaskStarted`——落盘统一由 recorder 订阅总线完成，
     // 否则同一条事件会被写两遍。
-    match runtime.run(spec, bus, RunControl::new()).await {
+    match runtime
+        .run(
+            spec,
+            bus,
+            RunControl {
+                cancel: task_cancel.clone(),
+            },
+        )
+        .await
+    {
         Ok(o) => {
             println!("\n最终结果: {o:?}");
             Ok(())
