@@ -205,6 +205,29 @@ impl MalformedArgs {
     }
 }
 
+/// 工具 trait。name/description/JSON-Schema 与 MCP 语义对齐，便于二期接入 MCP。
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    /// JSON Schema，供 LLM 生成 tool_calls。
+    fn parameters(&self) -> serde_json::Value;
+    /// 静态风险等级，供权限引擎初筛。
+    fn risk_level(&self) -> Risk;
+    /// 是否是「终止信号」工具：调用后执行循环应立即结束并汇总产物。
+    ///
+    /// 默认 `false`；`finish` 等显式收尾工具覆盖为 `true`。
+    fn is_terminating(&self) -> bool {
+        false
+    }
+    /// 执行。
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,27 +260,4 @@ mod tests {
         );
         assert_eq!(v[MalformedArgs::KEY], serde_json::json!("bad json"));
     }
-}
-
-/// 工具 trait。name/description/JSON-Schema 与 MCP 语义对齐，便于二期接入 MCP。
-#[async_trait]
-pub trait Tool: Send + Sync {
-    fn name(&self) -> &str;
-    fn description(&self) -> &str;
-    /// JSON Schema，供 LLM 生成 tool_calls。
-    fn parameters(&self) -> serde_json::Value;
-    /// 静态风险等级，供权限引擎初筛。
-    fn risk_level(&self) -> Risk;
-    /// 是否是「终止信号」工具：调用后执行循环应立即结束并汇总产物。
-    ///
-    /// 默认 `false`；`finish` 等显式收尾工具覆盖为 `true`。
-    fn is_terminating(&self) -> bool {
-        false
-    }
-    /// 执行。
-    async fn execute(
-        &self,
-        args: serde_json::Value,
-        ctx: &ToolCtx,
-    ) -> Result<ToolOutput, ToolError>;
 }

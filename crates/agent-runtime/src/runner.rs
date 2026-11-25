@@ -21,16 +21,12 @@ use agent_core::provider::{
 };
 use agent_core::store::LogConfig;
 use agent_core::task::{AgentRunner, RunControl, TaskSpec, TaskState};
-use agent_core::tool::{Tool, ToolCtx, ToolErrorCode};
+use agent_core::tool::{MalformedArgs, Tool, ToolCtx, ToolErrorCode};
 use agent_store::JsonlStore;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::context::{ContextConfig, ContextManager};
-
-/// 工具参数解析失败时的标记键：模型发来的 args 不是合法 JSON 对象时，
-/// 执行循环据此回填一条明确错误（而不是把 Null 当「没传参数」静默执行）。
-const MALFORMED_ARGS_KEY: &str = "__malformed_args_error";
 
 /// 单个工具调用的执行超时。超过即按失败回填，模型可换策略。
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -300,16 +296,10 @@ impl AgentRuntime {
             // 保留原文并打上标记，执行阶段据此回填一条明确的错误结果。
             let arguments = match serde_json::from_str::<serde_json::Value>(&args) {
                 Ok(v) if v.is_object() => v,
-                Ok(v) => {
-                    serde_json::json!({
-                        MALFORMED_ARGS_KEY: format!("参数不是 JSON 对象：{v}")
-                    })
-                }
+                Ok(v) => MalformedArgs::marker(format!("参数不是 JSON 对象：{v}")),
                 Err(e) => {
                     let raw: String = args.chars().take(300).collect();
-                    serde_json::json!({
-                        MALFORMED_ARGS_KEY: format!("JSON 解析失败：{e}；原文：{raw}")
-                    })
+                    MalformedArgs::marker(format!("JSON 解析失败：{e}；原文：{raw}"))
                 }
             };
             calls.push(ToolCall {
@@ -560,13 +550,9 @@ impl AgentRuntime {
                 let call_id = call.id.clone();
 
                 // 参数解析失败的调用：不执行工具，回填明确错误让模型重发。
-                if let Some(reason) = call
-                    .arguments
-                    .get(MALFORMED_ARGS_KEY)
-                    .and_then(|v| v.as_str())
-                {
+                if let Some(reason) = MalformedArgs::reason(&call.arguments) {
                     let content = format!(
-                        "[error] 工具参数不是合法 JSON，未执行：{reason}\n\
+                        "[error:malformed_args] 工具参数不是合法 JSON，未执行：{reason}\n\
                          请重新完整输出合法的 JSON 参数。"
                     );
                     let _ = bus.send(Event::ToolCallStart {
@@ -1484,6 +1470,15 @@ mod tests {
             name: Some(name.to_string()),
             args_delta: args.into(),
         }
+    }
+
+    #[test]
+    fn malformed_args_are_built_by_the_typed_helper_not_a_magic_string() {
+        let v = MalformedArgs::marker("oops");
+        assert!(MalformedArgs::reason(&v) == Some("oops"));
+        assert!(v.is_object());
+        // 正常参数绝不能被误判
+        assert!(MalformedArgs::reason(&serde_json::json!({"cmd": "ls"})).is_none());
     }
 
     #[tokio::test]
