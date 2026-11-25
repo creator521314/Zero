@@ -2,6 +2,8 @@
 
 pub mod context;
 pub mod runner;
+pub mod subagent;
 
 pub use context::ContextManager;
 pub use runner::{AgentRuntime, RuntimeDeps};
+pub use subagent::{BudgetCell, RuntimeSubagent};

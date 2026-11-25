@@ -35,6 +35,10 @@ const MALFORMED_ARGS_KEY: &str = "__malformed_args_error";
 /// 单个工具调用的执行超时。超过即按失败回填，模型可换策略。
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// delegate 内部自带 300s 墙钟超时，父层工具超时必须更长，
+/// 否则父层会在 120s 先把它掐断（TOOL_TIMEOUT 对所有工具一视同仁）。
+const DELEGATE_TOOL_TIMEOUT: Duration = Duration::from_secs(330);
+
 /// 审批应答。
 #[derive(Debug, Clone)]
 pub enum ApprovalReply {
@@ -141,6 +145,10 @@ impl ApprovalInbox {
 }
 
 /// 运行时依赖。
+///
+/// Clone 用于子任务委派：子 deps 由父 deps 克隆后覆写工具集与预算，
+/// 其余依赖（provider / perm / store / approvals / cost_sink / redact）天然共享。
+#[derive(Clone)]
 pub struct RuntimeDeps {
     pub provider: Arc<dyn LlmProvider>,
     pub provider_name: String,
@@ -242,16 +250,22 @@ impl AgentRuntime {
                 StreamEvent::Start { .. } => {}
                 StreamEvent::TextDelta(t) => {
                     text.push_str(&t);
-                    let _ = bus.send(Event::TextDelta {
-                        id: agent_core::ids::TaskId(task_id.to_string()),
-                        text: t,
-                    });
+                    // 子任务只保留整轮 AssistantTurn，不广播逐字增量：
+                    // 既不挤占 1024 容量的总线，也不会串进父任务对话区。
+                    if task.depth == 0 {
+                        let _ = bus.send(Event::TextDelta {
+                            id: agent_core::ids::TaskId(task_id.to_string()),
+                            text: t,
+                        });
+                    }
                 }
                 StreamEvent::ReasoningDelta(r) => {
-                    let _ = bus.send(Event::ReasoningDelta {
-                        id: agent_core::ids::TaskId(task_id.to_string()),
-                        text: r,
-                    });
+                    if task.depth == 0 {
+                        let _ = bus.send(Event::ReasoningDelta {
+                            id: agent_core::ids::TaskId(task_id.to_string()),
+                            text: r,
+                        });
+                    }
                 }
                 StreamEvent::ToolCallDelta {
                     index,
@@ -892,7 +906,11 @@ impl AgentRuntime {
             workspace: std::path::PathBuf::from(&task.workspace),
             project_root: task.project_root.as_ref().map(std::path::PathBuf::from),
             task_id: task.id.0.clone(),
-            timeout: TOOL_TIMEOUT,
+            timeout: if call.name == "delegate" {
+                DELEGATE_TOOL_TIMEOUT
+            } else {
+                TOOL_TIMEOUT
+            },
             cancel: cancel.clone(),
         };
 
