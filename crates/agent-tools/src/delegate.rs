@@ -5,7 +5,7 @@ use std::sync::Arc;
 use agent_core::event::Outcome;
 use agent_core::perm::Risk;
 use agent_core::subagent::{SubagentPort, SubtaskResult, SubtaskSpec};
-use agent_core::tool::{Tool, ToolCtx, ToolError, ToolOutput};
+use agent_core::tool::{Tool, ToolCtx, ToolError, ToolErrorCode, ToolOutput};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -74,6 +74,27 @@ impl Tool for DelegateTool {
     ) -> Result<ToolOutput, ToolError> {
         let spec: SubtaskSpec = serde_json::from_value(args.clone())
             .map_err(|e| ToolError::InvalidArgs(format!("delegate 参数不合法：{e}")))?;
+        let caps = self.port.capabilities();
+        let unsupported = [
+            (
+                spec.model.is_some() && !caps.supports_model_override,
+                "model",
+            ),
+            (
+                spec.budget_usd.is_some() && !caps.supports_budget,
+                "budget_usd",
+            ),
+            (spec.context.is_some() && !caps.supports_context, "context"),
+        ]
+        .into_iter()
+        .find(|(bad, _)| *bad)
+        .map(|(_, key)| key);
+        if let Some(key) = unsupported {
+            return Ok(ToolOutput::err_code(
+                ToolErrorCode::UnsupportedOption,
+                format!("当前委派后端不支持选项 {key}，未执行子任务；请去掉该参数后重试"),
+            ));
+        }
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
@@ -85,7 +106,16 @@ impl Tool for DelegateTool {
             Ok(result) => Ok(ToolOutput::ok(format_result(&result))),
             // 用 is_error 的工具结果而不是让父任务整体失败：模型可以换策略重试。
             // execute_tool 会统一加 [error] 前缀，这里不要重复加。
-            Err(e) => Ok(ToolOutput::err(format!("委派失败，未执行子任务：{e}"))),
+            Err(e) => {
+                let c = self.port.capacity();
+                Ok(ToolOutput::err_code(
+                    ToolErrorCode::DelegationFailed,
+                    format!(
+                        "委派失败，未执行子任务：{e}（当前子任务 {}/{}）",
+                        c.running, c.limit
+                    ),
+                ))
+            }
         }
     }
 }
@@ -196,6 +226,60 @@ mod tests {
             !out.content.starts_with("[error]"),
             "前缀由 execute_tool 统一加"
         );
+    }
+
+    /// 一个「什么都不支持」的后端：验证 DelegateTool 会明确拒绝而不是静默忽略。
+    struct NoOptionsPort;
+
+    #[async_trait]
+    impl SubagentPort for NoOptionsPort {
+        fn capabilities(&self) -> agent_core::subagent::SubagentCapabilities {
+            agent_core::subagent::SubagentCapabilities {
+                supports_model_override: false,
+                supports_budget: false,
+                supports_context: false,
+                max_depth: 1,
+            }
+        }
+
+        async fn run_subtask(
+            &self,
+            _parent_task_id: &str,
+            _spec: SubtaskSpec,
+            _cancel: CancellationToken,
+        ) -> Result<SubtaskResult, AgentError> {
+            panic!("能力校验应先拦下，不应走到这里")
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_option_is_rejected_before_dispatch() {
+        let tool = DelegateTool::new(Arc::new(NoOptionsPort));
+        let out = tool
+            .execute(json!({ "goal": "做事", "model": "cheap-model" }), &ctx())
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(
+            out.error_code,
+            Some(agent_core::tool::ToolErrorCode::UnsupportedOption)
+        );
+        assert!(out.content.contains("model"));
+        assert!(
+            !out.content.starts_with("[error]"),
+            "前缀由 execute_tool 统一加"
+        );
+    }
+
+    #[test]
+    fn default_capabilities_keep_existing_ports_compatible() {
+        // FakePort 没有实现 capabilities()/capacity()，必须走默认值且不报错。
+        let port = FakePort { fail: false };
+        let caps = SubagentPort::capabilities(&port);
+        assert!(caps.supports_model_override);
+        assert!(caps.supports_budget);
+        assert_eq!(caps.max_depth, 1);
+        assert_eq!(SubagentPort::capacity(&port).limit, 0);
     }
 
     #[test]

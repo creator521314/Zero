@@ -13,7 +13,9 @@ use std::time::Duration;
 use agent_core::error::AgentError;
 use agent_core::event::{Event, EventBus, Outcome};
 use agent_core::ids::TaskId;
-use agent_core::subagent::{SubagentPort, SubtaskResult, SubtaskSpec};
+use agent_core::subagent::{
+    SubagentCapabilities, SubagentCapacity, SubagentPort, SubtaskResult, SubtaskSpec,
+};
 use agent_core::task::{AgentRunner, RunControl, TaskSpec};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -90,6 +92,20 @@ impl RuntimeSubagent {
 
 #[async_trait]
 impl SubagentPort for RuntimeSubagent {
+    fn capabilities(&self) -> SubagentCapabilities {
+        SubagentCapabilities {
+            max_depth: MAX_DEPTH,
+            ..SubagentCapabilities::default()
+        }
+    }
+
+    fn capacity(&self) -> SubagentCapacity {
+        SubagentCapacity {
+            running: self.live.load(Ordering::Relaxed),
+            limit: MAX_LIVE_CHILDREN,
+        }
+    }
+
     async fn run_subtask(
         &self,
         parent_task_id: &str,

@@ -47,6 +47,34 @@ pub struct SubtaskResult {
     pub cost_usd: f64,
 }
 
+/// 委派后端声明自己支持什么。DelegateTool 在调用前据此拒绝不支持的选项，
+/// 而不是静默忽略（模型会以为「我指定了便宜模型」但根本没生效）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentCapabilities {
+    pub supports_model_override: bool,
+    pub supports_budget: bool,
+    pub supports_context: bool,
+    pub max_depth: u8,
+}
+
+impl Default for SubagentCapabilities {
+    fn default() -> Self {
+        Self {
+            supports_model_override: true,
+            supports_budget: true,
+            supports_context: true,
+            max_depth: 1,
+        }
+    }
+}
+
+/// 当前委派树的并发占用。`limit == 0` 表示「后端不提供容量信息」。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentCapacity {
+    pub running: usize,
+    pub limit: usize,
+}
+
 /// 依赖倒置端口：实现在 `agent-runtime`，装配层注入给 `agent-tools`。
 ///
 /// 为什么入参是 `parent_task_id: &str` 而不是 `&TaskSpec`：
@@ -54,6 +82,16 @@ pub struct SubtaskResult {
 /// 实现方由装配层登记「当前父任务」的上下文，这里按 id 取。
 #[async_trait]
 pub trait SubagentPort: Send + Sync {
+    /// 后端声明自己支持什么。默认「全支持」，保证既有实现行为不变。
+    fn capabilities(&self) -> SubagentCapabilities {
+        SubagentCapabilities::default()
+    }
+
+    /// 当前并发占用。`limit == 0` 表示不提供容量信息。
+    fn capacity(&self) -> SubagentCapacity {
+        SubagentCapacity::default()
+    }
+
     async fn run_subtask(
         &self,
         parent_task_id: &str,
