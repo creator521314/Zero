@@ -14,9 +14,11 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+pub mod distiller;
 pub mod memory_store;
 pub mod recorder;
 
+pub use distiller::spawn_memory_distiller;
 pub use memory_store::MemoryService;
 pub use recorder::{classify, spawn_event_sink};
 

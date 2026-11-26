@@ -51,6 +51,9 @@ pub fn classify(ev: &Event, cfg: &LogConfig) -> Option<(TaskId, Durability)> {
         // 纯界面事件（`/tasks` 列表、切历史任务）：不是任务事实，不进真相源。
         // 它们由编排层按需从 store 重算，落盘只会在日志里堆一堆可再生的副本。
         Event::TaskList { .. } | Event::TaskOpened { .. } => None,
+
+        // 系统通知（如 /improve 产物路径）：不进真相源，产物文件本身就是凭证。
+        Event::System { .. } => None,
     }
 }
 

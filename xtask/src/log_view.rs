@@ -294,6 +294,8 @@ fn render_events(events: &[StoredEvent], opts: &ViewOpts) -> String {
             }
             // 纯界面事件不落盘，也不会出现在审计日志里。
             Event::TaskList { .. } | Event::TaskOpened { .. } => {}
+            // 系统通知同样不落盘。
+            Event::System { .. } => {}
         }
     }
     s

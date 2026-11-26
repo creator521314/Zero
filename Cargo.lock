@@ -16,6 +16,7 @@ dependencies = [
  "agent-tui",
  "anyhow",
  "async-trait",
+ "chrono",
  "directories",
  "serde",
  "serde_json",

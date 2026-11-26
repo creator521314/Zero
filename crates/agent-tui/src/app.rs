@@ -27,6 +27,7 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "/news",
     "/remember",
     "/memory",
+    "/improve",
 ];
 
 /// 内置的新闻收集模板：`templates/news.md` 不存在时的兜底。
@@ -577,6 +578,12 @@ impl App {
                 }
                 self.wake_cursor();
             }
+            // 系统通知（如 /improve 产物路径）：进对话区，不落盘。
+            Event::System { message } => {
+                self.lines.push(Line::System(message));
+                self.auto_scroll();
+                self.wake_cursor();
+            }
             Event::TaskOpened { id, title, events } => {
                 self.panel_open = false;
                 if events.is_empty() {
@@ -781,6 +788,7 @@ impl App {
             || buf.starts_with("/resume ")
             || buf.starts_with("/news ")
             || buf.starts_with("/remember ")
+            || buf.starts_with("/improve ")
     }
 
     /// 执行一条 `/` 命令；成功执行后清空输入并关闭补全菜单。
@@ -827,6 +835,19 @@ impl App {
             // `/memory`：打开管理面板（生效页 / 候选页，Tab 切换）。
             "/memory" => {
                 self.pending_memory = Some(MemoryPending::Open);
+                self.input.take();
+                return true;
+            }
+            // `/improve <目标>`：记忆驱动的改进建议（编排层旁路生成 .patch）。
+            _ if cmd == "/improve" || cmd.starts_with("/improve ") => {
+                let goal = cmd.trim_start_matches("/improve").trim();
+                if goal.is_empty() {
+                    self.toast("用法：/improve <改进目标>");
+                    return true;
+                }
+                self.pending_command = Some(Command::Improve {
+                    goal: goal.to_string(),
+                });
                 self.input.take();
                 return true;
             }

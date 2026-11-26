@@ -122,6 +122,12 @@ pub enum Event {
         child_id: TaskId,
         goal: String,
     },
+    /// 纯界面系统通知（如 /improve 生成补丁后的路径提示）。
+    ///
+    /// 不落盘（recorder 返回 None）、不进审计真相源；产物文件本身就是凭证。
+    System {
+        message: String,
+    },
 }
 
 /// 工具调用的终结状态（[`Event::ToolCallEnd`] 的细分）。
@@ -195,6 +201,13 @@ pub enum Command {
     /// 还原成该任务当时的样子；之后用户再发指令，即以同一任务 id 携带这份上下文
     /// 继续跑（`TaskSpec::resume_from`）。
     ResumeTask(String),
+    /// 记忆驱动的代码改进建议（TUI `/improve <目标>`）。
+    ///
+    /// 由编排层在任务循环外单独跑一次模型调用，产物只写 `.patch` 文件
+    /// （设计 O7：不建分支、不 commit、不 push），路径经 [`Event::System`] 回给界面。
+    Improve {
+        goal: String,
+    },
     Quit,
 }
 

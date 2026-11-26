@@ -2412,6 +2412,7 @@ mod tests {
                 "/news",
                 "/remember",
                 "/memory",
+                "/improve",
             ]
         );
 
@@ -2479,7 +2480,7 @@ mod tests {
         let mut app = App::default();
         let _ = handle_key(&mut app, key(KeyCode::Char('/')));
         assert!(app.completion_active);
-        assert_eq!(app.slash_candidates().len(), 8);
+        assert_eq!(app.slash_candidates().len(), 9);
 
         let _ = handle_key(&mut app, key(KeyCode::Char('c')));
         assert_eq!(app.slash_candidates(), vec!["/clear"]);
@@ -2561,9 +2562,11 @@ mod tests {
         let _ = handle_key(&mut app, key(KeyCode::Down));
         assert_eq!(app.completion_sel, 7);
         let _ = handle_key(&mut app, key(KeyCode::Down));
-        assert_eq!(app.completion_sel, 7, "到底后 clamp");
+        assert_eq!(app.completion_sel, 8);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 8, "到底后 clamp");
         let _ = handle_key(&mut app, key(KeyCode::Up));
-        assert_eq!(app.completion_sel, 6);
+        assert_eq!(app.completion_sel, 7);
 
         let _ = handle_key(&mut app, key(KeyCode::Esc));
         assert!(!app.completion_active, "Esc 关闭补全");

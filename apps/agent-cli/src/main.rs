@@ -170,6 +170,102 @@ fn user_memory_path() -> std::path::PathBuf {
         .join("memory.jsonl")
 }
 
+/// 记忆驱动的代码改进建议：组装记忆 + 项目结构 → 模型生成 unified diff →
+/// 校验 → 写 `.patch`。硬边界（O7）：不建分支、不 commit、不 push、不跑测试。
+async fn run_improve(
+    provider: Arc<dyn agent_core::provider::LlmProvider>,
+    memory: Arc<agent_store::MemoryService>,
+    project_root: &std::path::Path,
+    ws_root: &std::path::Path,
+    goal: &str,
+) -> String {
+    use agent_core::memory::{MemoryPort, MemoryQuery};
+    // 相关记忆：先按目标关键词取，退化为最近使用的生效条目。
+    let mut entries = match MemoryPort::panel(
+        memory.as_ref(),
+        MemoryQuery {
+            keyword: Some(goal.to_string()),
+            scope: None,
+            state: None,
+            limit: 8,
+        },
+    )
+    .await
+    {
+        Ok(v) if !v.is_empty() => v,
+        _ => MemoryPort::panel(
+            memory.as_ref(),
+            MemoryQuery {
+                keyword: None,
+                scope: None,
+                state: None,
+                limit: 8,
+            },
+        )
+        .await
+        .unwrap_or_default(),
+    };
+    let mem_text = entries
+        .drain(..)
+        .map(|e| format!("- {}", e.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // 项目顶层结构摘要（只列名字，不读内容）。
+    let mut files = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(project_root) {
+        for e in rd.flatten().take(50) {
+            files.push(e.file_name().to_string_lossy().to_string());
+        }
+    }
+
+    let prompt = format!(
+        "你是代码改进助手。目标：{goal}\n\n\
+         【相关长期记忆】\n{mem_text}\n\n\
+         【项目顶层结构】\n{}\n\n\
+         请输出一个 unified diff（以 diff --git 开头），只改必要的文件；\n\
+         不要输出解释文字，不要包含任何密钥或凭据。",
+        files.join("\n"),
+    );
+    let req = agent_core::provider::ChatRequest {
+        model: String::new(),
+        messages: vec![agent_core::provider::Message::user(prompt)],
+        tools: Vec::new(),
+        temperature: Some(0.2),
+        max_tokens: Some(4096),
+        stream: false,
+        reasoning_effort: None,
+        metadata: agent_core::provider::RequestMeta {
+            task_id: None,
+            route_hint: None,
+        },
+    };
+    let text = match provider.chat(req).await {
+        Ok(resp) => resp.message.text(),
+        Err(e) => return format!("/improve 失败：{e}"),
+    };
+    // 校验：凭据红线 + 补丁格式。
+    if agent_core::memory::scan_secret(&text) {
+        return "/improve 拒绝：补丁内容疑似含凭据，已丢弃".into();
+    }
+    if !text.contains("diff --git") && !text.contains("--- ") {
+        return "/improve 未产出补丁格式内容，已丢弃".into();
+    }
+    let dir = ws_root.join("workspace").join("patches");
+    tokio::fs::create_dir_all(&dir).await.ok();
+    let path = dir.join(format!(
+        "improve-{}.patch",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    match tokio::fs::write(&path, &text).await {
+        Ok(_) => format!(
+            "改进建议已生成：{}（仅 .patch，未做任何 git 操作，请人工审阅后手动合并）",
+            path.display()
+        ),
+        Err(e) => format!("/improve 写文件失败：{e}"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cfg_path = ProvidersFile::config_path();
@@ -277,6 +373,21 @@ async fn main() -> anyhow::Result<()> {
 
     // 总线 → TUI 转发 + jsonl 落盘（落盘规则集中在 agent_store::recorder）
     agent_store::spawn_event_sink(bus.clone(), store.clone(), cfg.log.clone(), Some(ev_tx));
+
+    // 记忆提炼 worker（M5）：任务成功/失败收尾后旁路提炼候选，失败静默。
+    {
+        let distill_provider = router.resolve(None, None).await?;
+        agent_store::spawn_memory_distiller(
+            bus.clone(),
+            store.clone(),
+            memory.clone(),
+            distill_provider,
+            agent_core::memory::MemoryScope::Project {
+                root: project_root.display().to_string(),
+            },
+            agent_core::memory::MemoryConfig::default(),
+        );
+    }
 
     // Agent 命令循环
     {
@@ -546,6 +657,27 @@ async fn main() -> anyhow::Result<()> {
                                 });
                             }
                         }
+                    }
+                    Command::Improve { goal } => {
+                        // 记忆驱动的改进建议：旁路跑一次模型调用，产物只写
+                        // .patch（设计 O7），路径经 Event::System 回给界面。
+                        let provider = match router.resolve(None, None).await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let _ = bus.send(Event::System {
+                                    message: format!("/improve 失败：provider 不可用（{e}）"),
+                                });
+                                continue;
+                            }
+                        };
+                        let mem = memory2.clone();
+                        let proj = proj_root.clone();
+                        let ws = cfg_root.clone();
+                        let bus_c = bus.clone();
+                        tokio::spawn(async move {
+                            let msg = run_improve(provider, mem, &proj, &ws, &goal).await;
+                            let _ = bus_c.send(Event::System { message: msg });
+                        });
                     }
                     Command::Quit => break,
                 }

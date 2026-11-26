@@ -24,3 +24,6 @@
 /config/config.toml
 /config/config.*.toml
 !/config/config.example.toml
+
+# 项目级记忆库（设计 O4）：每个仓库本地自有，不入版本库
+.zero/
