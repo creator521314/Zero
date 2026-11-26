@@ -284,6 +284,8 @@ pub enum MemoryPending {
     Reload,
     /// 确认当前选中候选 → Active。
     Confirm,
+    /// 候选页批量确认：全部可见候选 → Active（P0-1B，避免逐条按）。
+    ConfirmAll,
     /// 丢弃当前选中候选 → Archived。
     Discard,
     /// 删除当前选中条目（生效页）。
@@ -1559,6 +1561,25 @@ impl App {
                     self.reload_memory_panel().await;
                     self.refresh_memory_candidates().await;
                 }
+            }
+            MemoryPending::ConfirmAll => {
+                // P0-1B：候选页一键全部确认（旧实现只能逐条按，候选无限堆积）。
+                let ids: Vec<agent_core::memory::MemoryId> = {
+                    let Some(p) = self.memory_panel.as_ref() else {
+                        return;
+                    };
+                    p.entries.iter().map(|e| e.id.clone()).collect()
+                };
+                if ids.is_empty() {
+                    return;
+                }
+                match MemoryPort::confirm(port.as_ref(), &ids).await {
+                    Ok(n) if n > 0 => self.toast(format!("已确认 {n} 条生效")),
+                    Ok(_) => {}
+                    Err(e) => self.toast(format!("确认失败：{e}")),
+                }
+                self.reload_memory_panel().await;
+                self.refresh_memory_candidates().await;
             }
             MemoryPending::Discard => {
                 if let Some(id) = self.memory_selected_id() {

@@ -861,6 +861,11 @@ fn memory_panel_key(app: &mut App, key: KeyEvent) -> UiAction {
             app.pending_memory = Some(MemoryPending::Clear);
             UiAction::None
         }
+        // P0-1B：候选页 Ctrl+A 一键全部确认。
+        KeyCode::Char('a') if candidate_page && key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.pending_memory = Some(MemoryPending::ConfirmAll);
+            UiAction::None
+        }
         KeyCode::Up => {
             app.memory_panel_move(-1);
             UiAction::None
@@ -942,7 +947,7 @@ fn draw_memory_panel(f: &mut Frame, app: &App, area: Rect) {
     )));
     // 提示行。
     lines.push(RtLine::from(Span::styled(
-        " Tab 切页  ⏎ 确认候选  Del 删除  ^K 清空  Esc 关闭 ",
+        " Tab 切页  ⏎ 确认候选  ^A 全部确认  Del 删除  ^K 清空  Esc 关闭 ",
         Style::default().fg(ink::FG_MUTED),
     )));
     // 条目行。

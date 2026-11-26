@@ -1,6 +1,6 @@
 # Zero 记忆系统 · 设计文档
 
-> 状态：**v1.0 待实施**（2026-11-26）
+> 状态：**v1.1 实测修订**（2026-11-27）。v1.0 实施后在真实使用中暴露「只写不读」等缺陷，见 `docs/memory-issues.md`；本文 §4 已按修复结果回写。
 > 上游：`docs/memory-requirements.md` v1.0（已裁决）。本文只做设计展开，**不是逐行实施说明书**；若需要低能力模型照做，另出实施说明书。
 > 本文所有「已裁决」条目均来自需求澄清文档 §10，不再重新讨论取舍。
 
@@ -185,7 +185,7 @@ append-only 操作日志，每行一个 `MemoryRecord`：
 ```
 /remember 显式 ─┐
                 ├─► 准入管道 ─► state=Active ─► upsert
-收尾自动提炼 ───┘（结果一律 state=Candidate，批量确认后才改 Active）
+收尾自动提炼 ───┘（v1.1：通过准入管道的产出**直接 Active**，见 §4.4）
 ```
 
 ### 4.1 准入管道（顺序不可调换）
@@ -194,21 +194,32 @@ append-only 操作日志，每行一个 `MemoryRecord`：
 2. **密钥扫描**：`scan_secret(&content)` 命中即拒绝，**错误文案不回显原文**。
    - 纯字符串匹配：常见凭据前缀（`ghp_`/`xoxb-`/`sk-`/`AKIA`/`-----BEGIN ... PRIVATE KEY-----`）与 `http://user:pass@` 形态；零新依赖。
    - 参考教训：测试里写假样例时用 `EXAMPLE_NOT_A_REAL_KEY_000`，避免 Push Protection 拒收（见 `docs/interface-hardening.md` §8.3）。
-3. **来源与时间戳**：由写入端强制填充，调用方不能伪造（`MemoryEntry` 构造器统一生成）。
-4. **去重 / 冲突**：同 `scope` + 同 `key` → `version+1`、`state=Archived` 留旧版本；无 `key` 时用归一化 content 的哈希做隐式键。
-5. **落盘**：`upsert` 追加记录并更新内存索引；失败不影响任务结束（O5）。
+3. **元信息黑名单（v1.1，P1-3）**：关于记忆系统自身的条目不入库——tags 命中黑名单
+   （记忆机制/记忆存储/记忆系统/记忆库/长期记忆/记忆功能）或 content 命中关键词
+   （记忆系统/记忆库/记忆机制/memory.jsonl/长期记忆//memory）即拒绝。
+4. **来源与时间戳**：由写入端强制填充，调用方不能伪造（`MemoryEntry` 构造器统一生成）。
+5. **去重 / 冲突**：同 `scope` + 同 `key` 且状态为 `Active | Candidate` → `version+1`、旧条目
+   `Archived` 留版本（v1.1：候选之间也去重，P0-2）；无 `key` 时用归一化 content 哈希兜底。
+6. **落盘**：`upsert` 追加记录并更新内存索引；失败不影响任务结束（O5）。
 
 ### 4.2 自动提炼（O5）
 
 - **触发点**：装配层的**提炼 worker 订阅 `EventBus`**，只在 `TaskFinished` 且 `Outcome::Success` / `Failed` 时触发；取消/暂停不触发。
-- **输入**：该任务最后一次 `ContextSnapshot` 的 messages + outcome 摘要；**不读全量会话日志**，控制成本。
-- **输出**：0~N 条 `state=Candidate` 条目（每条仍过准入管道）。
+- **输入**：该任务最后一次 `ContextSnapshot` 的 messages + outcome 摘要，**外加已有生效记忆清单**（v1.1：供模型避免重复、复用同主题 key）；**不读全量会话日志**，控制成本。
+- **输出**：0~N 条 `state=Active` 条目（v1.1 自动转正，每条仍过准入管道），并要求模型
+  为每条产出**稳定显式 key**（如 `user:commit_language`），同主题更新复用同 key。
 - **失败策略**：provider 调用失败 / 解析失败 / 超时 → **静默跳过**，绝不阻塞任务结束、不写 `Event::Error`。
 - **不进执行循环**：worker 是旁路任务，因此 `RuntimeDeps` 零改动。
 
-### 4.3 候选批量确认（O6）
+### 4.3 候选批量确认（O6，v1.1 保留为兜底）
 
-`/memory` 面板的 Candidate 页：勾选 → `MemoryPort::confirm` → 批量 `state=Active`；或丢弃。确认前条目**不注入、不参与检索**（验收第 4 条）。
+`/memory` 面板的 Candidate 页：逐条 Enter 确认 / **Ctrl+A 全部确认（v1.1 新增）** / Del 丢弃；`Ctrl+K` 清空当前页。候选态仍保留：`confirm`/`discard` 接口与面板入口不变，作为自动转正的兜底与审计路径。
+
+### 4.4 自动转正（v1.1，P0-1A）
+
+v1.0 实测：提炼产出全部停在 `Candidate` 且唯一 `confirm` 调用点在 TUI 逐条按键，导致
+「记忆只写不读」。修订为：**通过准入管道的提炼产出直接 `state=Active`**，立即参与注入
+与检索；用户仍可在 `/memory` 生效页删除/清理（逻辑删除可追溯）。
 
 ---
 

@@ -199,6 +199,12 @@ impl MemoryService {
     /// `user_path`：用户级 jsonl 路径（生产用 `~/.config/zero/memory.jsonl`，
     /// 测试用临时目录）。构造时立即回放用户级文件；项目级文件按 scope 惰性加载。
     pub fn new(user_path: PathBuf, cfg: MemoryConfig) -> Self {
+        // P1-4：启动即确保用户级目录存在（幂等；不创建/不覆盖文件本身）。
+        if let Some(parent) = user_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(error = %e, path = %parent.display(), "创建用户级记忆目录失败");
+            }
+        }
         let mut inner = Inner {
             cfg,
             user_path: user_path.clone(),
@@ -223,7 +229,8 @@ impl MemoryStore for MemoryService {
         e.updated_at = now;
         e.last_used_at = e.last_used_at.max(now);
 
-        // 冲突：同 scope + 同 dedup key 且仍 Active 的旧条目 → 归档留版本。
+        // 冲突：同 scope + 同 dedup key 且未归档（Active | Candidate）的旧条目 →
+        // 归档留版本。P0-2：候选之间也去重，否则候选无限堆积（实测缺陷）。
         let key = e.dedup_key();
         let old = {
             let cache = inner.caches.get(&path).expect("已加载");
@@ -231,7 +238,7 @@ impl MemoryStore for MemoryService {
                 .entries
                 .values()
                 .find(|c| {
-                    c.state == MemoryState::Active
+                    matches!(c.state, MemoryState::Active | MemoryState::Candidate)
                         && c.scope == e.scope
                         && c.dedup_key() == key
                         && c.id != e.id
@@ -831,6 +838,45 @@ mod tests {
         assert_eq!(gone.state, MemoryState::Archived);
         let alive = MemoryStore::get(&s2, &ids[1]).await.unwrap().unwrap();
         assert_eq!(alive.state, MemoryState::Active);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn candidate_entries_dedup_against_each_other() {
+        // P0-2 回归：候选之间也必须去重（旧实现只匹配 Active，候选无限堆积）。
+        let tmp = std::env::temp_dir().join(format!("zero-mem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let s = svc(&tmp);
+        let mk = |at: i64| {
+            MemoryEntry::new(
+                MemoryScope::User,
+                "工作目录是 Rust 项目",
+                vec![],
+                MemorySource::Distilled { task_id: None, at },
+                MemoryState::Candidate,
+                at,
+            )
+        };
+        let first = MemoryStore::upsert(s.as_ref(), mk(1)).await.unwrap();
+        let second = MemoryStore::upsert(s.as_ref(), mk(2)).await.unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(second.version, first.version + 1, "候选同键写入应递增版本");
+        let old = MemoryStore::get(s.as_ref(), &first.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.state, MemoryState::Archived, "旧候选应归档留版本");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn new_creates_user_dir_without_touching_file() {
+        // P1-4 回归：构造 MemoryService 应创建用户级目录，但不创建/覆盖文件。
+        let tmp = std::env::temp_dir().join(format!("zero-mem-{}", uuid::Uuid::new_v4()));
+        let path = tmp.join("nested/zero/memory.jsonl");
+        let _ = MemoryService::new(path.clone(), MemoryConfig::default());
+        assert!(path.parent().unwrap().is_dir(), "父目录应被创建");
+        assert!(!path.exists(), "文件本身不应被创建");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
