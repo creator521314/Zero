@@ -13,6 +13,7 @@ async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 thiserror.workspace = true
+chrono.workspace = true
 reqwest.workspace = true
 
 # shell_exec 的子进程输出要按系统 OEM 代码页转码（见 shell.rs decode_output）。

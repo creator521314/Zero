@@ -79,11 +79,19 @@ async fn main() -> anyhow::Result<()> {
     ));
     let subagent_port: Arc<dyn agent_core::subagent::SubagentPort> = subagent_impl.clone();
 
+    // 记忆服务 + 工具注入（与 CLI 同一套规则）。
+    let memory = Arc::new(agent_store::MemoryService::new(
+        user_memory_path(),
+        agent_core::memory::MemoryConfig::default(),
+    ));
+    let injected_registry = agent_tools::InjectedRegistry::new();
+
     let mut registry = agent_tools::default_tools(agent_tools::SearchBackend::resolve(
         cfg.search.backend.as_deref(),
         cfg.search.searxng_endpoint.as_deref(),
     ));
     registry.register_delegate(subagent_port.clone());
+    registry.register_memory(memory.clone(), memory.clone(), injected_registry.clone());
     let registry = Arc::new(registry);
     let reg_for_lookup = registry.clone();
     let lookup: agent_runtime::runner::ToolLookup =
@@ -183,27 +191,22 @@ async fn main() -> anyhow::Result<()> {
     spec.project_root = Some(cfg.agent.resolved_project_root().display().to_string());
     // headless 单任务：登记一次即可，不需要 unregister。
     // 记忆注入快照（M2）：与 CLI 同一套规则；失败静默，不阻塞任务。
+    let memory_port = &*memory;
+    match agent_core::memory::MemoryPort::compose(
+        memory_port,
+        &agent_core::memory::MemoryScope::Project {
+            root: cfg.agent.resolved_project_root().display().to_string(),
+        },
+        agent_runtime::context::ContextConfig::default().max_context,
+    )
+    .await
     {
-        let memory = agent_store::MemoryService::new(
-            user_memory_path(),
-            agent_core::memory::MemoryConfig::default(),
-        );
-        let scope = agent_core::memory::MemoryScope::Project {
-            root: spec.project_root.clone().unwrap_or_default(),
-        };
-        match agent_core::memory::MemoryPort::compose(
-            &memory,
-            &scope,
-            agent_runtime::context::ContextConfig::default().max_context,
-        )
-        .await
-        {
-            Ok(ctx) if !ctx.text.is_empty() => {
-                tracing::info!(injected = ctx.injected_ids.len(), "memory injected");
-                spec.memory_context = Some(ctx);
-            }
-            _ => {}
+        Ok(ctx) if !ctx.text.is_empty() => {
+            tracing::info!(injected = ctx.injected_ids.len(), "memory injected");
+            injected_registry.register(&spec.id.0, ctx.injected_ids.clone());
+            spec.memory_context = Some(ctx);
         }
+        _ => {}
     }
     subagent_impl
         .register(spec.clone(), deps, bus.clone())

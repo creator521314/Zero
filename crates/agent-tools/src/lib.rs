@@ -6,11 +6,13 @@
 pub mod delegate;
 pub mod finish;
 pub mod fs_tools;
+pub mod memory_search;
 pub mod paths;
 pub mod registry;
 pub mod shell;
 pub mod web;
 
 pub use delegate::DelegateTool;
+pub use memory_search::{InjectedRegistry, MemorySearchTool};
 pub use registry::{default_tools, ToolRegistry};
 pub use web::SearchBackend;

@@ -217,6 +217,11 @@ pub enum MemoryError {
     Other(String),
 }
 
+/// 记忆类工具名集合（供 `tool_allowlist` / 子任务隔离判定；单一事实源）。
+pub fn is_memory_tool(name: &str) -> bool {
+    name == "memory_search"
+}
+
 /// 凭据扫描：命中常见密钥形态即拒绝写入（需求红线，命中错误文案不回显原文）。
 ///
 /// 零依赖的字符串匹配，覆盖：常见 token 前缀、PEM 私钥、URL 内嵌凭据、

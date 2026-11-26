@@ -221,6 +221,15 @@ async fn main() -> anyhow::Result<()> {
     ));
     let subagent_port: Arc<dyn agent_core::subagent::SubagentPort> = subagent_impl.clone();
 
+    // 记忆服务（用户级 ~/.config/zero/memory.jsonl；项目级 <project_root>/.zero/）。
+    // 失败不阻塞启动：记忆是增强能力，读写失败只影响注入与检索。
+    let memory = Arc::new(agent_store::MemoryService::new(
+        user_memory_path(),
+        agent_core::memory::MemoryConfig::default(),
+    ));
+    // 每任务已注入记忆 id 注册表：memory_search 据此排除重复（设计 §5.1）。
+    let injected_registry = agent_tools::InjectedRegistry::new();
+
     // 工具集。搜索后端按 [search] 段解析：未配置时走内置免 key 后端，
     // 保证 web_search 开箱可用。
     let mut registry = agent_tools::default_tools(agent_tools::SearchBackend::resolve(
@@ -228,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.search.searxng_endpoint.as_deref(),
     ));
     registry.register_delegate(subagent_port.clone());
+    registry.register_memory(memory.clone(), memory.clone(), injected_registry.clone());
     let registry = Arc::new(registry);
     let reg_for_lookup = registry.clone();
     let lookup: agent_runtime::runner::ToolLookup =
@@ -245,13 +255,6 @@ async fn main() -> anyhow::Result<()> {
     // 存储
     let store = Arc::new(JsonlStore::new(&root));
     store.init().await?;
-
-    // 记忆服务（用户级 ~/.config/zero/memory.jsonl；项目级 <project_root>/.zero/）。
-    // 失败不阻塞启动：记忆是增强能力，读写失败只影响注入与检索。
-    let memory = Arc::new(agent_store::MemoryService::new(
-        user_memory_path(),
-        agent_core::memory::MemoryConfig::default(),
-    ));
     // 过期清理：`transient_retention_days` 此前只是配置里的死字段，临时事件
     // （含工具输出）永不删除。失败不阻塞启动。
     if let Err(e) = store
@@ -292,6 +295,7 @@ async fn main() -> anyhow::Result<()> {
         let port2 = subagent_impl.clone();
         let budget_cell2 = budget_cell.clone();
         let memory2 = memory.clone();
+        let injected2 = injected_registry.clone();
 
         tokio::spawn(async move {
             // 当前运行中的任务：取消令牌 + 句柄。
@@ -381,6 +385,8 @@ async fn main() -> anyhow::Result<()> {
                                         truncated = ctx.truncated,
                                         "memory injected"
                                     );
+                                    // 登记已注入 id：memory_search 据此去重（设计 §5.1）。
+                                    injected2.register(&spec.id.0, ctx.injected_ids.clone());
                                     spec.memory_context = Some(ctx);
                                 }
                                 Ok(_) => {}
@@ -448,6 +454,7 @@ async fn main() -> anyhow::Result<()> {
 
                         tracing::info!(task = %task_id, provider = %provider_name, "task started");
                         let port3 = port2.clone();
+                        let injected3 = injected2.clone();
                         let handle = tokio::spawn(async move {
                             match runtime.run(spec, bus_task, ctl).await {
                                 Ok(_) => tracing::info!(task = %task_id, "task run finished"),
@@ -456,6 +463,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                             port3.unregister(&task_id).await;
+                            injected3.unregister(&task_id);
                         });
                         current = Some((cancel, handle));
                     }

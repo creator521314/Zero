@@ -61,6 +61,18 @@ impl ToolRegistry {
     pub fn register_delegate(&mut self, port: Arc<dyn SubagentPort>) {
         self.register(Arc::new(DelegateTool::new(port)));
     }
+
+    /// 显式注入记忆检索工具（同 `register_delegate` 的理由）。
+    pub fn register_memory(
+        &mut self,
+        index: Arc<dyn agent_core::memory::MemoryIndex>,
+        store: Arc<dyn agent_core::memory::MemoryStore>,
+        injected: crate::memory_search::InjectedRegistry,
+    ) {
+        self.register(Arc::new(crate::memory_search::MemorySearchTool::new(
+            index, store, injected,
+        )));
+    }
 }
 
 /// 组装一期默认工具集。

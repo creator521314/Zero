@@ -197,16 +197,18 @@ impl RuntimeSubagent {
 
         // ---- 子 deps：Clone 之后只覆写预算；工具集用统一的 allowlist 规则 ----
         let mut child_deps: RuntimeDeps = parent.deps.clone();
-        // 递归防护：子任务看不到、也调不到 delegate。
+        // 递归防护：子任务看不到、也调不到 delegate 与记忆工具。
         // 刻意不再在子 deps 里硬编码过滤——stream_once / execute_tool 会用
         // 同一条 TaskSpec::allows_tool 规则处理，避免两处逻辑漂移。
+        // 记忆完全隔离（设计 §6）：既无注入（memory_context 不复制，恒 None），
+        // 也无 memory_search 工具。
         child.tool_allowlist = Some(
             parent
                 .deps
                 .tool_defs
                 .iter()
                 .map(|d| d.name.clone())
-                .filter(|n| n != "delegate")
+                .filter(|n| n != "delegate" && !agent_core::memory::is_memory_tool(n))
                 .collect(),
         );
         if let Some(cap) = child.budget_usd {
@@ -424,16 +426,24 @@ mod tests {
                 description: "".into(),
                 parameters: serde_json::json!({}),
             },
+            agent_core::provider::ToolDef {
+                name: "memory_search".into(),
+                description: "".into(),
+                parameters: serde_json::json!({}),
+            },
         ];
         let allow: Vec<String> = defs
             .iter()
             .map(|d| d.name.clone())
-            .filter(|n| n != "delegate")
+            .filter(|n| n != "delegate" && !agent_core::memory::is_memory_tool(n))
             .collect();
         let mut task = TaskSpec::new("child", "/tmp/ws");
         task.tool_allowlist = Some(allow);
         assert!(!task.allows_tool("delegate"));
+        assert!(!task.allows_tool("memory_search"), "子任务不得调记忆工具");
         assert!(task.allows_tool("file_read"));
+        // 子任务无记忆注入（TaskSpec::new 默认 None，run_child 不复制）。
+        assert!(task.memory_context.is_none());
     }
 
     #[tokio::test]

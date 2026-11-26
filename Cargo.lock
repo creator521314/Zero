@@ -160,6 +160,7 @@ dependencies = [
  "agent-core",
  "agent-net",
  "async-trait",
+ "chrono",
  "reqwest",
  "serde",
  "serde_json",
