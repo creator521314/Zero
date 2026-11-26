@@ -1001,9 +1001,14 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             .fg(ink::PRIMARY)
             .add_modifier(Modifier::BOLD),
     );
-    // 中：provider · 运行状态（灰）
+    // 中：provider · 运行状态 · 前缀缓存命中率（灰）
+    let cache = app
+        .cache_hit
+        .filter(|(_, total)| *total > 0)
+        .map(|(hit, total)| format!(" · 缓存{}%", (hit.min(total)) * 100 / total))
+        .unwrap_or_default();
     let meta = Span::styled(
-        format!(" {} · {} ", app.provider, app.status),
+        format!(" {} · {}{} ", app.provider, app.status, cache),
         Style::default().fg(ink::FG_MUTED),
     );
     // 右：权限徽章（底色按档位三态）+ 候选角标

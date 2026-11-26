@@ -125,21 +125,28 @@ fn render_events(events: &[StoredEvent], opts: &ViewOpts) -> String {
                     s.push_str(&format!("▶ 任务：{title}\n"));
                 }
             }
+            Event::UserPrompt { text, .. } => {
+                if !opts.errors_only {
+                    s.push_str(&format!("  ✎ 用户：{}\n", clip(text, limit)));
+                }
+            }
             Event::ContextSnapshot {
                 iteration,
                 model,
-                messages,
+                added,
+                reset,
                 tools,
                 ..
             } => {
                 if !opts.errors_only {
                     s.push_str(&format!(
-                        "\n[轮 {iteration} · {model}] 上下文 {} 条消息 / 工具 {} 个\n",
-                        messages.len(),
+                        "\n[轮 {iteration} · {model}] 上下文{} {} 条消息 / 工具 {} 个\n",
+                        if *reset { "重置" } else { "新增" },
+                        added.len(),
                         tools.len()
                     ));
                     if opts.full {
-                        for m in messages {
+                        for m in added {
                             s.push_str(&format!(
                                 "    ▸ {}：{}\n",
                                 role_name(&m.role),

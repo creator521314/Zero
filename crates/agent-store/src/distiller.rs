@@ -75,30 +75,43 @@ pub fn spawn_memory_distiller(
 ) {
     let mut sub = bus.subscribe();
     tokio::spawn(async move {
+        // 子任务复用父任务的 EventBus，旧实现会把子任务内部的探查过程也
+        // 提炼成记忆，污染项目级记忆库。SubtaskLinked 一定先于子任务收尾。
+        let mut child_tasks: std::collections::HashSet<String> = Default::default();
         loop {
             let ev = match sub.recv().await {
                 Ok(ev) => ev,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            if let Event::TaskFinished { id, outcome } = ev {
-                // O5：仅成功/失败触发。
-                if !matches!(outcome, Outcome::Success { .. } | Outcome::Failed { .. }) {
-                    continue;
+            match ev {
+                Event::SubtaskLinked { child_id, .. } => {
+                    child_tasks.insert(child_id.0);
                 }
-                // 串行提炼即可（一期串行任务）；提炼慢不影响下一任务。
-                if let Err(e) = distill_once(
-                    &store,
-                    memory.as_ref(),
-                    provider.as_ref(),
-                    &scope,
-                    &cfg,
-                    &id,
-                )
-                .await
-                {
-                    tracing::warn!(error = %e, task = %id.0, "memory distill skipped");
+                Event::TaskFinished { id, outcome } => {
+                    if child_tasks.remove(&id.0) {
+                        tracing::debug!(task = %id.0, "skip distilling subtask");
+                        continue;
+                    }
+                    // O5：仅成功/失败触发。
+                    if !matches!(outcome, Outcome::Success { .. } | Outcome::Failed { .. }) {
+                        continue;
+                    }
+                    // 串行提炼即可（一期串行任务）；提炼慢不影响下一任务。
+                    if let Err(e) = distill_once(
+                        &store,
+                        memory.as_ref(),
+                        provider.as_ref(),
+                        &scope,
+                        &cfg,
+                        &id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, task = %id.0, "memory distill skipped");
+                    }
                 }
+                _ => {}
             }
         }
     });
@@ -112,7 +125,8 @@ async fn distill_once(
     cfg: &MemoryConfig,
     task_id: &TaskId,
 ) -> Result<usize, MemoryError> {
-    // 输入：该任务最后一次上下文快照（当时真正送给模型的消息），不读全量日志。
+    // 输入：由增量快照序列重建的完整上下文（当时真正送给模型的消息），
+    // 不读全量会话日志；见 `JsonlStore::resume_context()`。
     let Some(messages): Option<Vec<agent_core::provider::Message>> =
         store.resume_context(task_id).await
     else {
@@ -204,22 +218,50 @@ async fn distill_once(
     Ok(n)
 }
 
-/// 把快照消息裁成有限的文本记录（每条 ≤400 字符，总量 ≤6000 字符）。
+/// 把上下文裁成有限的文本记录（总量 ≤6000 字符）。
+///
+/// 提炼最关心「用户到底要什么」和「最后得出了什么结论」。旧实现从头部
+/// 顺序累加、超过 6000 就 break：固定 system 模板 + 早期大段工具输出会把
+/// 尾部真正有价值的追问与结论整段挤掉。这里改为跳过 system、按角色分配
+/// 不同配额、超预算时**保留尾部**并标注省略条数。
 fn clip_transcript(messages: &[Message]) -> String {
-    let mut out = String::new();
+    const MAX_CHARS: usize = 6000;
+    let mut lines: Vec<String> = Vec::new();
     for m in messages {
-        let role = match m.role {
-            agent_core::provider::Role::System => "system",
-            agent_core::provider::Role::User => "user",
-            agent_core::provider::Role::Assistant => "assistant",
-            agent_core::provider::Role::Tool => "tool",
+        let (role, limit) = match m.role {
+            agent_core::provider::Role::System => continue,
+            agent_core::provider::Role::User => ("user", 600),
+            agent_core::provider::Role::Assistant => ("assistant", 300),
+            agent_core::provider::Role::Tool => ("tool", 120),
         };
         let text = m.text();
-        let clipped: String = text.chars().take(400).collect();
-        out.push_str(&format!("{role}: {clipped}\n"));
-        if out.chars().count() > 6000 {
+        let clipped: String = text.chars().take(limit).collect();
+        let mut line = format!("{role}: {clipped}");
+        if text.chars().count() > limit {
+            line.push('…');
+        }
+        lines.push(line);
+    }
+
+    let mut total = 0usize;
+    let mut kept: Vec<String> = Vec::new();
+    for line in lines.iter().rev() {
+        let n = line.chars().count() + 1;
+        if total + n > MAX_CHARS {
             break;
         }
+        total += n;
+        kept.push(line.clone());
+    }
+    kept.reverse();
+    let omitted = lines.len() - kept.len();
+    let mut out = String::new();
+    if omitted > 0 {
+        out.push_str(&format!("[已省略 {omitted} 条较早消息]\n"));
+    }
+    for line in kept {
+        out.push_str(&line);
+        out.push('\n');
     }
     out
 }
@@ -281,6 +323,23 @@ mod tests {
         assert_eq!(out[0].0, "推送 GitHub 需要重试");
         assert_eq!(out[0].1, vec!["git"]);
         assert_eq!(out[0].2.as_deref(), Some("git:push_retry"));
+    }
+
+    #[test]
+    fn clip_transcript_keeps_tail_and_drops_fixed_system() {
+        let mut msgs = vec![Message::system("固定区模板".repeat(200))];
+        for i in 0..200 {
+            msgs.push(Message::user(format!("早期探查 {i} {}", "x".repeat(300))));
+        }
+        msgs.push(Message::user("最终追问：代理端口是多少？"));
+        msgs.push(Message::assistant("最终结论：代理端口 7890"));
+
+        let out = clip_transcript(&msgs);
+        assert!(!out.contains("固定区模板"), "system 模板不该占提炼预算");
+        assert!(out.contains("最终追问：代理端口是多少？"));
+        assert!(out.contains("最终结论：代理端口 7890"), "{out}");
+        assert!(out.contains("[已省略"), "超预算时应标注省略条数: {out}");
+        assert!(out.chars().count() <= 6100, "总量要受控: {}", out.len());
     }
 
     #[test]

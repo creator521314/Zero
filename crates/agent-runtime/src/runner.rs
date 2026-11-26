@@ -26,7 +26,7 @@ use agent_store::JsonlStore;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::context::{ContextConfig, ContextManager};
+use crate::context::{ContextAssembler, ContextConfig, ContextManager};
 
 /// 单个工具调用的执行超时。超过即按失败回填，模型可换策略。
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -176,63 +176,52 @@ impl AgentRuntime {
         Self { deps }
     }
 
+    /// 固定 system 区（v1.2）：**不含本次任务、不含记忆**。
+    ///
+    /// 旧实现把 `{prompt}` 与【长期记忆】都拼在这里，追问时第 0 条消息
+    /// 就变，前缀缓存全灭；且续跑回灌的旧快照又带一份旧 system，于是
+    /// system 条数随追问次数线性增长。现在这里只放逐字节恒定的内容，
+    /// 任务与记忆由 `ContextAssembler::first_user` 以 user 消息承载。
     fn system_prompt(task: &TaskSpec) -> String {
-        // 工具的相对路径基于项目根（没有项目根时就是私有工作区）；
-        // 提示词里给出的必须是同一个目录，否则模型会照着它去猜不存在的路径。
         let ws = task
             .project_root
             .clone()
             .unwrap_or_else(|| task.workspace.clone());
-        format!(
-            "你是一个个人助理 Agent，通过工具在用户电脑上完成真实任务。\n\
-             【用户任务】{prompt}\n\
-             【工作目录】{ws}（相对路径基于它；所有文件读写必须在此目录内）\n\
-             \n\
-             规则：\n\
-             1. 先思考再行动；**独立的探查操作（读文件、grep、ls 等）必须在一轮里并行批量调用**，\n\
-                不要一条一条慢慢试——每轮只发一条命令会迅速耗尽迭代预算。\n\
-             2. 产出文件时写入工作目录（推荐放到 artifacts/ 下），并在 finish 的 artifacts 里登记交付物路径。\n\
-             3. 任务完成时调用 finish 工具结束：在 summary 里给用户一段简洁总结。\n\
-             4. 如果某个操作被拒绝，换一种策略，不要重复同样的调用。\n\
-             5. 目标文件/目录不存在或目录为空时，**不要继续猜路径**；\n\
-                直接说明缺什么，向用户索要材料或改用其他思路。\n\
-             6. 迭代预算有限：拿到足以回答的信息就**立即收敛作答**，不要无限扩大检索范围。\n\
-             \n\
-             【审批】当你发起的工具调用需要用户确认时，用户批准后该工具的返回会以\n\
-             [user-approved] 开头；被拒绝会以 [rejected by user] 或 [denied] 开头。\n\
-             除此之外，你**无法得知**某次操作是否经过人工审批，也不得依据「操作成功了」\n\
-             推断权限系统是否设防。\
-             {memory}",
-            prompt = task.prompt,
-            ws = ws,
-            // 记忆注入快照（已在装配层完成动态截断与来源标注；None/空文本时为空串）。
-            // 子任务的 memory_context 恒为 None（完全隔离）。
-            memory = match &task.memory_context {
-                Some(mc) if !mc.text.is_empty() => format!("\n\n【长期记忆】\n{}", mc.text),
-                _ => String::new(),
-            },
-        )
+        ContextAssembler::fixed_system(&ws)
     }
 
-    /// 单次模型调用 + 流式聚合。返回 (文本, 工具调用集合, finish_reason, usage, provider)。
+    /// 单次模型调用 + 流式聚合。
+    ///
+    /// `extra` 是**只 appended 到本次请求、不写进历史**的临时消息
+    /// （预算提醒、强制收尾指令）。追加在尾部既不影响前缀缓存，也不会
+    /// 污染续跑上下文或记忆提炼输入（v1.2，旧实现把提醒以 Role::User
+    /// 永久 push 进历史）。
+    /// `allow_tools = false` 用于强制收尾轮：禁止模型再发起工具调用。
     async fn stream_once(
         &self,
         bus: &EventBus,
-        task_id: &str,
         cm: &mut ContextManager,
         cancel: &tokio_util::sync::CancellationToken,
         task: &TaskSpec,
+        extra: &[Message],
+        allow_tools: bool,
     ) -> Result<StreamOutcome, AgentError> {
+        let task_id = task.id.0.as_str();
+        let mut messages = cm.messages().to_vec();
+        messages.extend_from_slice(extra);
         let req = ChatRequest {
             model: task.model.clone().unwrap_or_default(),
-            messages: cm.messages().to_vec(),
-            tools: self
-                .deps
-                .tool_defs
-                .iter()
-                .filter(|d| task.allows_tool(&d.name))
-                .cloned()
-                .collect(),
+            messages,
+            tools: if allow_tools {
+                self.deps
+                    .tool_defs
+                    .iter()
+                    .filter(|d| task.allows_tool(&d.name))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            },
             temperature: Some(0.3),
             max_tokens: None,
             stream: true,
@@ -245,6 +234,7 @@ impl AgentRuntime {
 
         let mut stream = self.deps.provider.chat_stream(req).await?;
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut tool_acc: ToolAccum = std::collections::BTreeMap::new();
         let mut finish = agent_core::provider::FinishReason::Stop;
         let mut usage = Usage::default();
@@ -271,6 +261,7 @@ impl AgentRuntime {
                     }
                 }
                 StreamEvent::ReasoningDelta(r) => {
+                    reasoning.push_str(&r);
                     if task.depth == 0 {
                         let _ = bus.send(Event::ReasoningDelta {
                             id: agent_core::ids::TaskId(task_id.to_string()),
@@ -326,6 +317,7 @@ impl AgentRuntime {
 
         Ok(StreamOutcome {
             text,
+            reasoning,
             calls,
             finish,
             usage,
@@ -335,6 +327,9 @@ impl AgentRuntime {
 
 struct StreamOutcome {
     text: String,
+    /// 思考链在统一层保留（续跑/回放不丢），但不回传厂商：
+    /// OpenAI 兼容端点不接受请求里的 reasoning 字段。
+    reasoning: String,
     calls: Vec<ToolCall>,
     #[allow(dead_code)]
     finish: agent_core::provider::FinishReason,
@@ -380,6 +375,35 @@ impl AgentRunner for AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// 把自上次以来的新增消息落盘（v1.2 增量协议）。
+    ///
+    /// 收尾路径也必须调用：否则最后一轮的答复与工具结果只存在于事件里，
+    /// 快照序列缺一段，续跑与复盘都要靠另一套逻辑去补。
+    fn flush_context(
+        &self,
+        bus: &EventBus,
+        task_id: &agent_core::ids::TaskId,
+        iteration: u32,
+        model: &str,
+        cm: &mut ContextManager,
+        tools: Vec<String>,
+    ) {
+        let (added, reset) = cm.flush_delta();
+        if added.is_empty() && !reset {
+            return;
+        }
+        if self.deps.log_cfg.save_context {
+            let _ = bus.send(Event::ContextSnapshot {
+                id: task_id.clone(),
+                iteration,
+                model: model.to_string(),
+                added,
+                reset,
+                tools,
+            });
+        }
+    }
+
     /// 记录任务状态（失败只记日志：摘要写不进去不该让任务本身失败）。
     async fn mark_task(&self, task: &TaskSpec, state: TaskState) {
         if let Err(e) = self
@@ -408,43 +432,77 @@ impl AgentRuntime {
             project_root = %task.project_root.clone().unwrap_or_else(|| "-".into()),
             "run start"
         );
+        let prompt_text = (self.deps.redact)(&task.prompt);
         let _ = bus.send(Event::TaskStarted {
             id: task_id.clone(),
             title: task.title.clone(),
         });
+        // v1.2：用户输入独立落盘。旧实现只有冻结的标题，`/resume` / 切任务 /
+        // 重启后回放出的对话里完全没有用户说过什么。
+        let _ = bus.send(Event::UserPrompt {
+            id: task_id.clone(),
+            text: prompt_text.clone(),
+        });
 
-        let mut cm = ContextManager::new(self.deps.context_cfg.clone(), Self::system_prompt(&task));
-        // 续跑：接着上一次的上下文往下走（快照里已含 system 固定区与历史消息），
-        // 而不是从零开始——否则「恢复」只是把老对话留在日志里，模型什么都没记住。
-        match task.resume_messages.take() {
+        let memory_text = task
+            .memory_context
+            .as_ref()
+            .map(|mc| (self.deps.redact)(&mc.text))
+            .filter(|t| !t.trim().is_empty());
+
+        // 上下文唯一构造点：新任务 = 固定 system + 首轮 user（任务 + 记忆）；
+        // 续跑 = 沿用快照里的固定 system（不再重建）+ 规范化历史 + 尾部新增。
+        // 这样「同一对话追问 N 次」时 Role::System 恒为 1 条，前缀逐字节一致。
+        let mut cm = match task.resume_messages.take() {
             Some(history) if !history.is_empty() => {
                 let turns = history.len();
-                for m in history {
-                    cm.push(m);
+                let normalized = ContextAssembler::normalize_history(history);
+                let mut cm =
+                    ContextManager::from_messages(self.deps.context_cfg.clone(), normalized);
+                // 记忆变化才追加尾部增量；不变则历史里那份继续生效，前缀完全不动。
+                if let Some(upd) = task
+                    .memory_update
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    let safe = (self.deps.redact)(upd);
+                    cm.push(ContextAssembler::background_update(&safe));
                 }
-                // 恢复的上下文只到「上一次请求之前 + 上轮答复」为止；用户这次
-                // 新发的指令必须补进去，否则模型拿到的是原样的问题，只会把上一轮
-                // 的答案再答一遍。
-                if !task.prompt.trim().is_empty() {
-                    cm.push(Message::user(&task.prompt));
+                if !prompt_text.trim().is_empty() {
+                    cm.push(Message::user(&prompt_text));
                 }
-                tracing::info!(task = %task_id.0, turns, "resumed from snapshot");
+                tracing::info!(task = %task_id.0, turns, "resumed from increment context");
+                cm
             }
-            _ => cm.push(Message::user(&task.prompt)),
-        }
+            _ => {
+                let mut cm =
+                    ContextManager::new(self.deps.context_cfg.clone(), Self::system_prompt(&task));
+                cm.push(ContextAssembler::first_user(
+                    &prompt_text,
+                    memory_text.as_deref(),
+                ));
+                cm
+            }
+        };
 
         let cancel = ctl.cancel.clone();
         let mut artifacts: Vec<String> = Vec::new();
         let mut repeats: std::collections::HashMap<u64, usize> = Default::default();
         let mut no_progress = 0usize;
-        // R1：预算临近告警只注入一次，避免每轮重复提醒。
-        let mut budget_warned = false;
+        // 预算提醒按「剩余轮数」在请求尾部即时构造，不写进历史（见循环内）。
         let mut spent = 0.0f64;
         // 审计用：记录真实生效的模型（未显式指定时取 provider 名）。
         let model = task
             .model
             .clone()
             .unwrap_or_else(|| self.deps.provider_name.clone());
+        let tool_names: Vec<String> = self
+            .deps
+            .tool_defs
+            .iter()
+            .filter(|d| task.allows_tool(&d.name))
+            .map(|d| d.name.clone())
+            .collect();
 
         for iteration in 0..task.max_iterations {
             if cancel.is_cancelled() {
@@ -452,30 +510,44 @@ impl AgentRuntime {
                     id: task_id.clone(),
                     outcome: Outcome::Cancelled,
                 });
+                self.flush_context(
+                    &bus,
+                    &task_id,
+                    iteration as u32 + 1,
+                    &model,
+                    &mut cm,
+                    tool_names.clone(),
+                );
                 return Ok(Outcome::Cancelled);
             }
             cm.maybe_compress();
 
-            // 落盘本轮送往模型的完整上下文（含 system 固定区）。
-            // 放在请求之前：即使本轮流被中断或报错，也知道模型当时看到了什么。
-            if self.deps.log_cfg.save_context {
-                let _ = bus.send(Event::ContextSnapshot {
-                    id: task_id.clone(),
-                    iteration: iteration as u32,
-                    model: model.clone(),
-                    messages: cm.messages().to_vec(),
-                    tools: self
-                        .deps
-                        .tool_defs
-                        .iter()
-                        .filter(|d| task.allows_tool(&d.name))
-                        .map(|d| d.name.clone())
-                        .collect(),
-                });
-            }
+            // 只落「自上次快照以来新增的消息」；`reset=true` 表示压缩重写了
+            // 历史，此时 added 是全量基线。旧实现每轮全量落盘，日志按 O(N²) 膨胀。
+            self.flush_context(
+                &bus,
+                &task_id,
+                iteration as u32,
+                &model,
+                &mut cm,
+                tool_names.clone(),
+            );
+
+            // 预算临近提醒：只附加在本次请求尾部，**不写进历史**。
+            // 旧实现以 Role::User 永久 push 进 cm，于是提醒进了快照、
+            // 进了提炼输入、跨续跑被当成真实用户输入，过期数字还一直误导。
+            let remaining = task.max_iterations.saturating_sub(iteration + 1);
+            let budget_extra: Vec<Message> = if (1..=3).contains(&remaining) {
+                vec![Message::user(format!(
+                    "[系统提示] 迭代预算只剩 {remaining} 轮。请立即收敛：汇总已有发现直接作答，\
+                     或调用 finish 结束任务；不要再发起新的大范围探查。"
+                ))]
+            } else {
+                Vec::new()
+            };
 
             let out = match self
-                .stream_once(&bus, &task_id.0, &mut cm, &cancel, &task)
+                .stream_once(&bus, &mut cm, &cancel, &task, &budget_extra, true)
                 .await
             {
                 Ok(o) => o,
@@ -484,6 +556,14 @@ impl AgentRuntime {
                         id: task_id.clone(),
                         outcome: Outcome::Cancelled,
                     });
+                    self.flush_context(
+                        &bus,
+                        &task_id,
+                        iteration as u32 + 1,
+                        &model,
+                        &mut cm,
+                        tool_names.clone(),
+                    );
                     return Ok(Outcome::Cancelled);
                 }
                 Err(e) => {
@@ -539,6 +619,11 @@ impl AgentRuntime {
                 } else {
                     out.text.clone()
                 };
+                // 最终答复也要进上下文：增量快照序列必须覆盖完整对话，
+                // 否则续跑时「模型刚刚说过什么」只能靠事件反推。
+                if !out.text.is_empty() {
+                    cm.push(Message::assistant(out.text.clone()));
+                }
                 let _ = bus.send(Event::TaskFinished {
                     id: task_id.clone(),
                     outcome: Outcome::Success {
@@ -546,6 +631,14 @@ impl AgentRuntime {
                         artifacts: artifacts.clone(),
                     },
                 });
+                self.flush_context(
+                    &bus,
+                    &task_id,
+                    iteration as u32 + 1,
+                    &model,
+                    &mut cm,
+                    tool_names.clone(),
+                );
                 return Ok(Outcome::Success { summary, artifacts });
             }
 
@@ -561,7 +654,11 @@ impl AgentRuntime {
                 tool_call_id: None,
                 reasoning: None,
             };
-            assistant_msg.reasoning = None;
+            assistant_msg.reasoning = if out.reasoning.is_empty() {
+                None
+            } else {
+                Some(out.reasoning.clone())
+            };
             cm.push(assistant_msg);
 
             // 逐个执行工具
@@ -731,6 +828,14 @@ impl AgentRuntime {
                                 continue;
                             }
                             Err(_) => {
+                                self.flush_context(
+                                    &bus,
+                                    &task_id,
+                                    iteration as u32 + 1,
+                                    &model,
+                                    &mut cm,
+                                    tool_names.clone(),
+                                );
                                 return Ok(Outcome::Cancelled);
                             }
                         }
@@ -855,6 +960,14 @@ impl AgentRuntime {
                         artifacts: artifacts.clone(),
                     },
                 });
+                self.flush_context(
+                    &bus,
+                    &task_id,
+                    iteration as u32 + 1,
+                    &model,
+                    &mut cm,
+                    tool_names.clone(),
+                );
                 return Ok(Outcome::Success { summary, artifacts });
             }
 
@@ -876,19 +989,16 @@ impl AgentRuntime {
                             artifacts: artifacts.clone(),
                         },
                     });
+                    self.flush_context(
+                        &bus,
+                        &task_id,
+                        iteration as u32 + 1,
+                        &model,
+                        &mut cm,
+                        tool_names.clone(),
+                    );
                     return Ok(Outcome::Success { summary, artifacts });
                 }
-            }
-
-            // R1：接近迭代上限时注入一次性提醒，促使模型立即收敛作答——
-            // 否则模型对剩余预算一无所知，会以同样粒度探查到撞限为止。
-            let remaining = task.max_iterations.saturating_sub(iteration + 1);
-            if (1..=3).contains(&remaining) && !budget_warned {
-                budget_warned = true;
-                cm.push(Message::user(format!(
-                    "[系统提示] 迭代预算只剩 {remaining} 轮。请立即收敛：汇总已有发现直接作答，\
-                     或调用 finish 结束任务；不要再发起新的大范围探查。"
-                )));
             }
 
             tracing::debug!(task = %task_id, iteration, "iteration complete");
@@ -897,16 +1007,36 @@ impl AgentRuntime {
         // R2：迭代预算耗尽不直接失败——追加一轮强制收尾，让模型基于
         // 已收集的上下文给出阶段结论。25 轮的探查成果不该随错误一起作废。
         if !cancel.is_cancelled() {
-            cm.push(Message::user(
+            let final_extra = vec![Message::user(
                 "[系统提示] 迭代预算已耗尽。请立即基于以上已收集的信息输出最终结论：\
                  完成了什么、发现了什么、还剩什么没做。不要再调用任何工具。",
-            ));
+            )];
+            // 收尾轮也要留审计痕迹：旧实现既不发快照也不发 AssistantTurn，
+            // 最终结论只存在于 TaskFinished.summary，提炼与回放都看不到。
+            self.flush_context(
+                &bus,
+                &task_id,
+                task.max_iterations as u32,
+                &model,
+                &mut cm,
+                Vec::new(),
+            );
+            // allow_tools=false：收尾轮不再给模型任何工具，杜绝「又调一个」。
             if let Ok(out) = self
-                .stream_once(&bus, &task_id.0, &mut cm, &cancel, &task)
+                .stream_once(&bus, &mut cm, &cancel, &task, &final_extra, false)
                 .await
             {
+                let _ = bus.send(Event::AssistantTurn {
+                    id: task_id.clone(),
+                    iteration: task.max_iterations as u32,
+                    text: out.text.clone(),
+                    calls: out.calls.clone(),
+                    usage: out.usage,
+                });
                 let text = out.text.trim().to_string();
                 if !text.is_empty() {
+                    // 收尾答复也要进增量序列，续跑才能看到模型最后的结论。
+                    cm.push(Message::assistant(text.clone()));
                     let summary = format!(
                         "【部分完成 · 迭代预算 {} 轮已耗尽】\n{}",
                         task.max_iterations, text
@@ -918,6 +1048,14 @@ impl AgentRuntime {
                             artifacts: artifacts.clone(),
                         },
                     });
+                    self.flush_context(
+                        &bus,
+                        &task_id,
+                        task.max_iterations as u32,
+                        &model,
+                        &mut cm,
+                        tool_names.clone(),
+                    );
                     return Ok(Outcome::Success { summary, artifacts });
                 }
             }
@@ -1012,20 +1150,22 @@ impl AgentRuntime {
             }
         };
 
-        let arts: Vec<String> = out.side_effects.iter().map(|a| a.path.clone()).collect();
+        let mut arts: Vec<String> = out.side_effects.iter().map(|a| a.path.clone()).collect();
 
         // 脱敏必须在外置落盘**之前**：外置文件写的是原文的话，明文密钥
         // 会永久留在 ctx/*.txt，而下游只对回填模型的 500 字符摘要做脱敏，
         // 外置文件本身永远不会过脱敏管道。先脱敏，再外置。
         let redacted = (self.deps.redact)(&out.content);
 
-        // 大输出外置
+        // 大输出外置。外置文件也要登记为产物：否则模型只有回填文本里
+        // 一个 UUID 路径，事后无法追溯属于哪次调用、也拿不到交付物清单。
         let content = if cm.should_externalize(redacted.len()) {
             let ctxdir = std::path::Path::new(&task.workspace).join("ctx");
             let _ = tokio::fs::create_dir_all(&ctxdir).await;
             let fname = format!("{}.txt", uuid::Uuid::new_v4());
             let fpath = ctxdir.join(&fname);
             let _ = tokio::fs::write(&fpath, redacted.as_bytes()).await;
+            arts.push(format!("ctx/{fname}"));
             let snippet: String = redacted.chars().take(500).collect();
             format!(
                 "[输出已外置到 ctx/{fname}，共 {} 字节] 摘要：{snippet}",
@@ -1080,6 +1220,37 @@ mod tests {
     use agent_core::tool::{ToolError, ToolOutput};
     use futures::stream;
     use std::path::PathBuf;
+
+    /// 把增量快照序列还原成「每份快照落盘时的完整上下文」。
+    /// 与 `JsonlStore::resume_context()` 同语义：`reset` 清空重建，否则追加。
+    fn snapshot_states(events: &[Event]) -> Vec<Vec<Message>> {
+        let mut cur: Vec<Message> = Vec::new();
+        let mut out = Vec::new();
+        for e in events {
+            if let Event::ContextSnapshot { added, reset, .. } = e {
+                if *reset {
+                    cur.clear();
+                }
+                cur.extend(added.iter().cloned());
+                out.push(cur.clone());
+            }
+        }
+        out
+    }
+
+    /// 所有真正进入过上下文的消息（脱敏 / 隔离检查用）。
+    /// 只看 `added`，避免快照重建后的重复项干扰断言。
+    fn all_snapshot_messages(events: &[Event]) -> Vec<Message> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ContextSnapshot { added, .. } => Some(added),
+                _ => None,
+            })
+            .flatten()
+            .cloned()
+            .collect()
+    }
 
     /// 按脚本吐流式事件的假 provider：每轮取走一条剧本。
     struct ScriptedProvider {
@@ -1628,20 +1799,23 @@ mod tests {
         .await;
         assert!(matches!(outcome, Outcome::Success { .. }));
 
+        let states = snapshot_states(&events);
         let snapshots: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
                 Event::ContextSnapshot {
                     iteration,
                     model,
-                    messages,
                     tools,
                     ..
-                } => Some((*iteration, model.clone(), messages.clone(), tools.clone())),
+                } => Some((*iteration, model.clone(), tools.clone())),
                 _ => None,
             })
+            .zip(states)
+            .map(|((iteration, model, tools), messages)| (iteration, model, messages, tools))
             .collect();
-        assert_eq!(snapshots.len(), 2, "每轮都要留一份上下文快照");
+        // 每轮开头一份 + 收尾把最终答复补齐的一份。
+        assert_eq!(snapshots.len(), 3, "每轮增量快照 + 收尾快照");
         // 第 0 轮：system + user
         assert_eq!(snapshots[0].2.len(), 2);
         assert!(
@@ -1649,17 +1823,24 @@ mod tests {
             "system 固定区必须留存：{}",
             snapshots[0].2[0].text()
         );
-        assert_eq!(snapshots[0].2[1].text(), "介绍下本项目");
-        // 第 1 轮：system + user + assistant + 2 条工具结果 + 预算提醒
-        // （max_iterations=4，第 0 轮结束后剩 3 轮 → 注入 R1 收敛提醒）
-        assert_eq!(snapshots[1].2.len(), 6, "工具结果与预算提醒都应回填");
         assert!(
-            snapshots[1].2[5]
-                .text()
-                .contains("[系统提示] 迭代预算只剩 3 轮"),
-            "最后一条应是预算收敛提醒：{}",
-            snapshots[1].2[5].text()
+            snapshots[0].2[1].text().contains("介绍下本项目"),
+            "任务只出现在首轮 user 里：{}",
+            snapshots[0].2[1].text()
         );
+        // 第 1 轮：system + user + assistant + 2 条工具结果。
+        // 预算提醒是 ephemeral，只随本次请求发送、**不写进历史快照**。
+        assert_eq!(snapshots[1].2.len(), 5, "工具结果应回填，提醒不进历史");
+        assert!(
+            !snapshots[1]
+                .2
+                .iter()
+                .any(|m| m.text().contains("[系统提示] 迭代预算只剩")),
+            "预算提醒不得污染上下文历史"
+        );
+        // 第 2 轮（收尾）：把最终答复也补进快照序列。
+        assert_eq!(snapshots[2].2.len(), 6);
+        assert!(snapshots[2].2[5].text().contains("工作区是空的"));
         assert_eq!(snapshots[1].0, 1);
         assert_eq!(snapshots[1].1, "scripted");
         assert_eq!(snapshots[1].3.len(), 2, "可用工具名要记录");
@@ -1779,6 +1960,7 @@ mod tests {
             .iter()
             .map(|e| match &e.payload {
                 Event::TaskStarted { .. } => "task_started",
+                Event::UserPrompt { .. } => "user_prompt",
                 Event::ContextSnapshot { .. } => "context_snapshot",
                 Event::AssistantTurn { .. } => "assistant_turn",
                 Event::ToolCallStart { .. } => "tool_call_start",
@@ -1792,6 +1974,7 @@ mod tests {
             kinds,
             vec![
                 "task_started",
+                "user_prompt",
                 "context_snapshot",
                 "assistant_turn",
                 "tool_call_start",
@@ -1799,23 +1982,22 @@ mod tests {
                 "context_snapshot",
                 "assistant_turn",
                 "task_finished",
+                "context_snapshot",
             ]
         );
 
-        // 上下文快照带着 system 提示词一起落盘
-        let snap = session.events[1].payload.clone();
+        // 首份增量快照就是全量基线：固定 system + 首轮 user。
+        let snap = session.events[2].payload.clone();
         match snap {
-            Event::ContextSnapshot {
-                messages, tools, ..
-            } => {
-                assert!(messages[0].text().contains("个人助理 Agent"));
-                assert_eq!(messages[1].text(), "介绍下本项目");
+            Event::ContextSnapshot { added, tools, .. } => {
+                assert!(added[0].text().contains("个人助理 Agent"));
+                assert!(added[1].text().contains("介绍下本项目"));
                 assert_eq!(tools.len(), 2);
             }
             other => panic!("应为 ContextSnapshot: {other:?}"),
         }
         // 工具返回原文落盘
-        match &session.events[4].payload {
+        match &session.events[5].payload {
             Event::ToolCallEnd { output, .. } => {
                 assert_eq!(output.as_deref(), Some("工具原文输出"));
             }
@@ -2061,23 +2243,40 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_injects_memory_context_when_present() {
+    fn memory_is_injected_into_first_user_not_system() {
         let mut spec = TaskSpec::new("t", "/tmp/ws");
-        // None / 空文本 → 不出现【长期记忆】段。
-        assert!(!AgentRuntime::system_prompt(&spec).contains("【长期记忆】"));
+        let fixed = AgentRuntime::system_prompt(&spec);
+        assert!(!fixed.contains("【长期记忆】"), "固定 system 不含记忆");
+        assert!(!fixed.contains("【用户任务】"), "固定 system 不含本次任务");
+
+        // 记忆怎么变，system 都必须逐字节恒定——这是前缀缓存的前提。
         spec.memory_context = Some(agent_core::memory::MemoryContext::default());
-        assert!(
-            !AgentRuntime::system_prompt(&spec).contains("【长期记忆】"),
-            "空文本不应注入空段"
-        );
+        assert_eq!(AgentRuntime::system_prompt(&spec), fixed);
         spec.memory_context = Some(agent_core::memory::MemoryContext {
             text: "【记忆 · 用户级】端口 7890\n".into(),
             injected_ids: vec![],
             truncated: 0,
         });
-        let p = AgentRuntime::system_prompt(&spec);
-        assert!(p.contains("【长期记忆】"), "有快照应注入: {p}");
-        assert!(p.contains("端口 7890"), "记忆内容应在 system 里: {p}");
+        assert_eq!(AgentRuntime::system_prompt(&spec), fixed);
+
+        // 记忆随首轮 user 注入，且可以被回读用于判断是否需要尾部增量。
+        let user = ContextAssembler::first_user("t", Some("【记忆 · 用户级】端口 7890\n"));
+        let t = user.text();
+        assert!(t.contains("【当前任务】t"), "任务只出现一次: {t}");
+        assert!(t.contains("【长期记忆】"), "记忆段应在首轮 user: {t}");
+        assert!(t.contains("端口 7890"));
+        assert_eq!(
+            ContextAssembler::extract_memory(std::slice::from_ref(&user)).as_deref(),
+            Some("【记忆 · 用户级】端口 7890")
+        );
+        // 尾部是普通追问时，仍要能回溯到历史里的记忆（不能每次追问重发增量）。
+        let history = vec![user, Message::user("再问一句")];
+        assert!(
+            ContextAssembler::extract_memory(&history)
+                .unwrap()
+                .contains("端口 7890"),
+            "extract_memory 必须倒序遍历所有 user 消息"
+        );
     }
 
     /// 系统级验证「批准本任务同类操作」：按过 `a` 之后，同类调用不再弹窗。
@@ -2464,13 +2663,8 @@ mod tests {
         assert!(output.contains("<redacted>"), "返回应被替换: {output}");
         assert!(!output.contains(SECRET), "落盘原文里不能有密钥: {output}");
 
-        let model_saw: String = events
+        let model_saw: String = all_snapshot_messages(&events)
             .iter()
-            .filter_map(|e| match e {
-                Event::ContextSnapshot { messages, .. } => Some(messages),
-                _ => None,
-            })
-            .flatten()
             .filter(|m| m.role == Role::Tool)
             .map(|m| m.text())
             .collect::<Vec<_>>()
@@ -2673,13 +2867,8 @@ mod tests {
         }
 
         // 模型侧：工具消息带 [user-approved]。
-        let model_tool: Vec<String> = events
+        let model_tool: Vec<String> = all_snapshot_messages(&events)
             .iter()
-            .filter_map(|e| match e {
-                Event::ContextSnapshot { messages, .. } => Some(messages),
-                _ => None,
-            })
-            .flatten()
             .filter(|m| m.role == Role::Tool)
             .map(|m| m.text())
             .collect();
@@ -2815,10 +3004,26 @@ mod tests {
             text.iter().any(|t| t == "共 3 个文件。"),
             "快照之后的答复也要带上（模型得记得自己刚说过什么）：{text:?}"
         );
+        // 续跑沿用历史里的固定 system，不再重建第二条。
         assert_eq!(
-            text.last().map(String::as_str),
+            seen[0].iter().filter(|m| m.role == Role::System).count(),
+            1,
+            "v1.2：Role::System 恒 1 条"
+        );
+        assert_eq!(text[0], "旧的 system", "要沿用历史固定区而不是重建");
+        // 预算提醒是 ephemeral、只挂在请求尾部；排除它之后新指令仍在历史末尾。
+        let last_historical = text
+            .iter()
+            .rfind(|t| !t.starts_with("[系统提示]"))
+            .map(String::as_str);
+        assert_eq!(
+            last_historical,
             Some("再把结果写进 README"),
-            "新的指令必须补在最后——只接历史而不接新指令，模型会把上一轮再答一遍：{text:?}"
+            "新的指令必须补在历史最后——只接历史而不接新指令，模型会把上一轮再答一遍：{text:?}"
+        );
+        assert!(
+            text.iter().filter(|t| t.starts_with("[系统提示]")).count() <= 1,
+            "预算提醒最多 1 条且不累积"
         );
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
@@ -2951,8 +3156,8 @@ mod tests {
         // 上下文隔离：快照里不得出现「子任务内部过程」这段文本。
         let mut leaked = false;
         while let Ok(ev) = sub.try_recv() {
-            if let Event::ContextSnapshot { messages, .. } = ev {
-                for m in messages {
+            if let Event::ContextSnapshot { added, .. } = ev {
+                for m in added {
                     if m.text().contains("子任务内部过程，不应出现在父上下文") {
                         leaked = true;
                     }
@@ -3012,7 +3217,8 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
-    /// R1 回归：剩余轮数 ≤3 时向上下文注入一次性收敛提醒（只注入一次）。
+    /// R1 回归：剩余轮数 ≤3 时在**请求尾部**附加收敛提醒，
+    /// 且它是 ephemeral 的——绝不写进上下文历史 / 快照 / 续跑基线。
     #[tokio::test]
     async fn budget_warning_is_injected_once_near_iteration_limit() {
         let (runtime, _store, tmp) = make_runtime(
@@ -3046,12 +3252,10 @@ mod tests {
         let mut per_snapshot: Vec<(u32, usize)> = Vec::new();
         while let Ok(ev) = sub.try_recv() {
             if let Event::ContextSnapshot {
-                iteration,
-                messages,
-                ..
+                iteration, added, ..
             } = ev
             {
-                let n = messages
+                let n = added
                     .iter()
                     .filter(|m| m.text().contains("[系统提示] 迭代预算只剩"))
                     .count();
@@ -3059,12 +3263,11 @@ mod tests {
             }
         }
         per_snapshot.sort_by_key(|(i, _)| *i);
-        // 注入前的快照（第 0 轮）没有提醒；注入后提醒持续留在上下文里，
-        // 但每个后续快照里最多 1 条——证明没有每轮重复注入。
-        assert_eq!(per_snapshot[0], (0, 0), "第 0 轮不应有预算提醒");
-        for (iteration, n) in &per_snapshot[1..] {
-            assert_eq!(n, &1, "第 {iteration} 轮快照应恰好携带 1 条预算提醒");
-        }
+        assert!(!per_snapshot.is_empty(), "应有多轮增量快照");
+        assert!(
+            per_snapshot.iter().all(|(_, n)| *n == 0),
+            "预算提醒是请求尾部临时消息，不得累积进历史：{per_snapshot:?}"
+        );
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }

@@ -474,39 +474,6 @@ async fn main() -> anyhow::Result<()> {
                         // 就只是装饰，切了档提交时仍走默认 L2。
                         spec.max_iterations = max_iter;
 
-                        // 记忆注入快照（M2）：任务提交时算好并随 TaskSpec 走，
-                        // 审计可复现当时注入了什么；/resume 不重算（沿用原快照）。
-                        if spec.memory_context.is_none() {
-                            let scope = match spec.project_root.as_deref() {
-                                Some(r) if !r.is_empty() => {
-                                    agent_core::memory::MemoryScope::Project { root: r.into() }
-                                }
-                                _ => agent_core::memory::MemoryScope::User,
-                            };
-                            match agent_core::memory::MemoryPort::compose(
-                                memory2.as_ref(),
-                                &scope,
-                                agent_runtime::context::ContextConfig::default().max_context,
-                            )
-                            .await
-                            {
-                                Ok(ctx) if !ctx.text.is_empty() => {
-                                    tracing::info!(
-                                        injected = ctx.injected_ids.len(),
-                                        truncated = ctx.truncated,
-                                        "memory injected"
-                                    );
-                                    // 登记已注入 id：memory_search 据此去重（设计 §5.1）。
-                                    injected2.register(&spec.id.0, ctx.injected_ids.clone());
-                                    spec.memory_context = Some(ctx);
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "memory compose 失败，本次不注入")
-                                }
-                            }
-                        }
-
                         let provider = match router.resolve(None, spec.model.as_deref()).await {
                             Ok(p) => p,
                             Err(e) => {
@@ -518,6 +485,55 @@ async fn main() -> anyhow::Result<()> {
                                 continue;
                             }
                         };
+
+                        // v1.2：上下文窗口必须按**实际 provider**取，不能硬编码
+                        // 128K —— 32K 模型下压缩阈值永远够不着，请求直接超窗口。
+                        // compose 与 deps 共用同一份配置。
+                        let ctx_cfg = agent_runtime::context::ContextConfig::for_model(
+                            provider.capabilities().max_context,
+                        );
+
+                        // 记忆注入快照：不再拼进 system（那会让前缀缓存每次都断），
+                        // 而是随首轮 user 消息走。续跑时与上轮注入内容比对，
+                        // 只有变化才在尾部追加一条 [背景更新] 增量。
+                        if spec.memory_context.is_none() {
+                            let scope = match spec.project_root.as_deref() {
+                                Some(r) if !r.is_empty() => {
+                                    agent_core::memory::MemoryScope::Project { root: r.into() }
+                                }
+                                _ => agent_core::memory::MemoryScope::User,
+                            };
+                            match agent_core::memory::MemoryPort::compose(
+                                memory2.as_ref(),
+                                &scope,
+                                ctx_cfg.max_context,
+                            )
+                            .await
+                            {
+                                Ok(ctx) if !ctx.text.is_empty() => {
+                                    tracing::info!(
+                                        injected = ctx.injected_ids.len(),
+                                        truncated = ctx.truncated,
+                                        "memory composed"
+                                    );
+                                    injected2.register(&spec.id.0, ctx.injected_ids.clone());
+                                    if let Some(history) = spec.resume_messages.as_deref() {
+                                        let old =
+                                            agent_runtime::context::ContextAssembler::extract_memory(
+                                                history,
+                                            );
+                                        if old.as_deref() != Some(ctx.text.trim()) {
+                                            spec.memory_update = Some(ctx.text.clone());
+                                        }
+                                    }
+                                    spec.memory_context = Some(ctx);
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "memory compose 失败，本次不注入")
+                                }
+                            }
+                        }
 
                         let cap = router.per_task_limit();
                         let ctl = RunControl::new();
@@ -538,7 +554,7 @@ async fn main() -> anyhow::Result<()> {
                             store: store.clone(),
                             log_cfg: log_cfg2.clone(),
                             approvals: approvals2.clone(),
-                            context_cfg: Default::default(),
+                            context_cfg: ctx_cfg.clone(),
                             per_task_budget: router.per_task_limit(),
                             // 每轮成本：报月度账本 + 记入任务树共享预算；
                             // 合计超额直接取消令牌，由执行循环已有的
@@ -829,10 +845,11 @@ mod tests {
                     id: tid.clone(),
                     iteration: 1,
                     model: "m".into(),
-                    messages: vec![
+                    added: vec![
                         agent_core::provider::Message::system("你是助理"),
                         agent_core::provider::Message::user("统计文件数"),
                     ],
+                    reset: false,
                     tools: vec![],
                 },
             )
@@ -899,7 +916,8 @@ mod tests {
                     id: tid.clone(),
                     iteration: 1,
                     model: "m".into(),
-                    messages: vec![agent_core::provider::Message::user("你好？")],
+                    added: vec![agent_core::provider::Message::user("你好？")],
+                    reset: false,
                     tools: vec![],
                 },
             )

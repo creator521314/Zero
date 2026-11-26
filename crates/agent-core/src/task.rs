@@ -26,7 +26,8 @@ pub enum TaskState {
 pub struct TaskSpec {
     pub id: TaskId,
     pub title: String,
-    /// 用户原始任务描述（system 中固化，永不丢弃）。
+    /// 用户原始任务描述（v1.2：由首轮 user 消息承载，永不丢弃；
+    /// 不再复制进 system 固定区，以免同一句话重复多遍）。
     pub prompt: String,
     pub tier: PermissionTier,
     /// 每任务私有工作区：外置输出等**系统数据**落在里面。
@@ -45,18 +46,19 @@ pub struct TaskSpec {
     pub budget_usd: Option<f64>,
     /// 续跑：从哪个历史任务接上（`/resume` / 任务面板切换后提交时由界面填入）。
     ///
-    /// 编排层据此从 store 取该任务最后一次 `ContextSnapshot` 还原 `resume_messages`。
-    /// 界面只传 id、不碰消息，因为 TUI 不依赖 `agent-store`。
+    /// 编排层据此从 store 把该任务的增量 `ContextSnapshot` 序列重建成
+    /// `resume_messages`。界面只传 id、不碰消息，因为 TUI 不依赖 `agent-store`。
     #[serde(default)]
     pub resume_from: Option<TaskId>,
     /// 续跑时携带的历史消息（`/resume` 用）。
     ///
-    /// 由 store 里该任务最后一次 `ContextSnapshot` 还原而来——那就是当时
-    /// **真正送给模型**的上下文。带它启动时，执行循环不再从零拼 system+prompt，
-    /// 而是接着这份上下文继续。
+    /// 由 `JsonlStore::resume_context()` 把该任务的**增量**快照序列重建而来
+    /// ——那就是当时真正送给模型的上下文。
     ///
-    /// 注意：`prompt` 仍会写进新的 system 固定区（system 提示词每次都要重建），
-    /// 所以「当初要做什么」不会因为续跑而丢失。
+    /// v1.2：续跑不再重建 system 固定区，也不往 system 塞 prompt；
+    /// `ContextAssembler::normalize_history()` 保证 `Role::System` 恒 1 条，
+    /// 新指令只追加在尾部。同一对话追问 N 次时请求前缀逐字节一致，
+    /// 前缀缓存才能真正命中。
     #[serde(default)]
     pub resume_messages: Option<Vec<crate::provider::Message>>,
     /// 父任务 id；None = 顶层任务。用于委派关系与审计回放。
@@ -70,9 +72,15 @@ pub struct TaskSpec {
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
     /// 记忆注入快照（装配层在任务提交时算好；子任务恒为 None，完全隔离）。
-    /// `Some` 且文本非空时拼进 system 固定区；随事件/日志可复现当时注入了什么。
+    /// v1.2：不再拼进 system 固定区，而是随首轮 user 消息注入，避免
+    /// 记忆一变就打断请求前缀缓存；随事件/日志仍可复现当时注入了什么。
     #[serde(default)]
     pub memory_context: Option<crate::memory::MemoryContext>,
+    /// 续跑时的记忆增量（v1.2）：本次 compose 与上轮注入内容不同时，
+    /// 由编排层填入最新记忆文本，runner 把它作为**尾部追加**的一条消息。
+    /// 记忆不变时为 None —— 历史里已有的那份继续生效，前缀完全不动。
+    #[serde(default)]
+    pub memory_update: Option<String>,
 }
 
 impl TaskSpec {
@@ -95,6 +103,7 @@ impl TaskSpec {
             depth: 0,
             tool_allowlist: None,
             memory_context: None,
+            memory_update: None,
         }
     }
 

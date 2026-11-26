@@ -123,6 +123,38 @@ fn to_openai_message(m: &Message) -> Value {
 
     let text = parts_to_text(&m.content);
 
+    // 多模态：Capabilities.vision=true 的端点必须真的把图片发出去。
+    // 旧实现静默丢掉 ContentPart::Image，模型只会看到一句空文本。
+    // OpenAI 只接受 user 消息里的 image_url，故仅对 Role::User 生效。
+    if m.role == Role::User {
+        let images: Vec<Value> = m
+            .content
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Image {
+                    url,
+                    b64,
+                    media_type,
+                } => {
+                    let uri = b64
+                        .as_ref()
+                        .map(|b| format!("data:{media_type};base64,{b}"))
+                        .or_else(|| url.clone());
+                    uri.map(|u| json!({"type": "image_url", "image_url": {"url": u}}))
+                }
+                _ => None,
+            })
+            .collect();
+        if !images.is_empty() {
+            let mut parts = Vec::new();
+            if !text.is_empty() {
+                parts.push(json!({"type": "text", "text": text}));
+            }
+            parts.extend(images);
+            return json!({ "role": role, "content": parts });
+        }
+    }
+
     // assistant 发起工具调用
     if !m.tool_calls.is_empty() {
         let calls: Vec<Value> = m
@@ -154,7 +186,9 @@ fn parts_to_text(parts: &[ContentPart]) -> String {
         .iter()
         .filter_map(|p| match p {
             ContentPart::Text { text } => Some(text.as_str()),
-            _ => None, // 多模态一期不发送
+            // 图片由 `to_openai_message` 单独组 content array；这里只负责
+            // 纯文本视图（审计 / 提炼 / tool 回填都不该塞 base64）。
+            _ => None,
         })
         .collect::<Vec<_>>()
         .join("")
@@ -380,10 +414,14 @@ fn parse_usage(v: Option<&Value>) -> Usage {
             .get("completion_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(|x| x.as_u64()),
+        // 两套缓存口径：OpenAI 放 `prompt_tokens_details.cached_tokens`，
+        // DeepSeek 放顶层 `prompt_cache_hit_tokens`。此前只认前者，导致
+        // DeepSeek 明明命中了缓存，TUI 的「缓存N%」却永远不显示。
         cached_tokens: u
             .get("prompt_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
-            .and_then(|x| x.as_u64()),
+            .and_then(Value::as_u64)
+            .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64)),
     }
 }
 
@@ -482,5 +520,64 @@ mod tests {
         let (text, reasoning) = split_content_reasoning(&delta);
         assert_eq!(text, None);
         assert_eq!(reasoning.as_deref(), Some("我在思考..."));
+    }
+
+    #[test]
+    fn usage_reads_both_openai_and_deepseek_cache_fields() {
+        let openai = parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "prompt_tokens_details": { "cached_tokens": 80 }
+        })));
+        assert_eq!(openai.cached_tokens, Some(80));
+
+        // DeepSeek 把命中数放在 usage 顶层，旧实现读不到 → TUI 缓存率恒为空。
+        let deepseek = parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "prompt_cache_hit_tokens": 64,
+            "prompt_cache_miss_tokens": 36
+        })));
+        assert_eq!(deepseek.cached_tokens, Some(64));
+        assert_eq!(deepseek.input_tokens, 100);
+    }
+
+    #[test]
+    fn user_image_is_sent_as_multimodal_content() {
+        let m = Message {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("这张图里写了什么？"),
+                ContentPart::Image {
+                    url: None,
+                    b64: Some("QUJD".into()),
+                    media_type: "image/png".into(),
+                },
+            ],
+            tool_calls: vec![],
+            tool_call_id: None,
+            reasoning: None,
+        };
+        let v = to_openai_message(&m);
+        assert!(v["content"].is_array(), "图片消息必须是 content array");
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(
+            v["content"][1]["image_url"]["url"],
+            "data:image/png;base64,QUJD"
+        );
+
+        let by_url = Message {
+            content: vec![ContentPart::Image {
+                url: Some("https://example.com/a.png".into()),
+                b64: None,
+                media_type: "image/png".into(),
+            }],
+            ..m
+        };
+        let v = to_openai_message(&by_url);
+        assert_eq!(
+            v["content"][0]["image_url"]["url"],
+            "https://example.com/a.png"
+        );
     }
 }

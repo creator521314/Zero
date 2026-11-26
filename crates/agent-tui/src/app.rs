@@ -200,6 +200,9 @@ pub struct App {
     pub tier: String,
     pub provider: String,
     pub status: String,
+    /// 最近一轮的 (缓存命中 token, 输入 token)：header 显示前缀缓存命中率。
+    /// None 表示厂商没回报该字段。
+    pub cache_hit: Option<(u64, u64)>,
     pub scroll_from_bottom: u16,
     pub should_quit: bool,
     /// 是否跟随输出（自动滚到底）。
@@ -350,6 +353,7 @@ impl Default for App {
             tier: "L2".into(),
             provider: "-".into(),
             status: "就绪".into(),
+            cache_hit: None,
             scroll_from_bottom: 0,
             should_quit: false,
             follow: true,
@@ -417,6 +421,23 @@ impl App {
                     self.lines
                         .push(Line::System(format!("▶ 任务开始: {title}")));
                     self.scroll_to_bottom();
+                }
+            }
+            // v1.2：用户输入独立落盘，回放时才能还原「当时到底问了什么」。
+            // 实时提交时 submit() 已 push 过一行，故就近去重；回放路径
+            // （lines 被整体替换）没有这一行，能正常补上。
+            Event::UserPrompt { text, .. } => {
+                if !text.trim().is_empty() {
+                    let already = self
+                        .lines
+                        .iter()
+                        .rev()
+                        .take(6)
+                        .any(|l| matches!(l, Line::User(t) if t.trim() == text.trim()));
+                    if !already {
+                        self.lines.push(Line::User(text));
+                        self.scroll_to_bottom();
+                    }
                 }
             }
             Event::SubtaskLinked { goal, .. } => {
@@ -498,7 +519,11 @@ impl App {
             // 整轮回复：实时路径下它与逐字增量重合（增量已经拼好了），但
             // **历史转写**里通常只有它——`TextDelta` 默认不落盘。所以：内容
             // 与最后一行正文相同就跳过，不同才补，两条路径都不重复。
-            Event::AssistantTurn { text, .. } => {
+            Event::AssistantTurn { text, usage, .. } => {
+                // 前缀缓存命中率可观测：追问是否真的省钱，界面上要看得见。
+                if usage.input_tokens > 0 {
+                    self.cache_hit = usage.cached_tokens.map(|hit| (hit, usage.input_tokens));
+                }
                 if !text.trim().is_empty() {
                     let same = matches!(self.lines.last(), Some(Line::Assistant(t)) if t.trim() == text.trim());
                     if !same {

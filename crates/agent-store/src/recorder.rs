@@ -23,8 +23,11 @@ use crate::JsonlStore;
 /// 内容已被按轮次的快照覆盖，落盘只会撑爆文件。
 pub fn classify(ev: &Event, cfg: &LogConfig) -> Option<(TaskId, Durability)> {
     match ev {
-        // 任务生命周期与错误：参与二期同步，长期保留。
+        // 任务生命周期、用户输入与错误：参与二期同步，长期保留。
+        // v1.2：`UserPrompt` 是「用户说过什么」的唯一真相源，绝不能随
+        // Transient 保留期被清掉，否则回放又变成只有工具调用没有提问。
         Event::TaskStarted { id, .. }
+        | Event::UserPrompt { id, .. }
         | Event::TaskFinished { id, .. }
         | Event::Error { id, .. } => Some((id.clone(), Durability::Persistent)),
 
@@ -122,7 +125,8 @@ mod tests {
             id: TaskId::new(),
             iteration: 0,
             model: "m".into(),
-            messages: vec![],
+            added: vec![],
+            reset: false,
             tools: vec![],
         };
         assert_eq!(
@@ -190,7 +194,8 @@ mod tests {
                 id: tid.clone(),
                 iteration: 0,
                 model: "m".into(),
-                messages: vec![],
+                added: vec![],
+                reset: false,
                 tools: vec![],
             },
             Event::TextDelta {

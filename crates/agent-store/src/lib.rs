@@ -157,54 +157,95 @@ impl JsonlStore {
         out
     }
 
-    /// 取某个任务最后一份上下文快照里的消息（用于「恢复继续」）。
+    /// 取某个任务最后一份上下文里的消息（用于「恢复继续」）。
     ///
-    /// 之所以用快照而不是重放事件：快照就是**当时真正送给模型的那份上下文**
-    /// （含 system 固定区与历史工具结果），重放还得自己重新拼。
-    /// 会话 id 与任务 id 同名（见 `recorder`），找不到就返回 None。
+    /// v1.2：委托 `resume_context`，避免两处各维护一份重建逻辑而漂移。
     pub async fn last_messages(
         &self,
         task_id: &TaskId,
     ) -> Option<Vec<agent_core::provider::Message>> {
-        let session = self
-            .load_session(&SessionId::from_raw(task_id.0.clone()))
-            .await
-            .ok()?;
-        session
-            .events
-            .iter()
-            .rev()
-            .find_map(|ev| match &ev.payload {
-                Event::ContextSnapshot { messages, .. } => Some(messages.clone()),
-                _ => None,
-            })
+        self.resume_context(task_id).await
     }
 
-    /// 续跑上下文：最后一次快照 + 快照之后的模型答复。
+    /// 续跑上下文：按**增量快照序列**重建当时真正送给模型的上下文，
+    /// 再补齐最后一份快照之后的整轮回复与工具结果。
     ///
-    /// 快照是在**每次请求之前**拍的，所以任务最后那轮答复不在快照里；不带上的话，
-    /// 恢复后模型会「忘记自己刚刚说过什么」。快照之前的答复都已在快照内，不重复补。
+    /// v1.2 的关键修复：
+    /// - 旧实现直接取最后一份「全量快照」，于是每次续跑都会把旧 system
+    ///   一起回灌，system 条数随追问次数线性增长；现在按 added 逐份追加，
+    ///   遇到 `reset=true`（压缩）则整份替换。
+    /// - 旧实现只把快照后的 `AssistantTurn.text` 补成一条纯文本 assistant
+    ///   消息，**丢掉 tool_calls 与全部工具结果**：末轮有工具调用时
+    ///   `assistant.tool_calls` 找不到配对 tool 消息，OpenAI 兼容端点直接 400。
+    ///   现在连同 calls 与 ToolCallEnd 一并复原，交给 runner 做配对规范化。
     pub async fn resume_context(
         &self,
         task_id: &TaskId,
     ) -> Option<Vec<agent_core::provider::Message>> {
+        use agent_core::provider::{ContentPart, Message, Role};
+
         let session = self
             .load_session(&SessionId::from_raw(task_id.0.clone()))
             .await
             .ok()?;
-        let last = session
-            .events
-            .iter()
-            .rposition(|e| matches!(e.payload, Event::ContextSnapshot { .. }))?;
-        let mut messages = match &session.events[last].payload {
-            Event::ContextSnapshot { messages, .. } => messages.clone(),
-            _ => return None,
-        };
-        for ev in &session.events[last + 1..] {
-            if let Event::AssistantTurn { text, .. } = &ev.payload {
-                if !text.trim().is_empty() {
-                    messages.push(agent_core::provider::Message::assistant(text));
+        let mut messages: Vec<Message> = Vec::new();
+        let mut last_snapshot = 0usize;
+        for (idx, ev) in session.events.iter().enumerate() {
+            match &ev.payload {
+                Event::ContextSnapshot {
+                    added, reset: true, ..
+                } => {
+                    messages = added.clone();
+                    last_snapshot = idx;
                 }
+                Event::ContextSnapshot { added, .. } => {
+                    messages.extend(added.iter().cloned());
+                    last_snapshot = idx;
+                }
+                _ => {}
+            }
+        }
+        if messages.is_empty() {
+            return None;
+        }
+
+        for ev in &session.events[last_snapshot + 1..] {
+            match &ev.payload {
+                Event::AssistantTurn { text, calls, .. } => {
+                    if text.trim().is_empty() && calls.is_empty() {
+                        continue;
+                    }
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: if text.is_empty() {
+                            vec![]
+                        } else {
+                            vec![ContentPart::text(text.clone())]
+                        },
+                        tool_calls: calls.clone(),
+                        tool_call_id: None,
+                        reasoning: None,
+                    });
+                }
+                Event::ToolCallEnd {
+                    call_id,
+                    output,
+                    detail,
+                    ..
+                } => {
+                    let text = output
+                        .clone()
+                        .or_else(|| detail.clone())
+                        .unwrap_or_else(|| "（工具无输出）".into());
+                    messages.push(Message {
+                        role: Role::Tool,
+                        content: vec![ContentPart::text(text)],
+                        tool_calls: vec![],
+                        tool_call_id: Some(call_id.clone()),
+                        reasoning: None,
+                    });
+                }
+                _ => {}
             }
         }
         Some(messages)
@@ -220,8 +261,9 @@ impl JsonlStore {
 
     /// 任务转写：只取「对话长什么样」相关的事件，按时间顺序。
     ///
-    /// 上下文快照刻意排除在外——它每轮都重复整份历史，几百 KB 且对界面无用
-    /// （一次 24 工具的会话里，快照占了绝大部分体积）。
+    /// 上下文快照刻意排除在外——即使是增量，它也是审计数据而非对话内容。
+    /// v1.2 起 `UserPrompt` 纳入：用户输入此前从不落盘，回放出的对话
+    /// 只有「任务开始 + 工具调用 + 回答」，看不到用户到底问了什么。
     pub async fn task_events(&self, task_id: &TaskId) -> Vec<Event> {
         let Ok(session) = self
             .load_session(&SessionId::from_raw(task_id.0.clone()))
@@ -237,6 +279,7 @@ impl JsonlStore {
                 matches!(
                     e,
                     Event::TaskStarted { .. }
+                        | Event::UserPrompt { .. }
                         | Event::TextDelta { .. }
                         | Event::ReasoningDelta { .. }
                         | Event::AssistantTurn { .. }
@@ -273,18 +316,31 @@ impl JsonlStore {
             };
 
             let text = String::from_utf8_lossy(&bytes);
+            let lines: Vec<&str> = text.lines().collect();
+            let parsed: Vec<Option<StoredEvent>> = lines
+                .iter()
+                .map(|l| serde_json::from_str::<StoredEvent>(l).ok())
+                .collect();
+            // v1.2 增量协议：ContextSnapshot 是上下文的**唯一真相源**。
+            // 续跑必须按顺序回放整条 added 序列（从首份基线或最后一次
+            // reset 起），删掉中间任何一份都会让重建结果残缺。因此它们
+            // 虽属 Transient，也不参与过期清理——单份体积已经很小。
+            // 只保留「最后一份基线」是全量快照时代的做法，在增量协议下
+            // 会直接毁掉 /resume。
             let mut kept: Vec<&str> = Vec::new();
             let mut removed_here = 0usize;
             let mut max_seq = 0u64;
-            for line in text.lines() {
+            for (line, ev) in lines.iter().zip(parsed.iter()) {
                 if line.trim().is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<StoredEvent>(line) {
-                    Ok(e) => {
+                match ev {
+                    Some(e) => {
                         let expired =
                             e.durability == Durability::Transient && e.clock.wall_ms < cutoff;
-                        if expired {
+                        let is_context_baseline =
+                            matches!(e.payload, Event::ContextSnapshot { .. });
+                        if expired && !is_context_baseline {
                             removed_here += 1;
                         } else {
                             max_seq = max_seq.max(e.clock.seq);
@@ -292,7 +348,7 @@ impl JsonlStore {
                         }
                     }
                     // 损坏行保留：清理不该顺手毁掉排查线索。
-                    Err(_) => kept.push(line),
+                    None => kept.push(line),
                 }
             }
             if removed_here == 0 {
@@ -313,7 +369,10 @@ impl JsonlStore {
                 let sid = SessionId::from_raw(stem);
                 if let Some(events) = self.cache.lock().await.get_mut(&sid) {
                     events.retain(|e| {
-                        e.durability == Durability::Persistent || e.clock.wall_ms >= cutoff
+                        e.durability == Durability::Persistent
+                            || e.clock.wall_ms >= cutoff
+                            // 与磁盘侧同一条规则：增量快照序列整体保留。
+                            || matches!(e.payload, Event::ContextSnapshot { .. })
                     });
                 }
                 let mut seq = self.seq.lock().await;
@@ -510,10 +569,11 @@ mod tests {
                     id: tid.clone(),
                     iteration: 0,
                     model: "m".into(),
-                    messages: vec![
+                    added: vec![
                         agent_core::provider::Message::system("你是助理"),
                         agent_core::provider::Message::user("统计文件数"),
                     ],
+                    reset: false,
                     tools: vec![],
                 },
             )
@@ -627,6 +687,69 @@ mod tests {
                 .any(|e| matches!(&e.payload, Event::TextDelta { text, .. } if text == "新临时")),
             "未过期的 Transient 必须保留"
         );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// v1.2 回归：增量快照序列必须整体保留。
+    /// 只留最后一份基线会让 `resume_context()` 重建出残缺上下文。
+    #[tokio::test]
+    async fn prune_transient_keeps_increment_snapshot_sequence() {
+        let (store, tmp) = temp_store();
+        store.init().await.unwrap();
+        let sid = SessionId::new();
+        let tid = TaskId::new();
+        let old = chrono::Utc::now().timestamp_millis() - 10 * 24 * 60 * 60 * 1000;
+
+        let snap = |seq: u64, text: &str| StoredEvent {
+            schema_version: SCHEMA_VERSION,
+            session_id: sid.clone(),
+            task_id: tid.clone(),
+            clock: Clock { wall_ms: old, seq },
+            durability: Durability::Transient,
+            payload: Event::ContextSnapshot {
+                id: tid.clone(),
+                iteration: seq as u32,
+                model: "m".into(),
+                added: vec![agent_core::provider::Message::user(text)],
+                reset: false,
+                tools: vec![],
+            },
+        };
+        for i in 1..=3 {
+            store
+                .append_event(&snap(i, &format!("片段{i}")))
+                .await
+                .unwrap();
+        }
+        // 一条同样过期的普通瞬态事件，应被清掉。
+        store
+            .append_event(&StoredEvent {
+                schema_version: SCHEMA_VERSION,
+                session_id: sid.clone(),
+                task_id: tid.clone(),
+                clock: Clock {
+                    wall_ms: old,
+                    seq: 4,
+                },
+                durability: Durability::Transient,
+                payload: Event::TextDelta {
+                    id: tid.clone(),
+                    text: "旧增量".into(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let removed = store.prune_transient(7).await.unwrap();
+        assert_eq!(removed, 1, "只该删掉过期的非基线事件");
+        let session = store.load_session(&sid).await.unwrap();
+        let snaps = session
+            .events
+            .iter()
+            .filter(|e| matches!(&e.payload, Event::ContextSnapshot { .. }))
+            .count();
+        assert_eq!(snaps, 3, "增量序列必须完整，否则 /resume 丢历史");
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }

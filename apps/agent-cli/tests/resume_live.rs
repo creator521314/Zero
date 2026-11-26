@@ -152,16 +152,18 @@ async fn resumed_task_really_carries_the_previous_turn() {
     )
     .await
     .expect("会话应可加载");
-    let last_ctx = session
-        .events
-        .iter()
-        .rev()
-        .find_map(|e| match &e.payload {
-            agent_core::event::Event::ContextSnapshot { messages, .. } => Some(messages.clone()),
-            _ => None,
-        })
-        .expect("第二次请求前应有快照");
-    let texts: Vec<String> = last_ctx.iter().map(|m| m.text()).collect();
+    // v1.2 增量协议：快照只记「本轮新增」，完整上下文 = 按序拼接所有 added
+    //（遇到 reset 则整份替换）。这也正是运行时重建续跑上下文的规则。
+    let mut texts: Vec<String> = Vec::new();
+    for e in &session.events {
+        if let agent_core::event::Event::ContextSnapshot { added, reset, .. } = &e.payload {
+            if *reset {
+                texts.clear();
+            }
+            texts.extend(added.iter().map(|m| m.text()));
+        }
+    }
+    assert!(!texts.is_empty(), "应有上下文增量快照");
     assert!(
         texts.iter().any(|t| t.contains("7319")),
         "续跑请求里必须包含第一轮的对话：{texts:?}"

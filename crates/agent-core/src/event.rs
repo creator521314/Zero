@@ -20,6 +20,16 @@ pub enum Event {
         id: TaskId,
         title: String,
     },
+    /// 用户本次提交的输入原文（已过密钥脱敏）。
+    ///
+    /// v1.2：用户输入此前**从不落盘**——`TaskStarted` 只带冻结的标题，
+    /// `/resume` / 切任务 / 重启后回放出的对话里完全没有用户说过什么。
+    /// 独立成事件而不是塞进 `TaskStarted`：任务生命周期与「用户说了什么」
+    /// 是两件事实，且旧日志里的 `task_started` 无需改动即可继续解析。
+    UserPrompt {
+        id: TaskId,
+        text: String,
+    },
     /// 流式正文增量。
     TextDelta {
         id: TaskId,
@@ -30,16 +40,24 @@ pub enum Event {
         id: TaskId,
         text: String,
     },
-    /// 每轮送给模型的**完整上下文快照**（system 固定区 + 全部历史消息）。
+    /// 上下文**增量**（v1.2）：自上一轮快照以来新追加到上下文的消息。
     ///
-    /// 复盘时最关键的一条：模型是依据这些材料做出的判断。
-    /// 只服务审计，不进对话流（TUI 忽略）。
+    /// 旧实现每轮把 `cm.messages()` 全量落盘，25 轮长任务的日志按 O(N²)
+    /// 膨胀，且续跑、提炼、回放共用这一份全量数据，语义互相打架。
+    /// 现在只记增量：首轮 `added` 含「固定 system + 首轮 user」，其后每轮
+    /// 只含上一轮的 assistant / tool 结果 / 新指令。
+    ///
+    /// `reset = true` 表示压缩重写了历史，此时 `added` 是**压缩后的完整基线**，
+    /// 重建方应清空已有累积再整份替换。
     ContextSnapshot {
         id: TaskId,
         /// 第几轮（从 0 开始）。
         iteration: u32,
         model: String,
-        messages: Vec<Message>,
+        added: Vec<Message>,
+        /// 压缩导致历史被重写（added 为全量基线，而非增量）。
+        #[serde(default)]
+        reset: bool,
         /// 本轮可用的工具名。
         tools: Vec<String>,
     },
@@ -328,16 +346,17 @@ mod tests {
     }
 
     #[test]
-    fn context_snapshot_roundtrip_keeps_full_messages() {
+    fn context_snapshot_roundtrip_keeps_added_messages() {
         let ev = Event::ContextSnapshot {
             id: TaskId::new(),
             iteration: 2,
             model: "deepseek-flash".into(),
-            messages: vec![
+            added: vec![
                 Message::system("你是个人助理"),
                 Message::user("介绍下本项目"),
                 Message::assistant("先看看工作区"),
             ],
+            reset: false,
             tools: vec!["list_dir".into(), "file_read".into()],
         };
         let s = serde_json::to_string(&ev).expect("应可序列化");
@@ -345,17 +364,32 @@ mod tests {
             Event::ContextSnapshot {
                 iteration,
                 model,
-                messages,
+                added,
+                reset,
                 tools,
                 ..
             } => {
                 assert_eq!(iteration, 2);
                 assert_eq!(model, "deepseek-flash");
-                assert_eq!(messages.len(), 3);
-                assert_eq!(messages[0].text(), "你是个人助理", "system 必须留下");
+                assert_eq!(added.len(), 3);
+                assert_eq!(added[0].text(), "你是个人助理", "system 必须留下");
+                assert!(!reset, "首轮不是压缩重置");
                 assert_eq!(tools, vec!["list_dir", "file_read"]);
             }
             other => panic!("应为 ContextSnapshot: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_prompt_roundtrip() {
+        let ev = Event::UserPrompt {
+            id: TaskId::from_raw("t-1"),
+            text: "列出你的长期记忆".into(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        match serde_json::from_str::<Event>(&s).unwrap() {
+            Event::UserPrompt { text, .. } => assert_eq!(text, "列出你的长期记忆"),
+            other => panic!("应为 UserPrompt: {other:?}"),
         }
     }
 

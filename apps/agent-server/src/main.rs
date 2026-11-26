@@ -153,6 +153,9 @@ async fn main() -> anyhow::Result<()> {
     // RunControl；自建一个没人监听的令牌等于没有熔断。
     let task_cancel = tokio_util::sync::CancellationToken::new();
     let cap = router.per_task_limit();
+    // v1.2：窗口按实际 provider 取，compose 与 deps 共用同一份配置。
+    let ctx_cfg =
+        agent_runtime::context::ContextConfig::for_model(provider.capabilities().max_context);
     let deps = agent_runtime::RuntimeDeps {
         provider: provider.clone(),
         provider_name: provider.name().to_string(),
@@ -162,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
         store: store.clone(),
         log_cfg: cfg.log.clone(),
         approvals: Arc::new(agent_runtime::runner::ApprovalInbox::new(ap_rx)),
-        context_cfg: Default::default(),
+        context_cfg: ctx_cfg.clone(),
         per_task_budget: router.per_task_limit(),
         // 每轮成本：报月度账本 + 记入任务树共享预算；合计超额取消令牌。
         cost_sink: Some(Arc::new({
@@ -197,12 +200,12 @@ async fn main() -> anyhow::Result<()> {
         &agent_core::memory::MemoryScope::Project {
             root: cfg.agent.resolved_project_root().display().to_string(),
         },
-        agent_runtime::context::ContextConfig::default().max_context,
+        ctx_cfg.max_context,
     )
     .await
     {
         Ok(ctx) if !ctx.text.is_empty() => {
-            tracing::info!(injected = ctx.injected_ids.len(), "memory injected");
+            tracing::info!(injected = ctx.injected_ids.len(), "memory composed");
             injected_registry.register(&spec.id.0, ctx.injected_ids.clone());
             spec.memory_context = Some(ctx);
         }
