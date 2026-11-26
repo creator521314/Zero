@@ -161,7 +161,8 @@ impl SecretRedactor {
    - `finish_summary` 取自 `finish` 工具输出，也 redact。
    - denied / rejected 分支不含工具输出，跳过。
 
-**为什么在这几处做**：`ContextSnapshot` 由 `cm.messages` 生成，工具消息先 redact，
+**为什么在这几处做**：`ContextSnapshot` 由 `cm.flush_delta()` 取走的新增消息生成
+（v1.2 增量协议，见 `docs/context-audit.md`），工具消息在 push 进 `cm` 之前已 redact，
 快照自然干净；`ToolCallEnd` 先 redact，jsonl 干净。两处都归结到同一个 `r.content`。
 
 **已知限制（文档注明，不实现）**：不做 URL 编码/反转义变体；`AssistantTurn.text`

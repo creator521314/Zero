@@ -8,6 +8,8 @@
 | [design.md](./design.md)       | 技术方案设计（V1） | 已冻结（M1 骨架按此架构落地） |
 | [ui-design.md](./ui-design.md) | TUI 界面设计方案（V1，参考 iCode） | P0 已实施，P1/P2 待评审 |
 | [milestones.md](./milestones.md) | **开发计划与里程碑**（活文档：现在在哪、接下来做什么、怎么算完成） | 执行中 |
+| [context-audit.md](./context-audit.md) | **上下文构造全面审视与 v1.2 修复**（固定 system、增量快照协议、前缀缓存） | 已实施 |
+| [memory-design.md](./memory-design.md) | Zero 记忆系统设计（v1.2 已按上下文协议回写） | 已实施 |
 
 ## 文档关系
 

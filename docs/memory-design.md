@@ -1,6 +1,6 @@
 # Zero 记忆系统 · 设计文档
 
-> 状态：**v1.1 实测修订**（2026-11-27）。v1.0 实施后在真实使用中暴露「只写不读」等缺陷，见 `docs/memory-issues.md`；本文 §4 已按修复结果回写。
+> 状态：**v1.2 上下文协议修订**（2026-11-27）。v1.0 实施后在真实使用中暴露「只写不读」等缺陷，见 `docs/memory-issues.md`；本文 §4 已按修复结果回写。v1.2 按 `docs/context-audit.md` 把记忆注入从 system 固定区移到首轮 user，并改用增量上下文快照协议，§4.2 / §5.1 已同步。
 > 上游：`docs/memory-requirements.md` v1.0（已裁决）。本文只做设计展开，**不是逐行实施说明书**；若需要低能力模型照做，另出实施说明书。
 > 本文所有「已裁决」条目均来自需求澄清文档 §10，不再重新讨论取舍。
 
@@ -205,7 +205,9 @@ append-only 操作日志，每行一个 `MemoryRecord`：
 ### 4.2 自动提炼（O5）
 
 - **触发点**：装配层的**提炼 worker 订阅 `EventBus`**，只在 `TaskFinished` 且 `Outcome::Success` / `Failed` 时触发；取消/暂停不触发。
-- **输入**：该任务最后一次 `ContextSnapshot` 的 messages + outcome 摘要，**外加已有生效记忆清单**（v1.1：供模型避免重复、复用同主题 key）；**不读全量会话日志**，控制成本。
+- **输入**：由该任务的**增量** `ContextSnapshot`（`added` / `reset`）序列重建的完整上下文（见 `JsonlStore::resume_context()`）+ outcome 摘要，**外加已有生效记忆清单**（v1.1：供模型避免重复、复用同主题 key）；**不读全量会话日志**，控制成本。
+- **裁剪（v1.2）**：跳过固定 system、按角色分配配额（user 最长）、超 6000 字符时**保留尾部**并标注省略条数——固定模板与早期工具输出不再把最后一轮追问与结论挤掉。
+- **跳过子任务（v1.2）**：worker 依据 `Event::SubtaskLinked` 记录 child id，子任务的 `TaskFinished` 直接跳过，避免内部探查污染项目级记忆库。
 - **输出**：0~N 条 `state=Active` 条目（v1.1 自动转正，每条仍过准入管道），并要求模型
   为每条产出**稳定显式 key**（如 `user:commit_language`），同主题更新复用同 key。
 - **失败策略**：provider 调用失败 / 解析失败 / 超时 → **静默跳过**，绝不阻塞任务结束、不写 `Event::Error`。
@@ -225,7 +227,7 @@ v1.0 实测：提炼产出全部停在 `Candidate` 且唯一 `confirm` 调用点
 
 ## 5. 读取流程（双通道）
 
-### 5.1 通道 A：注入系统固定区
+### 5.1 通道 A：随首轮 user 注入（v1.2）
 
 任务提交时，装配层：
 
@@ -237,12 +239,12 @@ v1.0 实测：提炼产出全部停在 `Candidate` 且唯一 `confirm` 调用点
    【记忆 · 项目级】推送 GitHub 经常需要重试 3~8 次（与上方冲突，请自行判断）
    ```
 
-3. **动态截断（O3）**：预算 = `max_context * inject_ratio`（默认 128000 × 0.03 ≈ 3840 tokens，用 `ContextManager::estimate_tokens` 的 chars/3 口径）。按「`last_used_at` 降序 → `updated_at` 降序 → id 稳定排序」丢弃尾部，直到估算 token 落入预算；`MemoryContext.truncated` 记丢弃数。
+3. **动态截断（O3）**：预算 = `max_context * inject_ratio`（`max_context` v1.2 起取 `provider.capabilities().max_context`，不再是硬编码 128K；估算口径见 `ContextAssembler` / `ContextManager::estimate_tokens`，中文按 1 字符≈1 token、ASCII≈0.34）。按「`last_used_at` 降序 → `updated_at` 降序 → id 稳定排序」丢弃尾部，直到估算 token 落入预算；`MemoryContext.truncated` 记丢弃数。
 4. 写入 `TaskSpec.memory_context: Option<MemoryContext>`（`#[serde(default)]`，旧日志可反序列化）。
-5. `AgentRuntime` 构造 `ContextManager` 时：`pinned_system = 原有固定区 + "\n" + memory_context.text`；**不改动**消息裁剪与压缩逻辑。
-6. `/resume` 时**沿用原快照**（`resume_messages` 里已含当时的 system），保证回放可复现；不重新 compose。
+5. **注入位置（v1.2 变更）**：`ContextAssembler::first_user()` 把任务与记忆文本一起放进**首轮 user 消息**（`【当前任务】` + `【长期记忆】`）。固定 system 恒定、不含任务与记忆——记忆变化不再打断请求前缀缓存。续跑时若本次 compose 与上轮注入内容不同，装配层填 `TaskSpec.memory_update`，runner 在历史**尾部**追加一条 `[背景更新]` 增量消息；相同则完全不动前缀。
+6. `/resume` 时由 `resume_context()` 把增量快照序列重建成 `resume_messages`，`normalize_history()` 保证 `Role::System` 恒 1 条后接着用；历史里已注入的记忆继续生效，不重新 compose。
 
-**去重约定**：装配层同时 `register(task_id, injected_ids)`；`memory_search` 返回结果时过滤掉这些 id，避免同一条同时出现在固定区和工具结果里（§10.3 强调）。
+**去重约定**：装配层同时 `register(task_id, injected_ids)`；`memory_search` 返回结果时过滤掉这些 id，避免同一条同时出现在首轮注入区和工具结果里（§10.3 强调）。
 
 ### 5.2 通道 B：按需检索工具
 

@@ -35,7 +35,7 @@ Zero 现状：**有任务粒度的日志持久化与 `/resume` 续跑，没有�
 | 已有机制 | 位置 | 与记忆的关系 |
 |---|---|---|
 | 事件 JSONL 落盘 | `agent-store` | 是**日志**，不是记忆：可读性面向审计回放，不向新任务注入 |
-| `resume_context()` | `agent-store/src/lib.rs:183` | 从最后一次 `ContextSnapshot` 还原**当时真正送给模型**的消息；仅 `/resume` 手动触发 |
+| `resume_context()` | `agent-store/src/lib.rs` | 从 `ContextSnapshot` 还原**当时真正送给模型**的消息；仅 `/resume` 手动触发（v1.2 起改为按 `added`/`reset` 增量序列重建，见 `docs/context-audit.md`） |
 | `ContextManager` 三层 | `agent-runtime/src/context.rs` | 固定系统区（永不丢弃）、最近 12 条消息、旧轮次轻量摘录；**任务一结束即销毁** |
 | 大输出外置 `ctx/` | 同上 | 文件外置层，路径可复用但不带语义 |
 | 子任务上下文隔离 | `agent-runtime/src/subagent.rs` | 注释明确「子任务永远是全新上下文」，刻意不复制父历史消息 |

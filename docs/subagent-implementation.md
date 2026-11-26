@@ -1843,8 +1843,9 @@ git add -A && git commit -m "feat(subagent/wiring): CLI/Server 注入 port 与�
         // 上下文隔离：快照里不得出现「子任务内部过程」这段文本。
         let mut leaked = false;
         while let Ok(ev) = sub.try_recv() {
-            if let Event::ContextSnapshot { messages, .. } = ev {
-                for m in messages {
+            // v1.2 增量协议：快照只带本轮 added，不再带全量 messages。
+            if let Event::ContextSnapshot { added, .. } = ev {
+                for m in added {
                     if m.text().contains("子任务内部过程，不应出现在父上下文") {
                         leaked = true;
                     }
