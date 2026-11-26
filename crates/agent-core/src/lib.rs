@@ -8,6 +8,7 @@ pub mod error;
 pub mod event;
 pub mod frontend;
 pub mod ids;
+pub mod memory;
 pub mod perm;
 pub mod provider;
 pub mod store;
@@ -20,6 +21,10 @@ pub use error::{AgentError, ErrorInfo};
 pub use event::{Command, Event, EventBus, Outcome};
 pub use frontend::Frontend;
 pub use ids::{SessionId, TaskId, ToolCallId};
+pub use memory::{
+    scan_secret, MemoryConfig, MemoryContext, MemoryEntry, MemoryError, MemoryId, MemoryIndex,
+    MemoryPort, MemoryQuery, MemoryScope, MemorySource, MemoryState, MemoryStore,
+};
 pub use perm::{ApprovalRequest, ApprovalResult, Decision, PermissionEngine, Risk};
 pub use provider::{
     Capabilities, ChatRequest, ChatResponse, ContentPart, FinishReason, LlmError, LlmProvider,
