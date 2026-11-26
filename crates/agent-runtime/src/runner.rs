@@ -189,12 +189,14 @@ impl AgentRuntime {
              【工作目录】{ws}（相对路径基于它；所有文件读写必须在此目录内）\n\
              \n\
              规则：\n\
-             1. 先思考再行动；能一次调用多个工具就并行调用。\n\
+             1. 先思考再行动；**独立的探查操作（读文件、grep、ls 等）必须在一轮里并行批量调用**，\n\
+                不要一条一条慢慢试——每轮只发一条命令会迅速耗尽迭代预算。\n\
              2. 产出文件时写入工作目录（推荐放到 artifacts/ 下），并在 finish 的 artifacts 里登记交付物路径。\n\
              3. 任务完成时调用 finish 工具结束：在 summary 里给用户一段简洁总结。\n\
              4. 如果某个操作被拒绝，换一种策略，不要重复同样的调用。\n\
              5. 目标文件/目录不存在或目录为空时，**不要继续猜路径**；\n\
                 直接说明缺什么，向用户索要材料或改用其他思路。\n\
+             6. 迭代预算有限：拿到足以回答的信息就**立即收敛作答**，不要无限扩大检索范围。\n\
              \n\
              【审批】当你发起的工具调用需要用户确认时，用户批准后该工具的返回会以\n\
              [user-approved] 开头；被拒绝会以 [rejected by user] 或 [denied] 开头。\n\
@@ -435,6 +437,8 @@ impl AgentRuntime {
         let mut artifacts: Vec<String> = Vec::new();
         let mut repeats: std::collections::HashMap<u64, usize> = Default::default();
         let mut no_progress = 0usize;
+        // R1：预算临近告警只注入一次，避免每轮重复提醒。
+        let mut budget_warned = false;
         let mut spent = 0.0f64;
         // 审计用：记录真实生效的模型（未显式指定时取 provider 名）。
         let model = task
@@ -876,10 +880,50 @@ impl AgentRuntime {
                 }
             }
 
+            // R1：接近迭代上限时注入一次性提醒，促使模型立即收敛作答——
+            // 否则模型对剩余预算一无所知，会以同样粒度探查到撞限为止。
+            let remaining = task.max_iterations.saturating_sub(iteration + 1);
+            if (1..=3).contains(&remaining) && !budget_warned {
+                budget_warned = true;
+                cm.push(Message::user(format!(
+                    "[系统提示] 迭代预算只剩 {remaining} 轮。请立即收敛：汇总已有发现直接作答，\
+                     或调用 finish 结束任务；不要再发起新的大范围探查。"
+                )));
+            }
+
             tracing::debug!(task = %task_id, iteration, "iteration complete");
         }
 
-        // 迭代上限
+        // R2：迭代预算耗尽不直接失败——追加一轮强制收尾，让模型基于
+        // 已收集的上下文给出阶段结论。25 轮的探查成果不该随错误一起作废。
+        if !cancel.is_cancelled() {
+            cm.push(Message::user(
+                "[系统提示] 迭代预算已耗尽。请立即基于以上已收集的信息输出最终结论：\
+                 完成了什么、发现了什么、还剩什么没做。不要再调用任何工具。",
+            ));
+            if let Ok(out) = self
+                .stream_once(&bus, &task_id.0, &mut cm, &cancel, &task)
+                .await
+            {
+                let text = out.text.trim().to_string();
+                if !text.is_empty() {
+                    let summary = format!(
+                        "【部分完成 · 迭代预算 {} 轮已耗尽】\n{}",
+                        task.max_iterations, text
+                    );
+                    let _ = bus.send(Event::TaskFinished {
+                        id: task_id.clone(),
+                        outcome: Outcome::Success {
+                            summary: summary.clone(),
+                            artifacts: artifacts.clone(),
+                        },
+                    });
+                    return Ok(Outcome::Success { summary, artifacts });
+                }
+            }
+        }
+
+        // 收尾轮也失败（模型无文本输出 / provider 报错 / 已取消）→ 才报迭代上限。
         let err = AgentError::IterationLimit(task.max_iterations);
         let _ = bus.send(Event::Error {
             id: task_id.clone(),
@@ -1606,8 +1650,16 @@ mod tests {
             snapshots[0].2[0].text()
         );
         assert_eq!(snapshots[0].2[1].text(), "介绍下本项目");
-        // 第 1 轮：system + user + assistant + 2 条工具结果
-        assert_eq!(snapshots[1].2.len(), 5, "工具结果应回填进下一轮上下文");
+        // 第 1 轮：system + user + assistant + 2 条工具结果 + 预算提醒
+        // （max_iterations=4，第 0 轮结束后剩 3 轮 → 注入 R1 收敛提醒）
+        assert_eq!(snapshots[1].2.len(), 6, "工具结果与预算提醒都应回填");
+        assert!(
+            snapshots[1].2[5]
+                .text()
+                .contains("[系统提示] 迭代预算只剩 3 轮"),
+            "最后一条应是预算收敛提醒：{}",
+            snapshots[1].2[5].text()
+        );
         assert_eq!(snapshots[1].0, 1);
         assert_eq!(snapshots[1].1, "scripted");
         assert_eq!(snapshots[1].3.len(), 2, "可用工具名要记录");
@@ -2911,6 +2963,108 @@ mod tests {
         assert!(tokio::fs::read_to_string(proj.join("artifacts/child.md"))
             .await
             .is_ok());
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// R2 回归：迭代预算耗尽不再直接报 iteration_limit——追加的强制收尾轮
+    /// 应把已收集信息汇总成「部分完成」结论返回，而不是让 25 轮探查全部作废。
+    #[tokio::test]
+    async fn iteration_limit_degrades_to_partial_summary_instead_of_error() {
+        let (runtime, _store, tmp) = make_runtime(
+            vec![
+                // 预算内两轮都在调工具（模拟截图里「只探查不出结论」的场景）。
+                vec![
+                    StreamEvent::TextDelta("先看看环境".into()),
+                    tool_call(0, "c1", "ok_tool"),
+                    StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                ],
+                vec![
+                    StreamEvent::TextDelta("再看点别的".into()),
+                    tool_call(0, "c2", "ok_tool"),
+                    StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                ],
+                // 强制收尾轮：模型基于已收集信息给出阶段结论。
+                vec![
+                    StreamEvent::TextDelta("已确认项目结构，结论如下……".into()),
+                    StreamEvent::Done(agent_core::provider::FinishReason::Stop),
+                ],
+            ],
+            LogConfig::default(),
+        );
+        let bus = event_bus();
+        let mut spec = TaskSpec::new("调查任务", tmp.join("workspace").display().to_string());
+        spec.max_iterations = 2;
+        let outcome = runtime.run(spec, bus, RunControl::new()).await;
+
+        match outcome.unwrap() {
+            Outcome::Success { summary, .. } => {
+                assert!(
+                    summary.contains("【部分完成 · 迭代预算 2 轮已耗尽】"),
+                    "应标注部分完成：{summary}"
+                );
+                assert!(
+                    summary.contains("已确认项目结构"),
+                    "收尾轮的结论应进入 summary：{summary}"
+                );
+            }
+            other => panic!("预算耗尽应降级为部分完成，而非失败：{other:?}"),
+        }
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// R1 回归：剩余轮数 ≤3 时向上下文注入一次性收敛提醒（只注入一次）。
+    #[tokio::test]
+    async fn budget_warning_is_injected_once_near_iteration_limit() {
+        let (runtime, _store, tmp) = make_runtime(
+            vec![
+                vec![
+                    tool_call(0, "c1", "ok_tool"),
+                    StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                ],
+                vec![
+                    tool_call(0, "c2", "ok_tool"),
+                    StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                ],
+                vec![
+                    tool_call(0, "c3", "ok_tool"),
+                    StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                ],
+                vec![
+                    StreamEvent::TextDelta("信息足够，直接作答。".into()),
+                    StreamEvent::Done(agent_core::provider::FinishReason::Stop),
+                ],
+            ],
+            LogConfig::default(),
+        );
+        let bus = event_bus();
+        let mut sub = bus.subscribe();
+        let mut spec = TaskSpec::new("探查任务", tmp.join("workspace").display().to_string());
+        spec.max_iterations = 4;
+        let outcome = runtime.run(spec, bus, RunControl::new()).await.unwrap();
+        assert!(matches!(outcome, Outcome::Success { .. }));
+
+        let mut per_snapshot: Vec<(u32, usize)> = Vec::new();
+        while let Ok(ev) = sub.try_recv() {
+            if let Event::ContextSnapshot {
+                iteration,
+                messages,
+                ..
+            } = ev
+            {
+                let n = messages
+                    .iter()
+                    .filter(|m| m.text().contains("[系统提示] 迭代预算只剩"))
+                    .count();
+                per_snapshot.push((iteration, n));
+            }
+        }
+        per_snapshot.sort_by_key(|(i, _)| *i);
+        // 注入前的快照（第 0 轮）没有提醒；注入后提醒持续留在上下文里，
+        // 但每个后续快照里最多 1 条——证明没有每轮重复注入。
+        assert_eq!(per_snapshot[0], (0, 0), "第 0 轮不应有预算提醒");
+        for (iteration, n) in &per_snapshot[1..] {
+            assert_eq!(n, &1, "第 {iteration} 轮快照应恰好携带 1 条预算提醒");
+        }
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }
