@@ -8,14 +8,23 @@
 
 | 平台 | 开启 | 关闭 |
 |---|---|---|
+| Linux / macOS | `./scripts/proxy-on.sh`  | `./scripts/proxy-off.sh`  |
 | PowerShell | `.\scripts\proxy-on.ps1`  | `.\scripts\proxy-off.ps1`  |
 | cmd / 双击 | `scripts\proxy-on.bat`    | `scripts\proxy-off.bat`    |
 
-> 推荐用 `.bat` 版本——不依赖 PowerShell 执行策略。
+> Linux/macOS 首次使用若提示无执行权限：`chmod +x scripts/*.sh`。
+> Windows 推荐用 `.bat` 版本——不依赖 PowerShell 执行策略。
 
 ## 修改代理地址
 
-如代理端口变更，编辑四个脚本中的：
+Linux / macOS 版支持环境变量临时覆盖（无需改脚本）：
+
+```bash
+PROXY_PORT=10809 ./scripts/proxy-on.sh
+PROXY_HOST=192.168.1.10 PROXY_PORT=7890 ./scripts/proxy-on.sh
+```
+
+Windows 版如代理端口变更，编辑脚本中的：
 
 ```
 PROXY_HOST = 127.0.0.1
@@ -33,6 +42,7 @@ PROXY_PORT = 7890
 
 | 现象 | 处理 |
 |---|---|
-| `git push` 仍超时 | 先 `scripts\proxy-off.bat` 再 `scripts\proxy-on.bat` 一次 |
-| 代理软件端口变化 | 编辑脚本中的 `PROXY_HOST` / `PROXY_PORT` |
+| `git push` 仍超时 | 先 `proxy-off` 再 `proxy-on` 一次 |
+| 代理软件端口变化 | 见「修改代理地址」 |
 | 想临时绕过代理 | `git push ... --config http.proxy=` |
+| Linux 提示 `Permission denied` | `chmod +x scripts/*.sh` |
