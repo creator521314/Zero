@@ -18,7 +18,16 @@ use crate::theme::{glyph, tier_label};
 /// 填入新闻收集提示词，都只改本地状态或读 store 后回灌界面。设计稿里的
 /// `/model`（切模型）、`/compact`（手动压缩上下文）依赖后端能力，尚未落地，
 /// 故不列入——遵循「只提示已实现功能」的原则，避免补出执行不了的入口。
-pub const SLASH_COMMANDS: &[&str] = &["/clear", "/help", "/tier", "/tasks", "/resume", "/news"];
+pub const SLASH_COMMANDS: &[&str] = &[
+    "/clear",
+    "/help",
+    "/tier",
+    "/tasks",
+    "/resume",
+    "/news",
+    "/remember",
+    "/memory",
+];
 
 /// 内置的新闻收集模板：`templates/news.md` 不存在时的兜底。
 ///
@@ -242,6 +251,44 @@ pub struct App {
     project_root: Option<std::path::PathBuf>,
     /// `@` 文件补全状态。
     pub at: AtCompletion,
+    /// 记忆门面（装配层注入；None = 记忆不可用，相关命令给提示）。
+    pub memory: Option<std::sync::Arc<dyn agent_core::memory::MemoryPort>>,
+    /// `/memory` 面板状态；None = 面板关闭。
+    pub memory_panel: Option<MemoryPanel>,
+    /// 待确认候选条数（header 角标）。
+    pub memory_candidates: usize,
+    /// 异步记忆动作暂存（run_slash_command 同步，真正执行在事件循环里 await）。
+    pub pending_memory: Option<MemoryPending>,
+}
+
+/// `/memory` 面板状态。
+pub struct MemoryPanel {
+    /// true = 生效页（Active），false = 候选页（Candidate）。
+    pub active_page: bool,
+    pub sel: usize,
+    /// 面板内搜索词（输入即过滤）。
+    pub query: String,
+    pub entries: Vec<agent_core::memory::MemoryEntry>,
+    pub scope: agent_core::memory::MemoryScope,
+}
+
+/// 需要在异步上下文里执行的记忆动作。
+#[derive(Debug, Clone)]
+pub enum MemoryPending {
+    /// `/remember <内容>` 显式写入。
+    Remember(String),
+    /// 打开 `/memory` 面板。
+    Open,
+    /// 重新加载面板列表 / 候选角标。
+    Reload,
+    /// 确认当前选中候选 → Active。
+    Confirm,
+    /// 丢弃当前选中候选 → Archived。
+    Discard,
+    /// 删除当前选中条目（生效页）。
+    Delete,
+    /// 清空当前页可见条目（生效页全部 Active / 候选页全部 Candidate）。
+    Clear,
 }
 
 /// `@` 文件补全状态。
@@ -321,6 +368,10 @@ impl Default for App {
             viewing: None,
             project_root: None,
             at: AtCompletion::default(),
+            memory: None,
+            memory_panel: None,
+            memory_candidates: 0,
+            pending_memory: None,
         }
     }
 }
@@ -726,7 +777,10 @@ impl App {
     /// 所以回车时先用这个判据拦一道。
     pub fn is_slash_command(&self) -> bool {
         let buf = self.input.buffer.trim_start();
-        SLASH_COMMANDS.contains(&buf) || buf.starts_with("/resume ") || buf.starts_with("/news ")
+        SLASH_COMMANDS.contains(&buf)
+            || buf.starts_with("/resume ")
+            || buf.starts_with("/news ")
+            || buf.starts_with("/remember ")
     }
 
     /// 执行一条 `/` 命令；成功执行后清空输入并关闭补全菜单。
@@ -756,6 +810,24 @@ impl App {
             // 让用户先看一眼、改一改，避免一按回车就花掉一次联网任务）。
             _ if cmd == "/news" || cmd.starts_with("/news ") => {
                 self.fill_news_prompt(cmd.trim_start_matches("/news").trim());
+                return true;
+            }
+            // `/remember <内容>`：显式写入长期记忆（立即生效）。真正执行在
+            // 事件循环的异步上下文里（MemoryPort 是 async trait）。
+            _ if cmd == "/remember" || cmd.starts_with("/remember ") => {
+                let content = cmd.trim_start_matches("/remember").trim();
+                if content.is_empty() {
+                    self.toast("用法：/remember <要长期记住的内容>");
+                    return true;
+                }
+                self.pending_memory = Some(MemoryPending::Remember(content.to_string()));
+                self.input.take();
+                return true;
+            }
+            // `/memory`：打开管理面板（生效页 / 候选页，Tab 切换）。
+            "/memory" => {
+                self.pending_memory = Some(MemoryPending::Open);
+                self.input.take();
                 return true;
             }
             _ => return false,
@@ -1347,6 +1419,214 @@ fn truncate(s: &str, max: usize) -> String {
 /// 前端命令通道包装。
 pub struct FrontendHandle {
     pub tx: mpsc::Sender<Command>,
+}
+
+// ---- 记忆系统（M4）----
+
+impl App {
+    /// 当前作用域：有项目根 → 项目级；否则用户级（与注入口径一致）。
+    fn memory_scope(&self) -> agent_core::memory::MemoryScope {
+        match self.project_root.as_ref() {
+            Some(r) if !r.as_os_str().is_empty() => agent_core::memory::MemoryScope::Project {
+                root: r.display().to_string(),
+            },
+            _ => agent_core::memory::MemoryScope::User,
+        }
+    }
+
+    /// 取走暂存的异步记忆动作（事件循环每轮调用一次）。
+    pub fn take_pending_memory(&mut self) -> Option<MemoryPending> {
+        self.pending_memory.take()
+    }
+
+    /// 候选页当前选中条目 id。
+    pub fn memory_selected_id(&self) -> Option<agent_core::memory::MemoryId> {
+        let p = self.memory_panel.as_ref()?;
+        p.entries.get(p.sel).map(|e| e.id.clone())
+    }
+
+    /// 面板搜索词追加/回退一个字符（同步）；返回 true 表示需要重新加载。
+    pub fn memory_panel_edit_query(&mut self, ch: Option<char>) -> bool {
+        let Some(p) = self.memory_panel.as_mut() else {
+            return false;
+        };
+        match ch {
+            Some(c) => p.query.push(c),
+            None => {
+                p.query.pop();
+            }
+        }
+        p.sel = 0;
+        true
+    }
+
+    /// 翻转生效页/候选页；返回 true 表示需要重新加载。
+    pub fn memory_panel_toggle_page(&mut self) -> bool {
+        let Some(p) = self.memory_panel.as_mut() else {
+            return false;
+        };
+        p.active_page = !p.active_page;
+        p.sel = 0;
+        true
+    }
+
+    pub fn memory_panel_move(&mut self, delta: i32) {
+        let Some(p) = self.memory_panel.as_mut() else {
+            return;
+        };
+        let len = p.entries.len();
+        if len == 0 {
+            return;
+        }
+        let cur = p.sel as i32 + delta;
+        p.sel = cur.clamp(0, len as i32 - 1) as usize;
+    }
+
+    pub fn close_memory_panel(&mut self) {
+        self.memory_panel = None;
+    }
+
+    /// 执行一个暂存的记忆动作。只允许在异步上下文（TUI 事件循环）里调用。
+    pub async fn handle_memory(&mut self, act: MemoryPending) {
+        use agent_core::memory::MemoryPort;
+        let Some(port) = self.memory.clone() else {
+            self.toast("记忆功能未启用");
+            return;
+        };
+        match act {
+            MemoryPending::Remember(content) => {
+                let scope = self.memory_scope();
+                match port.remember(scope, content, vec![]).await {
+                    Ok(_) => {
+                        self.toast("已记住（立即生效）");
+                        self.refresh_memory_candidates().await;
+                        if self.memory_panel.is_some() {
+                            self.reload_memory_panel().await;
+                        }
+                    }
+                    Err(agent_core::memory::MemoryError::SecretDetected) => {
+                        self.toast("拒绝写入：内容疑似凭据")
+                    }
+                    Err(agent_core::memory::MemoryError::TooLong { max }) => {
+                        self.toast(format!("拒绝写入：超过 {max} 字符"))
+                    }
+                    Err(e) => self.toast(format!("写入失败：{e}")),
+                }
+            }
+            MemoryPending::Open => {
+                self.memory_panel = Some(MemoryPanel {
+                    active_page: true,
+                    sel: 0,
+                    query: String::new(),
+                    entries: Vec::new(),
+                    scope: self.memory_scope(),
+                });
+                self.reload_memory_panel().await;
+                self.refresh_memory_candidates().await;
+            }
+            MemoryPending::Reload => {
+                self.reload_memory_panel().await;
+                self.refresh_memory_candidates().await;
+            }
+            MemoryPending::Confirm => {
+                if let Some(id) = self.memory_selected_id() {
+                    match MemoryPort::confirm(port.as_ref(), &[id]).await {
+                        Ok(n) if n > 0 => self.toast("已确认生效"),
+                        Ok(_) => {}
+                        Err(e) => self.toast(format!("确认失败：{e}")),
+                    }
+                    self.reload_memory_panel().await;
+                    self.refresh_memory_candidates().await;
+                }
+            }
+            MemoryPending::Discard => {
+                if let Some(id) = self.memory_selected_id() {
+                    match MemoryPort::discard(port.as_ref(), &[id]).await {
+                        Ok(n) if n > 0 => self.toast("已丢弃"),
+                        Ok(_) => {}
+                        Err(e) => self.toast(format!("丢弃失败：{e}")),
+                    }
+                    self.reload_memory_panel().await;
+                    self.refresh_memory_candidates().await;
+                }
+            }
+            MemoryPending::Delete => {
+                if let Some(id) = self.memory_selected_id() {
+                    match MemoryPort::delete(port.as_ref(), &id).await {
+                        Ok(_) => self.toast("已删除（可追溯归档）"),
+                        Err(e) => self.toast(format!("删除失败：{e}")),
+                    }
+                    self.reload_memory_panel().await;
+                    self.refresh_memory_candidates().await;
+                }
+            }
+            MemoryPending::Clear => {
+                let ids: Vec<agent_core::memory::MemoryId> = {
+                    let Some(p) = self.memory_panel.as_ref() else {
+                        return;
+                    };
+                    p.entries.iter().map(|e| e.id.clone()).collect()
+                };
+                if ids.is_empty() {
+                    return;
+                }
+                let mut n = 0usize;
+                for id in &ids {
+                    if MemoryPort::delete(port.as_ref(), id).await.is_ok() {
+                        n += 1;
+                    }
+                }
+                self.toast(format!("已清空 {n} 条"));
+                self.reload_memory_panel().await;
+                self.refresh_memory_candidates().await;
+            }
+        }
+    }
+
+    pub async fn refresh_memory_candidates(&mut self) {
+        use agent_core::memory::{MemoryPort, MemoryQuery, MemoryState};
+        let Some(port) = self.memory.clone() else {
+            return;
+        };
+        let q = MemoryQuery {
+            keyword: None,
+            scope: Some(self.memory_scope()),
+            state: Some(MemoryState::Candidate),
+            limit: 0,
+        };
+        if let Ok(v) = MemoryPort::panel(port.as_ref(), q).await {
+            self.memory_candidates = v.len();
+        }
+    }
+
+    async fn reload_memory_panel(&mut self) {
+        use agent_core::memory::{MemoryPort, MemoryQuery, MemoryState};
+        let Some(port) = self.memory.clone() else {
+            return;
+        };
+        let Some(p) = self.memory_panel.as_ref() else {
+            return;
+        };
+        let q = MemoryQuery {
+            keyword: (!p.query.is_empty()).then(|| p.query.clone()),
+            scope: Some(p.scope.clone()),
+            state: Some(if p.active_page {
+                MemoryState::Active
+            } else {
+                MemoryState::Candidate
+            }),
+            limit: 0,
+        };
+        match MemoryPort::panel(port.as_ref(), q).await {
+            Ok(v) => {
+                if let Some(p) = self.memory_panel.as_mut() {
+                    p.entries = v;
+                    p.sel = p.sel.min(p.entries.len().saturating_sub(1));
+                }
+            }
+            Err(e) => self.toast(format!("读取记忆失败：{e}")),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -300,6 +300,9 @@ pub trait MemoryPort: Send + Sync {
     /// 面板数据。
     async fn panel(&self, q: MemoryQuery) -> Result<Vec<MemoryEntry>, MemoryError>;
 
+    /// 删除（逻辑删除 → Archived，可追溯）。
+    async fn delete(&self, id: &MemoryId) -> Result<(), MemoryError>;
+
     /// 组装注入快照（动态截断 + 来源标注 + 冲突并存标注，O2/O3）。
     async fn compose(
         &self,

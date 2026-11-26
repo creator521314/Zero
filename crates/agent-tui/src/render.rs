@@ -24,7 +24,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use agent_core::event::{Command, Event};
 
-use crate::app::{App, Line, ToolStatus, UiAction, SLASH_COMMANDS};
+use crate::app::{App, Line, MemoryPending, ToolStatus, UiAction, SLASH_COMMANDS};
 use crate::markdown;
 use crate::theme::{glyph, ink, surface, tier_badge_color, tier_label, BG};
 
@@ -103,15 +103,29 @@ async fn event_loop(
         // `Disconnected` 必须显式处理：编排层一旦退出（panic / 提前 return），
         // 事件流关闭，此后 `try_recv` 只返回 `Empty`，界面与「模型正在思考」
         // 完全无法区分——用户只能干等。这里落一条错误行点明后端已死。
+        let mut task_ended = false;
         loop {
             match ev_rx.try_recv() {
-                Ok(ev) => app.apply_event(ev),
+                Ok(ev) => {
+                    // 任务收尾后提炼 worker 可能新增候选：刷新角标（M4/M5）。
+                    if matches!(ev, agent_core::event::Event::TaskFinished { .. }) {
+                        task_ended = true;
+                    }
+                    app.apply_event(ev);
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     app.backend_disconnected();
                     break;
                 }
             }
+        }
+
+        // 暂存的异步记忆动作（/remember、/memory、面板确认/删除/搜索）。
+        if let Some(act) = app.take_pending_memory() {
+            app.handle_memory(act).await;
+        } else if task_ended && app.memory.is_some() {
+            app.refresh_memory_candidates().await;
         }
 
         // 驱动软光标闪烁（与终端原生光标行为无关，跨平台一致）。
@@ -563,6 +577,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
         };
     }
 
+    // 记忆面板：打开时独占键盘（Tab 切页、Enter 确认候选、Del 删除、
+    // 直接打字即搜索、Esc 关闭）。
+    if app.memory_panel.is_some() {
+        return memory_panel_key(app, key);
+    }
+
     // 任务面板：打开时独占键盘（↑/↓ 选、Enter 切换、Esc 或 Ctrl+G 关）。
     // 放在补全菜单之前——面板是模态的，期间不该让 `/` 补全抢按键。
     if app.panel_open {
@@ -809,12 +829,160 @@ fn draw(f: &mut Frame, app: &App) {
         draw_task_panel(f, app, area);
     }
 
+    if app.memory_panel.is_some() {
+        draw_memory_panel(f, app, area);
+    }
+
     if let Some(p) = &app.pending {
         draw_approval(f, app, p, area);
     }
 
     // Toast 叠在最上层（含审批弹层之上），保证任何状态下反馈都可见。
     draw_toast(f, app, area);
+}
+
+/// 记忆面板按键（模态）：↑/↓ 选、Tab 切页、Enter 确认候选、Del 删除/丢弃、
+/// Ctrl+K 清空当前页、直接打字即搜索、Esc 关闭。
+///
+/// 动作都塞进 `pending_memory`，由事件循环在异步上下文里统一 await 执行。
+fn memory_panel_key(app: &mut App, key: KeyEvent) -> UiAction {
+    let candidate_page = app
+        .memory_panel
+        .as_ref()
+        .map(|p| !p.active_page)
+        .unwrap_or(false);
+    match key.code {
+        KeyCode::Esc => {
+            app.close_memory_panel();
+            UiAction::None
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => UiAction::Quit,
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.pending_memory = Some(MemoryPending::Clear);
+            UiAction::None
+        }
+        KeyCode::Up => {
+            app.memory_panel_move(-1);
+            UiAction::None
+        }
+        KeyCode::Down => {
+            app.memory_panel_move(1);
+            UiAction::None
+        }
+        KeyCode::Tab => {
+            if app.memory_panel_toggle_page() {
+                app.pending_memory = Some(MemoryPending::Reload);
+            }
+            UiAction::None
+        }
+        KeyCode::Enter if candidate_page => {
+            app.pending_memory = Some(MemoryPending::Confirm);
+            UiAction::None
+        }
+        KeyCode::Delete => {
+            app.pending_memory = Some(if candidate_page {
+                MemoryPending::Discard
+            } else {
+                MemoryPending::Delete
+            });
+            UiAction::None
+        }
+        KeyCode::Backspace => {
+            if app.memory_panel_edit_query(None) {
+                app.pending_memory = Some(MemoryPending::Reload);
+            }
+            UiAction::None
+        }
+        KeyCode::Char(c) => {
+            if app.memory_panel_edit_query(Some(c)) {
+                app.pending_memory = Some(MemoryPending::Reload);
+            }
+            UiAction::None
+        }
+        _ => UiAction::None,
+    }
+}
+
+/// `/memory` 管理面板：生效页 / 候选页，输入即搜索。
+///
+/// 与任务面板同一套居中弹层风格；候选页 Enter 确认、Del 丢弃，生效页 Del 删除。
+fn draw_memory_panel(f: &mut Frame, app: &App, area: Rect) {
+    let Some(p) = &app.memory_panel else { return };
+    let rows = (p.entries.len().max(1) as u16).min(10);
+    let w = area.width.saturating_sub(6).clamp(40, 78).min(area.width);
+    let h = (rows + 5)
+        .min(area.height.saturating_sub(2))
+        .max(6)
+        .min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let outer = Rect::new(x, y, w, h);
+    f.render_widget(Clear, outer);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            if p.active_page {
+                " 长期记忆 · 生效 "
+            } else {
+                " 长期记忆 · 待确认候选 "
+            },
+            Style::default()
+                .fg(ink::PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(surface::DIM));
+    let inner = block.inner(outer);
+    f.render_widget(block, outer);
+
+    let mut lines: Vec<RtLine> = Vec::new();
+    // 搜索行（输入即过滤）。
+    lines.push(RtLine::from(Span::styled(
+        format!(" 搜索：{}█", p.query),
+        Style::default().fg(ink::FG_MUTED),
+    )));
+    // 提示行。
+    lines.push(RtLine::from(Span::styled(
+        " Tab 切页  ⏎ 确认候选  Del 删除  ^K 清空  Esc 关闭 ",
+        Style::default().fg(ink::FG_MUTED),
+    )));
+    // 条目行。
+    if p.entries.is_empty() {
+        lines.push(RtLine::from(Span::styled(
+            if p.active_page {
+                " （此作用域暂无生效记忆，用 /remember 添加）"
+            } else {
+                " （暂无待确认候选）"
+            },
+            Style::default().fg(ink::FG_MUTED),
+        )));
+    }
+    for (i, e) in p.entries.iter().enumerate() {
+        let tags = if e.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", e.tags.join(","))
+        };
+        let scope_label = match &e.scope {
+            agent_core::memory::MemoryScope::User => "用户级",
+            agent_core::memory::MemoryScope::Project { .. } => "项目级",
+        };
+        let style = if i == p.sel {
+            Style::default().bg(surface::SELECTED).fg(BG)
+        } else {
+            Style::default().fg(ink::FG)
+        };
+        lines.push(RtLine::from(Span::styled(
+            format!(
+                "{}【{scope_label}】{}{tags}",
+                if i == p.sel { "▶" } else { " " },
+                e.content
+            ),
+            style,
+        )));
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
 }
 
 /// 顶部信息栏：左「品牌 + 任务模式」，中「provider · 状态」，右「权限徽章」。
@@ -833,7 +1001,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         format!(" {} · {} ", app.provider, app.status),
         Style::default().fg(ink::FG_MUTED),
     );
-    // 右：权限徽章（底色按档位三态）
+    // 右：权限徽章（底色按档位三态）+ 候选角标
     let badge = Span::styled(
         format!(" {} ", tier_label(&app.tier)),
         Style::default()
@@ -841,15 +1009,33 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             .fg(BG)
             .add_modifier(Modifier::BOLD),
     );
+    // 待确认候选角标（M4）：有候选时提示用户 /memory 批量确认。
+    let mem_badge = if app.memory_candidates > 0 {
+        Some(Span::styled(
+            format!(" 记忆{}待确认 ", app.memory_candidates),
+            Style::default().bg(surface::LINE).fg(ink::FG),
+        ))
+    } else {
+        None
+    };
 
     let left_w = 6usize;
     let meta_w = UnicodeWidthStr::width(meta.content.as_ref());
-    let badge_w = UnicodeWidthStr::width(badge.content.as_ref());
+    let badge_w = UnicodeWidthStr::width(badge.content.as_ref())
+        + mem_badge
+            .as_ref()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .unwrap_or(0);
     let pad = (area.width as usize)
         .saturating_sub(left_w + meta_w + badge_w + 1)
         .max(1);
 
-    let line = RtLine::from(vec![brand, meta, Span::raw(" ".repeat(pad)), badge]);
+    let mut line_spans = vec![brand, meta, Span::raw(" ".repeat(pad))];
+    if let Some(mb) = mem_badge {
+        line_spans.push(mb);
+    }
+    line_spans.push(badge);
+    let line = RtLine::from(line_spans);
     f.render_widget(Paragraph::new(line).style(base), area);
 }
 
@@ -2217,7 +2403,16 @@ mod tests {
         app.input.buffer = "/".into();
         assert_eq!(
             app.slash_candidates(),
-            vec!["/clear", "/help", "/tier", "/tasks", "/resume", "/news"]
+            vec![
+                "/clear",
+                "/help",
+                "/tier",
+                "/tasks",
+                "/resume",
+                "/news",
+                "/remember",
+                "/memory",
+            ]
         );
 
         app.input.buffer = "/c".into();
@@ -2227,7 +2422,7 @@ mod tests {
         assert_eq!(app.slash_candidates(), vec!["/tier", "/tasks"]);
 
         app.input.buffer = "/r".into();
-        assert_eq!(app.slash_candidates(), vec!["/resume"]);
+        assert_eq!(app.slash_candidates(), vec!["/resume", "/remember"]);
 
         app.input.buffer = "/n".into();
         assert_eq!(app.slash_candidates(), vec!["/news"]);
@@ -2284,7 +2479,7 @@ mod tests {
         let mut app = App::default();
         let _ = handle_key(&mut app, key(KeyCode::Char('/')));
         assert!(app.completion_active);
-        assert_eq!(app.slash_candidates().len(), 6);
+        assert_eq!(app.slash_candidates().len(), 8);
 
         let _ = handle_key(&mut app, key(KeyCode::Char('c')));
         assert_eq!(app.slash_candidates(), vec!["/clear"]);
@@ -2362,9 +2557,13 @@ mod tests {
         let _ = handle_key(&mut app, key(KeyCode::Down));
         assert_eq!(app.completion_sel, 5);
         let _ = handle_key(&mut app, key(KeyCode::Down));
-        assert_eq!(app.completion_sel, 5, "到底后 clamp");
+        assert_eq!(app.completion_sel, 6);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 7);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 7, "到底后 clamp");
         let _ = handle_key(&mut app, key(KeyCode::Up));
-        assert_eq!(app.completion_sel, 4);
+        assert_eq!(app.completion_sel, 6);
 
         let _ = handle_key(&mut app, key(KeyCode::Esc));
         assert!(!app.completion_active, "Esc 关闭补全");

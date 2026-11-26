@@ -514,6 +514,10 @@ impl MemoryPort for MemoryService {
         MemoryStore::list(self, q).await
     }
 
+    async fn delete(&self, id: &MemoryId) -> Result<(), MemoryError> {
+        MemoryStore::delete(self, id).await
+    }
+
     async fn compose(
         &self,
         scope: &MemoryScope,
@@ -818,7 +822,9 @@ mod tests {
             }
             v
         };
-        s.delete(&ids[0]).await.unwrap();
+        agent_core::memory::MemoryStore::delete(s.as_ref(), &ids[0])
+            .await
+            .unwrap();
         // 新实例回放压缩后的文件：删除仍然生效。
         let s2 = MemoryService::new(path.clone(), MemoryConfig::default());
         let gone = MemoryStore::get(&s2, &ids[0]).await.unwrap().unwrap();
