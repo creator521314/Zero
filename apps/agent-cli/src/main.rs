@@ -159,6 +159,17 @@ fn init_tracing(cfg_path: &Path) -> PathBuf {
     dir.join("agent.log")
 }
 
+/// 用户级记忆库路径（设计 O4：`~/.config/zero/memory.jsonl`）。
+fn user_memory_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home)
+        .join(".config")
+        .join("zero")
+        .join("memory.jsonl")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cfg_path = ProvidersFile::config_path();
@@ -234,6 +245,13 @@ async fn main() -> anyhow::Result<()> {
     // 存储
     let store = Arc::new(JsonlStore::new(&root));
     store.init().await?;
+
+    // 记忆服务（用户级 ~/.config/zero/memory.jsonl；项目级 <project_root>/.zero/）。
+    // 失败不阻塞启动：记忆是增强能力，读写失败只影响注入与检索。
+    let memory = Arc::new(agent_store::MemoryService::new(
+        user_memory_path(),
+        agent_core::memory::MemoryConfig::default(),
+    ));
     // 过期清理：`transient_retention_days` 此前只是配置里的死字段，临时事件
     // （含工具输出）永不删除。失败不阻塞启动。
     if let Err(e) = store
@@ -273,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
         let redact2 = redact.clone();
         let port2 = subagent_impl.clone();
         let budget_cell2 = budget_cell.clone();
+        let memory2 = memory.clone();
 
         tokio::spawn(async move {
             // 当前运行中的任务：取消令牌 + 句柄。
@@ -339,6 +358,37 @@ async fn main() -> anyhow::Result<()> {
                         // 之后提交的任务」）；这里不再用配置默认值覆盖——覆盖了徽章
                         // 就只是装饰，切了档提交时仍走默认 L2。
                         spec.max_iterations = max_iter;
+
+                        // 记忆注入快照（M2）：任务提交时算好并随 TaskSpec 走，
+                        // 审计可复现当时注入了什么；/resume 不重算（沿用原快照）。
+                        if spec.memory_context.is_none() {
+                            let scope = match spec.project_root.as_deref() {
+                                Some(r) if !r.is_empty() => {
+                                    agent_core::memory::MemoryScope::Project { root: r.into() }
+                                }
+                                _ => agent_core::memory::MemoryScope::User,
+                            };
+                            match agent_core::memory::MemoryPort::compose(
+                                memory2.as_ref(),
+                                &scope,
+                                agent_runtime::context::ContextConfig::default().max_context,
+                            )
+                            .await
+                            {
+                                Ok(ctx) if !ctx.text.is_empty() => {
+                                    tracing::info!(
+                                        injected = ctx.injected_ids.len(),
+                                        truncated = ctx.truncated,
+                                        "memory injected"
+                                    );
+                                    spec.memory_context = Some(ctx);
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "memory compose 失败，本次不注入")
+                                }
+                            }
+                        }
 
                         let provider = match router.resolve(None, spec.model.as_deref()).await {
                             Ok(p) => p,

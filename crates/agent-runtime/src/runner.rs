@@ -199,9 +199,16 @@ impl AgentRuntime {
              【审批】当你发起的工具调用需要用户确认时，用户批准后该工具的返回会以\n\
              [user-approved] 开头；被拒绝会以 [rejected by user] 或 [denied] 开头。\n\
              除此之外，你**无法得知**某次操作是否经过人工审批，也不得依据「操作成功了」\n\
-             推断权限系统是否设防。",
+             推断权限系统是否设防。\
+             {memory}",
             prompt = task.prompt,
             ws = ws,
+            // 记忆注入快照（已在装配层完成动态截断与来源标注；None/空文本时为空串）。
+            // 子任务的 memory_context 恒为 None（完全隔离）。
+            memory = match &task.memory_context {
+                Some(mc) if !mc.text.is_empty() => format!("\n\n【长期记忆】\n{}", mc.text),
+                _ => String::new(),
+            },
         )
     }
 
@@ -1999,6 +2006,26 @@ mod tests {
             p.contains("无法得知"),
             "提示词应声明模型看不到审批结果: {p}"
         );
+    }
+
+    #[test]
+    fn system_prompt_injects_memory_context_when_present() {
+        let mut spec = TaskSpec::new("t", "/tmp/ws");
+        // None / 空文本 → 不出现【长期记忆】段。
+        assert!(!AgentRuntime::system_prompt(&spec).contains("【长期记忆】"));
+        spec.memory_context = Some(agent_core::memory::MemoryContext::default());
+        assert!(
+            !AgentRuntime::system_prompt(&spec).contains("【长期记忆】"),
+            "空文本不应注入空段"
+        );
+        spec.memory_context = Some(agent_core::memory::MemoryContext {
+            text: "【记忆 · 用户级】端口 7890\n".into(),
+            injected_ids: vec![],
+            truncated: 0,
+        });
+        let p = AgentRuntime::system_prompt(&spec);
+        assert!(p.contains("【长期记忆】"), "有快照应注入: {p}");
+        assert!(p.contains("端口 7890"), "记忆内容应在 system 里: {p}");
     }
 
     /// 系统级验证「批准本任务同类操作」：按过 `a` 之后，同类调用不再弹窗。

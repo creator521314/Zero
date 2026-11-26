@@ -69,6 +69,10 @@ pub struct TaskSpec {
     /// 子任务由 RuntimeSubagent 设为「父工具集去掉 delegate」。
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
+    /// 记忆注入快照（装配层在任务提交时算好；子任务恒为 None，完全隔离）。
+    /// `Some` 且文本非空时拼进 system 固定区；随事件/日志可复现当时注入了什么。
+    #[serde(default)]
+    pub memory_context: Option<crate::memory::MemoryContext>,
 }
 
 impl TaskSpec {
@@ -90,6 +94,7 @@ impl TaskSpec {
             parent_id: None,
             depth: 0,
             tool_allowlist: None,
+            memory_context: None,
         }
     }
 
@@ -159,6 +164,22 @@ mod tests {
         });
         let t: TaskSpec = serde_json::from_value(json).expect("旧日志仍可反序列化");
         assert!(t.tool_allowlist.is_none());
+        assert!(t.memory_context.is_none());
         assert!(t.allows_tool("shell_exec"));
+    }
+
+    #[test]
+    fn memory_context_survives_serde_roundtrip() {
+        let mut t = TaskSpec::new("t", "/tmp/ws");
+        t.memory_context = Some(crate::memory::MemoryContext {
+            text: "【记忆 · 用户级】端口 7890\n".into(),
+            injected_ids: vec![crate::memory::MemoryId("m-1".into())],
+            truncated: 1,
+        });
+        let s = serde_json::to_string(&t).unwrap();
+        let back: TaskSpec = serde_json::from_str(&s).unwrap();
+        let mc = back.memory_context.expect("快照应保留");
+        assert_eq!(mc.truncated, 1);
+        assert!(mc.text.contains("端口 7890"));
     }
 }

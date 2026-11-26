@@ -18,6 +18,17 @@ use agent_providers::ProvidersFile;
 use agent_store::JsonlStore;
 use tokio::sync::mpsc;
 
+/// 用户级记忆库路径（设计 O4：`~/.config/zero/memory.jsonl`）。
+fn user_memory_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home)
+        .join(".config")
+        .join("zero")
+        .join("memory.jsonl")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -171,6 +182,29 @@ async fn main() -> anyhow::Result<()> {
     // 工具沙箱 = 项目根（默认启动目录）；私有工作区只放系统数据。
     spec.project_root = Some(cfg.agent.resolved_project_root().display().to_string());
     // headless 单任务：登记一次即可，不需要 unregister。
+    // 记忆注入快照（M2）：与 CLI 同一套规则；失败静默，不阻塞任务。
+    {
+        let memory = agent_store::MemoryService::new(
+            user_memory_path(),
+            agent_core::memory::MemoryConfig::default(),
+        );
+        let scope = agent_core::memory::MemoryScope::Project {
+            root: spec.project_root.clone().unwrap_or_default(),
+        };
+        match agent_core::memory::MemoryPort::compose(
+            &memory,
+            &scope,
+            agent_runtime::context::ContextConfig::default().max_context,
+        )
+        .await
+        {
+            Ok(ctx) if !ctx.text.is_empty() => {
+                tracing::info!(injected = ctx.injected_ids.len(), "memory injected");
+                spec.memory_context = Some(ctx);
+            }
+            _ => {}
+        }
+    }
     subagent_impl
         .register(spec.clone(), deps, bus.clone())
         .await;
