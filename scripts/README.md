@@ -1,4 +1,41 @@
-# 代理脚本（scripts/）
+# scripts/ 工具脚本
+
+## 目录
+
+| 脚本 | 用途 |
+|---|---|
+| `proxy-on` / `proxy-off` | git 走本地代理加速 push / pull / clone |
+| `memory-clear` | 删除 Zero 长期记忆文件（测试阶段清理用） |
+
+---
+
+## memory-clear · 记忆清理
+
+删除记忆系统的物理存储（append-only JSONL），让长期记忆回到全新状态：
+
+- 项目级：`<项目根>/.zero/memory.jsonl`
+- 用户级：`~/.config/zero/memory.jsonl`
+
+在 **项目根目录** 下：
+
+| 平台 | 命令 |
+|---|---|
+| Linux / macOS | `./scripts/memory-clear.sh` |
+| PowerShell | `.\scripts\memory-clear.ps1` |
+
+| 参数 | 含义 |
+|---|---|
+| （无） | 交互确认后删 项目级 + 用户级 |
+| `-y` / `-Yes` | 跳过确认 |
+| `project` / `-Scope project` | 只删项目级 |
+| `user` / `-Scope user` | 只删用户级 |
+| `--backup` / `-Backup` | 删除前改名为 `<文件>.bak-<时间戳>`（可追溯） |
+
+> 删除的是物理文件；TUI `/memory` 面板里的「删除/清空」只做逻辑删除（Archived 留版本），两者用途不同。
+
+---
+
+## proxy-on / proxy-off · Git 代理
 
 通过本地代理软件（默认 `127.0.0.1:7890`）加速 `git push / pull / clone` 等网络操作。
 
