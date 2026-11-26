@@ -278,9 +278,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
             }
             app.wake_cursor();
         }
-        MouseEventKind::Down(button) | MouseEventKind::Drag(button)
-            if button == MouseButton::Left =>
-        {
+        // 只认真正的「按下」：Down 是单击的起点。
+        // 此前这里是 `Down | Drag`，导致按住左键拖动时每一帧 Drag 都被当成
+        // 一次点击——拖过 header 权限徽章就连续切档、拖过输入区就乱跳光标。
+        MouseEventKind::Down(MouseButton::Left) => {
             // `@` 文件补全优先（和 `/` 菜单一样吞掉本次点击，避免误触背后界面）。
             if app.at.active {
                 if click_at_completion(app, m.row, m.column, input) {
@@ -306,6 +307,16 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
             } else if in_input {
                 click_input_cursor(app, m.column, input_content_rect(input));
             } else if let Some((sx, sy, sh)) = scrollbar_track(conv) {
+                if m.column == sx && m.row >= sy && m.row < sy.saturating_add(sh) {
+                    scroll_to_position(app, m.row, conv);
+                }
+            }
+        }
+        // 拖动不是点击：只允许一个用途——在滚动条轨道上跟随定位。
+        // 拖过 header / 输入区 / 弹层按钮一律无效果（弹层分支已在函数开头
+        // 只认 Down，天然不受影响）。
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some((sx, sy, sh)) = scrollbar_track(conv) {
                 if m.column == sx && m.row >= sy && m.row < sy.saturating_add(sh) {
                     scroll_to_position(app, m.row, conv);
                 }
@@ -2054,6 +2065,39 @@ mod tests {
     }
 
     #[test]
+    fn drag_over_header_badge_does_not_cycle_tier() {
+        // 回归：按住左键从空白区拖到权限徽章，此前每一帧 Drag 都被当成
+        // 点击，档位不停切换。Drag 不是点击。
+        let mut app = App::default();
+        app.tier = "L2".into();
+        let area = rect(80, 30);
+        let header = layout_chunks(area, true)[0];
+        let badge = header_badge_rect(header, &app.tier);
+        let m = mouse(MouseEventKind::Drag(MouseButton::Left), badge.x, badge.y);
+        handle_mouse(&mut app, m, area);
+        assert_eq!(app.tier, "L2", "拖过徽章不得触发切档");
+        // 松开（Up）同样不是点击。
+        let m = mouse(MouseEventKind::Up(MouseButton::Left), badge.x, badge.y);
+        handle_mouse(&mut app, m, area);
+        assert_eq!(app.tier, "L2");
+    }
+
+    #[test]
+    fn drag_over_input_area_does_not_move_cursor() {
+        // 同类问题排查：拖进输入区不得被当成点击移动光标。
+        let mut app = App::default();
+        for c in "hello".chars() {
+            app.input.insert_char(c);
+        }
+        let area = rect(80, 30);
+        let chunks = layout_chunks(area, true);
+        let input = chunks[2];
+        let m = mouse(MouseEventKind::Drag(MouseButton::Left), input.x, input.y);
+        handle_mouse(&mut app, m, area);
+        assert_eq!(app.input.cursor, 5, "拖动不得移动输入光标");
+    }
+
+    #[test]
     fn approval_button_areas_match_layout() {
         let area = rect(80, 24);
         let (approve, reject) = approval_button_areas(area);
@@ -2124,6 +2168,43 @@ mod tests {
         scroll_to_position(&mut app, sy + sh - 1, conv);
         assert_eq!(app.scroll_from_bottom, 0, "点底部应贴底");
         assert!(app.follow, "贴底应恢复 follow");
+    }
+
+    #[test]
+    fn drag_on_scrollbar_still_follows() {
+        // 拖动的唯一合法用途：在滚动条轨道上跟随定位。
+        use agent_core::ids::TaskId;
+        let mut app = App::default();
+        let id = TaskId::new();
+        app.apply_event(Event::TaskStarted {
+            id: id.clone(),
+            title: "t".into(),
+        });
+        for i in 0..60 {
+            app.apply_event(Event::TextDelta {
+                id: id.clone(),
+                text: format!("第 {i} 行\n"),
+            });
+        }
+        let area = rect(80, 30);
+        let conv = layout_chunks(area, true)[1];
+        let (sx, sy, _sh) = scrollbar_track(conv).expect("有滚动条");
+        let (total, view) = conversation_scroll_params(&app, conv);
+        assert!(total.saturating_sub(view) > 0);
+
+        // 起始贴底，然后「按住拖」到轨道顶部 —— 应滚到最顶。
+        app.scroll_from_bottom = 0;
+        app.follow = true;
+        let m = mouse(MouseEventKind::Drag(MouseButton::Left), sx, sy);
+        handle_mouse(&mut app, m, area);
+        assert_eq!(app.scroll_from_bottom, total - view, "拖到顶应滚到最顶");
+        assert!(!app.follow, "离开底部应停止跟随");
+
+        // 拖到非滚动条列上应无效果（不会误触其它交互）。
+        app.scroll_from_bottom = 3;
+        let m = mouse(MouseEventKind::Drag(MouseButton::Left), sx - 2, sy);
+        handle_mouse(&mut app, m, area);
+        assert_eq!(app.scroll_from_bottom, 3, "拖到轨道外不得改变滚动位置");
     }
 
     // ---- / 命令补全 ----
