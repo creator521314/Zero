@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use agent_core::event::{Command, Event, Outcome, ToolOutcome};
 use agent_core::ids::{ApprovalId, TaskId};
 use agent_core::perm::{ApprovalRequest, PermissionTier};
+use agent_core::question::{QuestionAnswer, QuestionRequest};
 use agent_core::store::TaskSummary;
 use agent_core::task::{TaskSpec, TaskState};
 use tokio::sync::mpsc;
@@ -213,6 +214,8 @@ pub struct App {
     /// 最近一次对话区内容宽度（wrap / 提取用），由渲染循环每帧更新。
     pub conv_width: usize,
     pub pending: Option<PendingApproval>,
+    /// AI 的提问弹层：候选选择 / 自定义输入 / 取消。None = 没有待回答问题。
+    pub pending_question: Option<PendingQuestion>,
     pub active_task: Option<TaskId>,
     /// 待转交编排层的 `/` 命令（`/resume`、面板刷新需要 store，UI 够不着）。
     pub pending_command: Option<Command>,
@@ -448,6 +451,7 @@ impl Default for App {
             mouse_captured: true,
             conv_width: 80,
             pending: None,
+            pending_question: None,
             active_task: None,
             pending_command: None,
             tier: "L2".into(),
@@ -566,6 +570,31 @@ pub struct ContextMenu {
     pub y: u16,
     /// 当前高亮的菜单项索引（↑↓ 选择，Enter 执行）。
     pub selected: usize,
+}
+
+/// 一次待回答的提问：候选索引与自定义输入缓冲区。
+pub struct PendingQuestion {
+    pub req: QuestionRequest,
+    /// 选中项：0..options.len()-1 是候选，等于 options.len() 表示「自己输入」。
+    pub sel: usize,
+    pub custom: InputState,
+    pub editing: bool,
+}
+
+impl PendingQuestion {
+    fn new(req: QuestionRequest) -> Self {
+        Self {
+            req,
+            sel: 0,
+            custom: InputState::default(),
+            editing: false,
+        }
+    }
+
+    /// 可选项目总数（最后一项是「自己输入」，若允许）。
+    pub fn option_count(&self) -> usize {
+        self.req.options.len() + usize::from(self.req.allow_custom)
+    }
 }
 
 /// 由按键解析出的动作。
@@ -740,6 +769,24 @@ impl App {
             // 审批结果只服务审计（日志/复盘）；界面上的「待审批」在用户按键
             // 那一刻就已清掉，这里无需再动状态。
             Event::ApprovalDecided { .. } => {}
+            Event::QuestionAsked { req, .. } => {
+                self.status = "等待回答…".into();
+                self.pending_question = Some(PendingQuestion::new(req));
+                self.request_repaint();
+            }
+            // 回答在用户按键那一刻已从界面清掉；这里按 id 再清一次，兜住
+            // 其它任务/其它前端回灌的答案，避免旧弹层留着不消失。
+            Event::QuestionAnswered { question_id, .. } => {
+                if self
+                    .pending_question
+                    .as_ref()
+                    .is_some_and(|p| p.req.id == question_id)
+                {
+                    self.pending_question = None;
+                    self.status = "就绪".into();
+                    self.request_repaint();
+                }
+            }
             Event::TaskFinished { id, outcome } => {
                 // 子任务收尾：只插一行状态，绝不碰 active_task / status。
                 if self.active_task.as_ref() != Some(&id) {
@@ -806,6 +853,8 @@ impl App {
             }
             Event::TaskOpened { id, title, events } => {
                 self.panel_open = false;
+                self.pending_question = None;
+                self.request_repaint();
                 // 历史回放现在带 ContextSnapshot（store::task_events 保留），
                 // 按与实时/续跑相同的增量协议重建调试视图；没有快照的旧日志
                 // 标记为 legacy，界面给出明确说明而不是空白。
@@ -1289,6 +1338,7 @@ impl App {
         // 新话题：旧的上下文快照序列不再适用，调试页一并回到空状态。
         self.ctx.reset(false);
         self.ctx_debug = None;
+        self.pending_question = None;
         self.lines.push(Line::System(
             "对话已清空（下一条指令将作为新任务开始）。".into(),
         ));
@@ -1500,6 +1550,98 @@ impl App {
         })
     }
 
+    /// 问答弹层：移动候选项（含末尾的「自己输入」）。
+    pub fn question_move(&mut self, delta: i32) {
+        if let Some(p) = &mut self.pending_question {
+            let n = p.option_count().saturating_sub(1) as i64;
+            let cur = p.sel as i64;
+            p.sel = (cur + delta as i64).max(0).min(n) as usize;
+            p.editing = false;
+            self.request_repaint();
+        }
+    }
+
+    /// Tab / `e`：在候选列表与自定义输入之间切换。
+    pub fn question_toggle_edit(&mut self) {
+        let allowed = self
+            .pending_question
+            .as_ref()
+            .is_some_and(|p| p.req.allow_custom);
+        if allowed {
+            if let Some(p) = &mut self.pending_question {
+                p.editing = !p.editing;
+                if p.editing {
+                    p.sel = p.req.options.len();
+                }
+                self.request_repaint();
+            }
+        }
+    }
+
+    /// 自定义输入：直接打字即进入编辑（省一次 Tab）。
+    pub fn question_char(&mut self, c: char) {
+        if let Some(p) = &mut self.pending_question {
+            if !p.req.allow_custom {
+                return;
+            }
+            p.editing = true;
+            p.sel = p.req.options.len();
+            p.custom.insert_char(c);
+            self.request_repaint();
+        }
+    }
+
+    pub fn question_backspace(&mut self) {
+        if let Some(p) = &mut self.pending_question {
+            p.editing = true;
+            p.custom.backspace();
+            self.request_repaint();
+        }
+    }
+
+    pub fn question_delete(&mut self) {
+        if let Some(p) = &mut self.pending_question {
+            p.editing = true;
+            p.custom.delete();
+            self.request_repaint();
+        }
+    }
+
+    pub fn question_move_cursor(&mut self, delta: i32) {
+        if let Some(p) = &mut self.pending_question {
+            p.editing = true;
+            if delta < 0 {
+                p.custom.move_left();
+            } else {
+                p.custom.move_right();
+            }
+            self.request_repaint();
+        }
+    }
+
+    /// 提交回答并清掉弹层；`Cancelled` 也是正式回答，等待中的工具会立刻结束。
+    pub fn take_question(&mut self, answer: QuestionAnswer) -> Option<Command> {
+        let p = self.pending_question.take()?;
+        self.status = "就绪".into();
+        self.request_repaint();
+        Some(Command::AnswerQuestion {
+            question_id: p.req.id,
+            answer,
+        })
+    }
+
+    /// 当前选中项对应的回答；选中「自己输入」时返回 None（调用方切编辑）。
+    pub fn question_selected_answer(&self) -> Option<QuestionAnswer> {
+        let p = self.pending_question.as_ref()?;
+        if p.sel >= p.req.options.len() {
+            return None;
+        }
+        Some(QuestionAnswer::Selected {
+            index: p.sel,
+            label: p.req.options[p.sel].clone(),
+        })
+    }
+
     /// 中断当前任务。
     pub fn cancel_command(&self) -> Option<Command> {
         self.active_task.clone().map(Command::Cancel)
@@ -1565,7 +1707,20 @@ fn replay_lines(events: &[Event]) -> Vec<Line> {
         if matches!(ev, Event::TaskList { .. } | Event::TaskOpened { .. }) {
             continue;
         }
-        ctx.apply_event(ev.clone());
+        // 问答事件在实时流里只弹层、不写对话区；回放时没有人再回答它们，
+        // 必须转成文本行，否则历史会话里「当时问了什么、答了什么」凭空消失。
+        match ev {
+            Event::QuestionAsked { req, .. } => ctx.lines.push(Line::System(format!(
+                "❓ AI 提问：{}（{} 个候选）",
+                req.question,
+                req.options.len()
+            ))),
+            Event::QuestionAnswered { answer, .. } => ctx.lines.push(Line::System(format!(
+                "✍ 用户回答：{}",
+                answer.as_model_text()
+            ))),
+            _ => ctx.apply_event(ev.clone()),
+        }
     }
     ctx.lines
 }
@@ -3368,5 +3523,129 @@ mod tests {
             "实时路径下增量与整轮回复不该各占一行：{:?}",
             app.lines
         );
+    }
+
+    // ---- AI 问答（ask_user）----
+
+    fn question_req(id: &str) -> agent_core::question::QuestionRequest {
+        agent_core::question::QuestionRequest {
+            id: agent_core::ids::QuestionId::from_raw(id),
+            task_id: TaskId::from_raw("t-ask"),
+            question: "用哪种数据库？".into(),
+            header: Some("技术选型".into()),
+            options: vec!["SQLite".into(), "Postgres".into()],
+            allow_custom: true,
+        }
+    }
+
+    #[test]
+    fn question_asked_opens_popup_and_matching_answer_closes_it() {
+        let mut app = App::default();
+        app.apply_event(Event::QuestionAsked {
+            id: TaskId::from_raw("t-ask"),
+            req: question_req("q-1"),
+        });
+        assert!(app.pending_question.is_some());
+        assert_eq!(app.status, "等待回答…");
+
+        // 别的问题的回答不能把当前弹层关掉。
+        app.apply_event(Event::QuestionAnswered {
+            id: TaskId::from_raw("t-ask"),
+            question_id: agent_core::ids::QuestionId::from_raw("other"),
+            answer: agent_core::question::QuestionAnswer::Cancelled,
+        });
+        assert!(app.pending_question.is_some());
+        app.apply_event(Event::QuestionAnswered {
+            id: TaskId::from_raw("t-ask"),
+            question_id: agent_core::ids::QuestionId::from_raw("q-1"),
+            answer: agent_core::question::QuestionAnswer::Cancelled,
+        });
+        assert!(app.pending_question.is_none());
+        assert_eq!(app.status, "就绪");
+    }
+
+    #[test]
+    fn question_move_and_custom_buffer_are_bounded() {
+        let mut app = App::default();
+        app.apply_event(Event::QuestionAsked {
+            id: TaskId::from_raw("t-ask"),
+            req: question_req("q-2"),
+        });
+        assert_eq!(app.pending_question.as_ref().unwrap().option_count(), 3);
+        app.question_move(10);
+        assert_eq!(
+            app.pending_question.as_ref().unwrap().sel,
+            2,
+            "clamp 到自定义项"
+        );
+        app.question_move(-10);
+        assert_eq!(app.pending_question.as_ref().unwrap().sel, 0);
+
+        app.question_toggle_edit();
+        assert!(app.pending_question.as_ref().unwrap().editing);
+        app.question_char('你');
+        app.question_char('好');
+        app.question_backspace();
+        assert_eq!(app.pending_question.as_ref().unwrap().custom.buffer, "你");
+    }
+
+    #[test]
+    fn take_question_returns_command_and_clears_state() {
+        let mut app = App::default();
+        app.apply_event(Event::QuestionAsked {
+            id: TaskId::from_raw("t-ask"),
+            req: question_req("q-3"),
+        });
+        let cmd = app
+            .take_question(agent_core::question::QuestionAnswer::Custom {
+                text: "都要".into(),
+            })
+            .unwrap();
+        match cmd {
+            Command::AnswerQuestion {
+                question_id,
+                answer,
+            } => {
+                assert_eq!(question_id.0, "q-3");
+                assert_eq!(
+                    answer,
+                    agent_core::question::QuestionAnswer::Custom {
+                        text: "都要".into()
+                    }
+                );
+            }
+            _ => panic!("应是问答命令"),
+        }
+        assert!(app.pending_question.is_none());
+        assert!(app.take_repaint(), "弹层消失要整屏重绘");
+    }
+
+    #[test]
+    fn replay_shows_question_and_answer_as_history_lines() {
+        let lines = replay_lines(&[
+            Event::QuestionAsked {
+                id: TaskId::from_raw("t-ask"),
+                req: question_req("q-history"),
+            },
+            Event::QuestionAnswered {
+                id: TaskId::from_raw("t-ask"),
+                question_id: agent_core::ids::QuestionId::from_raw("q-history"),
+                answer: agent_core::question::QuestionAnswer::Selected {
+                    index: 0,
+                    label: "SQLite".into(),
+                },
+            },
+        ]);
+        let text = lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::System(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("用哪种数据库"), "{text}");
+        assert!(text.contains("SQLite"), "{text}");
+        assert!(text.contains("用户回答"), "{text}");
     }
 }

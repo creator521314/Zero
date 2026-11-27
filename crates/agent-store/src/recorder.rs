@@ -39,6 +39,8 @@ pub fn classify(ev: &Event, cfg: &LogConfig) -> Option<(TaskId, Durability)> {
         | Event::ToolCallEnd { id, .. }
         | Event::AwaitingApproval { id, .. }
         | Event::ApprovalDecided { id, .. }
+        | Event::QuestionAsked { id, .. }
+        | Event::QuestionAnswered { id, .. }
         | Event::ContextSnapshot { id, .. }
         | Event::AssistantTurn { id, .. } => Some((id.clone(), Durability::Transient)),
 

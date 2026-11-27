@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_core::provider::ToolDef;
+use agent_core::question::UserQuestionPort;
 use agent_core::subagent::SubagentPort;
 use agent_core::tool::Tool;
 
@@ -60,6 +61,14 @@ impl ToolRegistry {
     /// 生产装配（agent-cli / agent-server）在构造注册表后调用本方法。
     pub fn register_delegate(&mut self, port: Arc<dyn SubagentPort>) {
         self.register(Arc::new(DelegateTool::new(port)));
+    }
+
+    /// 显式注入交互式问答工具。
+    ///
+    /// 不放进 `default_tools()`：headless 服务没有前端回答，注册了只会让模型
+    /// 用一个永远等不到应答的工具。只有装配了 TUI 的入口才调用本方法。
+    pub fn register_question(&mut self, port: Arc<dyn UserQuestionPort>) {
+        self.register(Arc::new(crate::ask_user::AskUserTool::new(port)));
     }
 
     /// 显式注入记忆检索工具（同 `register_delegate` 的理由）。

@@ -35,6 +35,10 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 /// 否则父层会在 120s 先把它掐断（TOOL_TIMEOUT 对所有工具一视同仁）。
 const DELEGATE_TOOL_TIMEOUT: Duration = Duration::from_secs(330);
 
+/// 交互问答在等**人**，120s 的机器超时会在用户还没想好时把工具掐断。
+/// 30 分钟仍未回答时按超时失败回填，模型换策略；取消令牌仍可立刻打断。
+const QUESTION_TOOL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// 审批应答。
 #[derive(Debug, Clone)]
 pub enum ApprovalReply {
@@ -769,12 +773,14 @@ impl AgentRuntime {
                 let repeat_count = *cnt;
 
                 // 终止信号工具（如 finish）无副作用，跳过权限裁决直接执行。
-                let terminating = (self.deps.tools)(&call.name)
-                    .map(|t| t.is_terminating())
-                    .unwrap_or(false);
+                // 交互工具（ask_user）同理：问一句话还要先弹批准框是骚扰，
+                // 而且两个弹层会互相抢模态；重复调用仍由下面的重复检测拦住。
+                let (terminating, interactive) = (self.deps.tools)(&call.name)
+                    .map(|t| (t.is_terminating(), t.is_interactive()))
+                    .unwrap_or((false, false));
 
                 // ---- 权限裁决 ----
-                let mut decision = if terminating {
+                let mut decision = if terminating || interactive {
                     Decision::Allow
                 } else {
                     self.deps.perm.check(call, &task).await
@@ -1180,7 +1186,9 @@ impl AgentRuntime {
             workspace: std::path::PathBuf::from(&task.workspace),
             project_root: task.project_root.as_ref().map(std::path::PathBuf::from),
             task_id: task.id.0.clone(),
-            timeout: if call.name == "delegate" {
+            timeout: if tool.is_interactive() {
+                QUESTION_TOOL_TIMEOUT
+            } else if call.name == "delegate" {
                 DELEGATE_TOOL_TIMEOUT
             } else {
                 TOOL_TIMEOUT
@@ -2192,6 +2200,93 @@ mod tests {
         }
         assert!(!asked, "终止信号工具不应进入审批流程");
 
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// 交互工具（ask_user）不能进审批流程：用户已经要回答问题了，
+    /// 再弹一次批准框会把两个模态叠在一起，而且审批没人回时任务会永远挂着。
+    struct InteractiveTool;
+
+    #[async_trait]
+    impl Tool for InteractiveTool {
+        fn name(&self) -> &str {
+            "ask_mock"
+        }
+        fn description(&self) -> &str {
+            "测试用交互工具"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn risk_level(&self) -> Risk {
+            Risk::Low
+        }
+        fn is_interactive(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("用户选择：A"))
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_tool_skips_permission_approval() {
+        let tmp = std::env::temp_dir().join(format!("agent-rt-ask-{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = Arc::new(JsonlStore::new(&tmp));
+
+        let lookup: ToolLookup = Arc::new(|name: &str| {
+            (name == "ask_mock").then(|| Arc::new(InteractiveTool) as Arc<dyn Tool>)
+        });
+        let (_ap_tx, ap_rx) = mpsc::channel::<ApprovalMsg>(1);
+        let runtime = AgentRuntime::new(RuntimeDeps {
+            provider: Arc::new(ScriptedProvider {
+                turns: Mutex::new(vec![
+                    vec![
+                        tool_call_args(0, "c1", "ask_mock", "{}"),
+                        StreamEvent::Done(agent_core::provider::FinishReason::ToolCalls),
+                    ],
+                    vec![StreamEvent::Done(agent_core::provider::FinishReason::Stop)],
+                ]),
+            }),
+            provider_name: "scripted".into(),
+            tools: lookup,
+            tool_defs: vec![],
+            // 一律询问：若交互工具没有豁免，这里会卡在等待审批上。
+            perm: Arc::new(AskAll),
+            store,
+            log_cfg: LogConfig::default(),
+            approvals: Arc::new(ApprovalInbox::new(ap_rx)),
+            context_cfg: ContextConfig::default(),
+            per_task_budget: 0.0,
+            cost_sink: None,
+            redact: Arc::new(|s: &str| s.to_string()),
+        });
+
+        let bus = event_bus();
+        let mut sub = bus.subscribe();
+        let mut spec = TaskSpec::new("问答", ws.display().to_string());
+        spec.max_iterations = 3;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            runtime.run(spec, bus, RunControl::new()),
+        )
+        .await
+        .expect("交互工具不应卡在审批等待")
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Success { .. }));
+
+        while let Ok(ev) = sub.try_recv() {
+            assert!(
+                !matches!(ev, Event::AwaitingApproval { .. }),
+                "交互工具不应触发审批"
+            );
+        }
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 

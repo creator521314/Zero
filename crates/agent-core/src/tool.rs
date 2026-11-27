@@ -214,6 +214,13 @@ pub trait Tool: Send + Sync {
     fn parameters(&self) -> serde_json::Value;
     /// 静态风险等级，供权限引擎初筛。
     fn risk_level(&self) -> Risk;
+    /// 是否是「需要用户参与」的交互工具（如 `ask_user`）。
+    ///
+    /// runtime 对这类工具跳过权限审批：问一句话还要先弹一次批准框是纯粹的骚扰，
+    /// 而且审批弹层与问答弹层会互相抢模态。默认 `false`，既有工具行为不变。
+    fn is_interactive(&self) -> bool {
+        false
+    }
     /// 是否是「终止信号」工具：调用后执行循环应立即结束并汇总产物。
     ///
     /// 默认 `false`；`finish` 等显式收尾工具覆盖为 `true`。

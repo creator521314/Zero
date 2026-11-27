@@ -326,6 +326,9 @@ async fn main() -> anyhow::Result<()> {
     // 每任务已注入记忆 id 注册表：memory_search 据此排除重复（设计 §5.1）。
     let injected_registry = agent_tools::InjectedRegistry::new();
 
+    // 事件总线要在工具注册表之前建好：交互问答工具需要它来广播提问。
+    let bus = event_bus();
+
     // 工具集。搜索后端按 [search] 段解析：未配置时走内置免 key 后端，
     // 保证 web_search 开箱可用。
     let mut registry = agent_tools::default_tools(agent_tools::SearchBackend::resolve(
@@ -334,6 +337,9 @@ async fn main() -> anyhow::Result<()> {
     ));
     registry.register_delegate(subagent_port.clone());
     registry.register_memory(memory.clone(), memory.clone(), injected_registry.clone());
+    // TUI 才有前端回答：headless 服务刻意不注册 ask_user。
+    let (question_port, q_tx) = agent_runtime::question::InteractiveQuestionPort::pair(bus.clone());
+    registry.register_question(Arc::new(question_port));
     let registry = Arc::new(registry);
     let reg_for_lookup = registry.clone();
     let lookup: agent_runtime::runner::ToolLookup =
@@ -364,9 +370,8 @@ async fn main() -> anyhow::Result<()> {
     let (ap_tx, ap_rx) = mpsc::channel::<agent_runtime::runner::ApprovalMsg>(16);
     let approvals = Arc::new(agent_runtime::runner::ApprovalInbox::new(ap_rx));
 
-    let bus = event_bus();
-
     // 命令通道
+
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(64);
     // 事件通道（TUI 消费）
     let (ev_tx, ev_rx) = mpsc::channel::<Event>(2048);
@@ -398,6 +403,7 @@ async fn main() -> anyhow::Result<()> {
         let lookup2 = lookup.clone();
         let perm2 = perm.clone();
         let approvals2 = approvals.clone();
+        let q_tx2 = q_tx.clone();
         let log_cfg2 = cfg.log.clone();
         let cfg_root = root.clone();
         let proj_root = project_root.clone();
@@ -624,6 +630,15 @@ async fn main() -> anyhow::Result<()> {
                             .is_err()
                         {
                             tracing::error!("approval channel closed; runner gone");
+                        }
+                    }
+                    Command::AnswerQuestion {
+                        question_id,
+                        answer,
+                    } => {
+                        tracing::info!(question = %question_id.0, "answer forwarded to runner");
+                        if q_tx2.send((question_id, answer)).await.is_err() {
+                            tracing::error!("question channel closed; runner gone");
                         }
                     }
                     Command::Cancel(id) => {

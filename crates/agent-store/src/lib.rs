@@ -286,6 +286,8 @@ impl JsonlStore {
                         | Event::AssistantTurn { .. }
                         | Event::ToolCallStart { .. }
                         | Event::ToolCallEnd { .. }
+                        | Event::QuestionAsked { .. }
+                        | Event::QuestionAnswered { .. }
                         | Event::TaskFinished { .. }
                         | Event::Error { .. }
                 )

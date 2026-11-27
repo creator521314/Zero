@@ -25,6 +25,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use agent_core::event::{Command, Event};
 use agent_core::provider::{estimate_messages_tokens, Message, Role};
+use agent_core::question::QuestionAnswer;
 
 use crate::app::{
     App, ContextAction, ContextMenu, Line, MemoryPending, Selection, ToolStatus, UiAction,
@@ -285,6 +286,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
     // 弹层优先：审批期间其它鼠标交互一律吞掉，避免误触背后的界面。
     if app.pending.is_some() {
         return handle_approval_mouse(m, area);
+    }
+    // 问答弹层也是模态的：点候选即回答，点输入行进入编辑，点按钮提交/取消。
+    if app.pending_question.is_some() {
+        return question_mouse(app, m, area);
     }
     // 任务面板同样是模态的：点某一行即切过去，点面板外关闭。
     if app.panel_open {
@@ -665,6 +670,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
         };
     }
 
+    // 问答弹层：AI 正在等用户决策，键盘完全归它（审批优先级更高）。
+    if app.pending_question.is_some() {
+        return question_key(app, key);
+    }
+
     // 记忆面板：打开时独占键盘（Tab 切页、Enter 确认候选、Del 删除、
     // 直接打字即搜索、Esc 关闭）。
     if app.ctx_debug.is_some() {
@@ -1030,6 +1040,12 @@ fn draw(f: &mut Frame, app: &App) {
 
     if app.ctx_debug.is_some() {
         draw_ctx_debug(f, app, area);
+    }
+
+    // 问答画在审批**之前**：审批优先级更高（按键/鼠标都以它为先），
+    // 同时出现时审批必须在最上层，否则用户会看到问答却按不动。
+    if app.pending_question.is_some() {
+        draw_question(f, app, area);
     }
 
     if let Some(p) = &app.pending {
@@ -1575,6 +1591,345 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
 
     // 最后统一修补宽字符续行 cell 的透明背景（见 OpaqueBg）。
     f.render_widget(OpaqueBg(BG), popup);
+}
+
+/// AI 提问弹层几何：宽度最多 80 列 / 屏幕 80%，高度最多 18 行 / 屏幕 70%，
+/// 居中；内部固定切成「问题 / 候选 / 自定义 / 按钮」四块，渲染与鼠标命中共用。
+struct QuestionLayout {
+    popup: Rect,
+    question: Rect,
+    options: Rect,
+    custom: Rect,
+    buttons: Rect,
+}
+
+fn question_rect(area: Rect) -> Rect {
+    let w = (area.width as usize * 80 / 100)
+        .clamp(28, 80)
+        .min(area.width as usize) as u16;
+    let h = (area.height as usize * 70 / 100)
+        .clamp(10, 18)
+        .min(area.height as usize) as u16;
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+fn question_layout(area: Rect) -> QuestionLayout {
+    let popup = question_rect(area);
+    let inner = Rect::new(
+        popup.x + 1,
+        popup.y + 1,
+        popup.width.saturating_sub(2),
+        popup.height.saturating_sub(2),
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3.min(inner.height)),
+            Constraint::Min(1),
+            Constraint::Length(3.min(inner.height)),
+            Constraint::Length(1.min(inner.height)),
+        ])
+        .split(inner);
+    QuestionLayout {
+        popup,
+        question: rows[0],
+        options: rows[1],
+        custom: rows[2],
+        buttons: rows[3],
+    }
+}
+
+/// 底部两个按钮（提交 / 取消），与渲染文字严格对齐。
+fn question_button_areas(area: Rect) -> (Rect, Rect) {
+    let b = question_layout(area).buttons;
+    let half = b.width / 2;
+    (
+        Rect::new(b.x, b.y, half, b.height),
+        Rect::new(b.x + half, b.y, b.width.saturating_sub(half), b.height),
+    )
+}
+
+fn question_key(app: &mut App, key: KeyEvent) -> UiAction {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return UiAction::Quit;
+    }
+    let editing = app.pending_question.as_ref().is_some_and(|p| p.editing);
+    let answer = match key.code {
+        KeyCode::Esc => Some(QuestionAnswer::Cancelled),
+        KeyCode::Enter if editing => {
+            let text = app
+                .pending_question
+                .as_ref()
+                .map(|p| p.custom.buffer.trim().to_string())
+                .unwrap_or_default();
+            if text.is_empty() {
+                None
+            } else {
+                Some(QuestionAnswer::Custom { text })
+            }
+        }
+        KeyCode::Enter => match app.question_selected_answer() {
+            Some(a) => Some(a),
+            None => {
+                app.question_toggle_edit();
+                None
+            }
+        },
+        KeyCode::Tab => {
+            app.question_toggle_edit();
+            None
+        }
+        KeyCode::Up => {
+            app.question_move(-1);
+            None
+        }
+        KeyCode::Down => {
+            app.question_move(1);
+            None
+        }
+        // hjkl 只在候选列表里导航；编辑模式下 j/k 是普通字符。
+        KeyCode::Char('k') if !editing => {
+            app.question_move(-1);
+            None
+        }
+        KeyCode::Char('j') if !editing => {
+            app.question_move(1);
+            None
+        }
+        KeyCode::Backspace if editing => {
+            app.question_backspace();
+            None
+        }
+        KeyCode::Delete if editing => {
+            app.question_delete();
+            None
+        }
+        KeyCode::Left | KeyCode::Home if editing => {
+            app.question_move_cursor(-1);
+            None
+        }
+        KeyCode::Right | KeyCode::End if editing => {
+            app.question_move_cursor(1);
+            None
+        }
+        KeyCode::Char(c) => {
+            app.question_char(c);
+            None
+        }
+        _ => None,
+    };
+    answer
+        .and_then(|a| app.take_question(a))
+        .map(UiAction::Command)
+        .unwrap_or(UiAction::None)
+}
+
+/// 问答弹层期间的鼠标：候选行点一下即提交；自定义行进入编辑；按钮提交/取消。
+fn question_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
+    if !matches!(m.kind, MouseEventKind::Down(button) if button == MouseButton::Left) {
+        return None;
+    }
+    let l = question_layout(area);
+    let (n_options, allow_custom, editing) = app
+        .pending_question
+        .as_ref()
+        .map(|p| (p.req.options.len(), p.req.allow_custom, p.editing))
+        .unwrap_or((0, false, false));
+
+    let mut hit_row = None;
+    for i in 0..n_options {
+        let r = Rect::new(l.options.x, l.options.y + i as u16, l.options.width, 1);
+        if point_in(r, m.row, m.column) {
+            hit_row = Some(i);
+            break;
+        }
+    }
+    if let Some(i) = hit_row {
+        return app
+            .take_question(QuestionAnswer::Selected {
+                index: i,
+                label: app
+                    .pending_question
+                    .as_ref()
+                    .and_then(|p| p.req.options.get(i).cloned())
+                    .unwrap_or_default(),
+            })
+            .map(UiAction::Command);
+    }
+    if allow_custom {
+        let custom_row = Rect::new(l.custom.x, l.custom.y + 1, l.custom.width, 1);
+        if point_in(custom_row, m.row, m.column) {
+            if let Some(p) = &mut app.pending_question {
+                p.editing = true;
+                p.sel = p.req.options.len();
+            }
+            app.request_repaint();
+            return None;
+        }
+    }
+    let (submit, cancel) = question_button_areas(area);
+    if point_in(cancel, m.row, m.column) {
+        return app
+            .take_question(QuestionAnswer::Cancelled)
+            .map(UiAction::Command);
+    }
+    if point_in(submit, m.row, m.column) {
+        let answer = if editing {
+            let text = app
+                .pending_question
+                .as_ref()
+                .map(|p| p.custom.buffer.trim().to_string())
+                .unwrap_or_default();
+            if text.is_empty() {
+                None
+            } else {
+                Some(QuestionAnswer::Custom { text })
+            }
+        } else {
+            app.question_selected_answer()
+        };
+        return answer
+            .and_then(|a| app.take_question(a))
+            .map(UiAction::Command);
+    }
+    None
+}
+
+/// 问答弹层：问题 + 候选列表 + 自定义输入 + 提交/取消。
+///
+/// 与 `/ctx` 弹层同样逐帧 Clear + 显式 BG + `OpaqueBg` 修补，避免宽字符
+/// 续行 cell 透出主界面（真彩终端上的残影）。
+fn draw_question(f: &mut Frame, app: &App, area: Rect) {
+    let Some(p) = &app.pending_question else {
+        return;
+    };
+    let l = question_layout(area);
+    let bg = Style::default().bg(BG);
+    f.render_widget(Clear, l.popup);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ink::PRIMARY).bg(BG))
+            .style(bg)
+            .title(Span::styled(
+                " AI 提问 · 请回答 ",
+                Style::default()
+                    .fg(ink::PRIMARY)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        l.popup,
+    );
+
+    // 问题（最多两行，超长交给 ratatui 折行；弹层高度已预留 3 行）。
+    f.render_widget(Clear, l.question);
+    let q_lines = vec![
+        RtLine::from(vec![
+            Span::styled("问题 ", Style::default().fg(ink::FG_MUTED).bg(BG)),
+            Span::styled(
+                p.req.header.as_deref().unwrap_or(""),
+                Style::default()
+                    .fg(ink::WARNING)
+                    .bg(BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        RtLine::from(Span::styled(
+            p.req.question.clone(),
+            Style::default().fg(ink::FG).bg(BG),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(q_lines).style(bg).wrap(Wrap { trim: false }),
+        l.question,
+    );
+
+    // 候选列表：一条一行，选中行用 SELECTED 底色；末尾项允许自己输入。
+    let mut opts: Vec<RtLine<'static>> = Vec::with_capacity(p.option_count().max(1));
+    for (i, label) in p.req.options.iter().enumerate() {
+        let selected = i == p.sel && !p.editing;
+        let base = bg.bg(if selected { surface::SELECTED } else { BG });
+        opts.push(RtLine::from(vec![
+            Span::styled(
+                format!(" {} {:>2}. ", if selected { "▸" } else { " " }, i + 1),
+                base.fg(ink::FG_MUTED),
+            ),
+            Span::styled(label.clone(), base.fg(ink::FG)),
+        ]));
+    }
+    if p.req.allow_custom {
+        let selected = p.sel == p.req.options.len() && !p.editing;
+        let base = bg.bg(if selected { surface::SELECTED } else { BG });
+        opts.push(RtLine::from(Span::styled(
+            format!(" {}   自己输入…", if selected { "▸" } else { " " }),
+            base.fg(ink::SECONDARY),
+        )));
+    }
+    // 候选最多 9 项，小终端只放得下几行：按选中号滚动，保证选中的那条
+    // 永远可见（与 /ctx 列表同一个思路）。
+    let opt_offset = p
+        .sel
+        .saturating_sub(l.options.height.saturating_sub(1) as usize);
+    f.render_widget(Clear, l.options);
+    f.render_widget(
+        Paragraph::new(opts)
+            .style(bg)
+            .scroll((opt_offset as u16, 0)),
+        l.options,
+    );
+
+    // 自定义输入行：只在允许时显示，光标用反色空格模拟（终端软光标仍归输入框）。
+    f.render_widget(Clear, l.custom);
+    let input_line = if p.req.allow_custom {
+        let shown = ctx_truncate(
+            p.custom.buffer.clone(),
+            l.custom.width.saturating_sub(4) as usize,
+        );
+        let cursor = if p.editing && app.cursor_visible {
+            "█"
+        } else {
+            " "
+        };
+        RtLine::from(vec![
+            Span::styled("自定义 ", Style::default().fg(ink::FG_MUTED).bg(BG)),
+            Span::styled(shown, Style::default().fg(ink::FG).bg(BG)),
+            Span::styled(cursor, Style::default().fg(ink::FG).bg(BG)),
+        ])
+    } else {
+        RtLine::from(Span::styled(
+            "候选已限定：只能用 ↑↓ 选择后提交。",
+            Style::default().fg(ink::FG_MUTED).bg(BG),
+        ))
+    };
+    f.render_widget(Paragraph::new(input_line).style(bg), l.custom);
+
+    // 按钮行：文字与 `question_button_areas` 左右半区对应。
+    let (submit, _) = question_button_areas(area);
+    let mut buttons = vec![Span::styled(" ", bg)];
+    let submit_text = "[ Enter 提交 ]".to_string();
+    let cancel_text = " [ Esc 取消 ]";
+    let pad = submit
+        .width
+        .saturating_sub(submit_text.len() as u16 + cancel_text.len() as u16)
+        / 2;
+    buttons.push(Span::styled(
+        format!("{}{}", " ".repeat(pad as usize), submit_text),
+        Style::default().fg(ink::PRIMARY).bg(BG),
+    ));
+    buttons.push(Span::styled(
+        cancel_text,
+        Style::default().fg(ink::FG_MUTED).bg(BG),
+    ));
+    f.render_widget(Clear, l.buttons);
+    f.render_widget(Paragraph::new(RtLine::from(buttons)).style(bg), l.buttons);
+
+    f.render_widget(OpaqueBg(BG), l.popup);
 }
 
 /// 弹窗最终的不透明修补层。
@@ -2731,6 +3086,7 @@ fn truncate_json(v: &serde_json::Value, max: usize) -> String {
 mod tests {
     use super::*;
     use agent_core::TaskId;
+    use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
 
     // ---- `/ctx` 弹窗几何 ----
@@ -5104,5 +5460,139 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.context_menu.is_none());
         assert_eq!(app.last_copy, "", "关闭菜单不应触发复制");
+    }
+
+    // ---- AI 问答弹层 ----
+
+    fn question_app() -> App {
+        let mut app = App::default();
+        app.apply_event(Event::QuestionAsked {
+            id: TaskId::from_raw("t-ask"),
+            req: agent_core::question::QuestionRequest {
+                id: agent_core::ids::QuestionId::from_raw("q-1"),
+                task_id: TaskId::from_raw("t-ask"),
+                question: "用哪种数据库？需要选一个继续".into(),
+                header: Some("技术选型".into()),
+                options: vec!["SQLite".into(), "Postgres".into()],
+                allow_custom: true,
+            },
+        });
+        app
+    }
+
+    fn answer_of(action: UiAction) -> agent_core::question::QuestionAnswer {
+        match action {
+            UiAction::Command(Command::AnswerQuestion { answer, .. }) => answer,
+            other => panic!("应是回答命令：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn question_enter_submits_selected_candidate() {
+        let mut app = question_app();
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            answer_of(action),
+            agent_core::question::QuestionAnswer::Selected {
+                index: 0,
+                label: "SQLite".into()
+            }
+        );
+        assert!(app.pending_question.is_none());
+    }
+
+    #[test]
+    fn question_custom_input_accepts_jk_and_esc_cancels() {
+        let mut app = question_app();
+        // 走到末尾的「自己输入」。
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Enter)),
+            UiAction::None
+        ));
+        assert!(app.pending_question.as_ref().unwrap().editing);
+
+        // 编辑模式下 j/k 是字符，不是导航键。
+        let _ = handle_key(&mut app, key(KeyCode::Char('j')));
+        let _ = handle_key(&mut app, key(KeyCode::Char('k')));
+        let answer = answer_of(handle_key(&mut app, key(KeyCode::Enter)));
+        assert_eq!(
+            answer,
+            agent_core::question::QuestionAnswer::Custom { text: "jk".into() }
+        );
+
+        let mut app = question_app();
+        assert_eq!(
+            answer_of(handle_key(&mut app, key(KeyCode::Esc))),
+            agent_core::question::QuestionAnswer::Cancelled
+        );
+    }
+
+    #[test]
+    fn question_modal_blocks_normal_input() {
+        let mut app = question_app();
+        let _ = handle_key(&mut app, key(KeyCode::Char('a')));
+        assert_eq!(app.input.buffer, "", "弹层期间不往任务输入框打字");
+        assert!(app.pending_question.as_ref().unwrap().editing);
+    }
+
+    #[test]
+    fn question_mouse_click_candidate_and_buttons() {
+        let area = Rect::new(0, 0, 120, 40);
+        let l = question_layout(area);
+        let mut app = question_app();
+        let click = |row: u16, col: u16| mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+        let action = handle_mouse(&mut app, click(l.options.y + 1, l.options.x + 4), area);
+        assert_eq!(
+            answer_of(action.unwrap()),
+            agent_core::question::QuestionAnswer::Selected {
+                index: 1,
+                label: "Postgres".into()
+            }
+        );
+
+        let mut app = question_app();
+        let (submit, cancel) = question_button_areas(area);
+        assert_eq!(submit.width + cancel.width, l.buttons.width);
+        let action = handle_mouse(&mut app, click(cancel.y, cancel.x + 1), area);
+        assert_eq!(
+            answer_of(action.unwrap()),
+            agent_core::question::QuestionAnswer::Cancelled
+        );
+    }
+
+    #[test]
+    fn question_popup_is_opaque_and_leaves_no_residue() {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut app = question_app();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal.draw(|f| draw(f, &app)).expect("draw");
+
+        // 换成很短的问题：旧长文本占过的行必须真的清掉。
+        app.pending_question.as_mut().unwrap().req.question = "短".into();
+        let frame = terminal.draw(|f| draw(f, &app)).expect("draw");
+        let l = question_layout(area);
+        for y in l.popup.y..l.popup.bottom() {
+            for x in l.popup.x..l.popup.right() {
+                let cell = &frame.buffer[(x, y)];
+                if cell.skip {
+                    continue;
+                }
+                assert!(
+                    cell.bg == BG || cell.bg == surface::SELECTED,
+                    "弹窗漏出透明背景: ({x},{y}) bg={:?}",
+                    cell.bg
+                );
+            }
+        }
+        let old = "用哪种数据库";
+        let mut visible = String::new();
+        for y in l.popup.y..l.popup.bottom() {
+            for x in l.popup.x..l.popup.right() {
+                visible.push_str(frame.buffer[(x, y)].symbol());
+            }
+        }
+        assert!(!visible.contains(old), "旧问题残留：{visible}");
     }
 }

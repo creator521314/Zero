@@ -73,6 +73,7 @@ fork bomb、`curl | sh`、写 `/etc`、`~/.ssh` 等。
 | `/` | 触发命令补全（`/clear` `/help` `/tier` `/sessions` `/resume` `/news` `/memory` `/improve` `/ctx`） |
 | `/ctx` | 打开上下文调试弹窗（94%×90% 大窗）：列表滚轮/单击选消息，预览区滚轮滚全文 |
 | `/sessions` / `Ctrl+G` | 会话面板（同一个面板）：`↑/↓` 选、`Enter` 切到该会话、`Esc` 关闭 |
+| AI 提问时 | 问答弹层：`↑/↓` 或 `j/k` 选候选、`Enter` 提交、`Tab`/直接打字切自定义输入、`Esc` 取消 |
 | `@` | 文件路径补全：`↑/↓` 选、`Tab`/`Enter` 补全、`Esc` 关闭（输入即触发） |
 | `Tab` / `↑` `↓` / `Esc` | 补全菜单：补全选中 / 选候选 / 关闭 |
 | `Ctrl+C` | 退出（审批弹层期间也可退出） |
@@ -188,7 +189,7 @@ save_stream_deltas = false   # 逐字增量（开着日志会大一数量级）
 
 ## 工具
 
-内置 9 个工具：
+内置 9 个工具（TUI 入口额外注入 `ask_user`）：
 
 | 工具 | 用途 |
 |---|---|
@@ -198,6 +199,7 @@ save_stream_deltas = false   # 逐字增量（开着日志会大一数量级）
 | `shell_exec` | 执行命令 |
 | `web_fetch` / `web_search` | 联网抓取 / 搜索 |
 | `finish` | 显式终止信号：总结 + 登记交付物路径，触发任务收尾 |
+| `ask_user` | 交互问答：给 1~8 个候选，用户可选一条或自己编辑回答（仅 TUI 入口注册；headless 服务不注册） |
 
 - **路径边界只约束 `file_*` / `list_dir`**：这些工具的路径 realpath 后必须落在
   项目目录（或私有工作区）内，`..` 与符号链接逃逸一律拒绝。项目目录默认就是
@@ -268,6 +270,7 @@ save_stream_deltas = false   # 逐字增量（开着日志会大一数量级）
 | `assistant_turn` | 本轮完整回复（正文 / 工具调用 / token 用量） | 模型回了什么 |
 | `tool_call_start` | 工具名 + 参数 | 准备做什么 |
 | `tool_call_end` | 四态结局 + 耗时 + 原因 + **工具返回原文** | 工具实际返回了什么 |
+| `question_asked` / `question_answered` | AI 的问题与用户的回答（选中的候选 / 自编文本 / 取消） | 决策依据与用户当时的选择 |
 | `task_started` / `task_finished` / `error` | 任务生命周期 | 是否跑完 |
 
 ```bash

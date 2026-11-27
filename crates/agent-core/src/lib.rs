@@ -11,6 +11,7 @@ pub mod ids;
 pub mod memory;
 pub mod perm;
 pub mod provider;
+pub mod question;
 pub mod store;
 pub mod subagent;
 pub mod sync;
@@ -20,7 +21,7 @@ pub mod tool;
 pub use error::{AgentError, ErrorInfo};
 pub use event::{Command, Event, EventBus, Outcome};
 pub use frontend::Frontend;
-pub use ids::{SessionId, TaskId, ToolCallId};
+pub use ids::{ApprovalId, QuestionId, SessionId, TaskId, ToolCallId};
 pub use memory::{
     scan_secret, MemoryConfig, MemoryContext, MemoryEntry, MemoryError, MemoryId, MemoryIndex,
     MemoryPort, MemoryQuery, MemoryScope, MemorySource, MemoryState, MemoryStore,

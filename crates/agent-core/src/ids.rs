@@ -36,3 +36,4 @@ id_type!(TaskId);
 id_type!(SessionId);
 id_type!(ToolCallId);
 id_type!(ApprovalId);
+id_type!(QuestionId);

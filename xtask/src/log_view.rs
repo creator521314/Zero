@@ -238,6 +238,23 @@ fn render_events(events: &[StoredEvent], opts: &ViewOpts) -> String {
                     }
                 }
             }
+            Event::QuestionAsked { req, .. } => {
+                if !opts.errors_only {
+                    s.push_str(&format!(
+                        "    ❓ 提问：{}（{} 个候选）\n",
+                        clip(&req.question, limit),
+                        req.options.len()
+                    ));
+                }
+            }
+            Event::QuestionAnswered { answer, .. } => {
+                if !opts.errors_only {
+                    s.push_str(&format!(
+                        "    ✍ 回答：{}\n",
+                        clip(&answer.as_model_text(), limit)
+                    ));
+                }
+            }
             Event::AwaitingApproval { req, .. } => {
                 if !opts.errors_only {
                     s.push_str(&format!(

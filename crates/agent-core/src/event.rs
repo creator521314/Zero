@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::error::ErrorInfo;
-use crate::ids::{ApprovalId, TaskId, ToolCallId};
+use crate::ids::{ApprovalId, QuestionId, TaskId, ToolCallId};
 use crate::perm::ApprovalRequest;
 use crate::provider::{Message, ToolCall, Usage};
+use crate::question::{QuestionAnswer, QuestionRequest};
 use crate::task::TaskSpec;
 
 /// Agent → 外界的广播事件。
@@ -100,6 +101,19 @@ pub enum Event {
         id: TaskId,
         approval_id: ApprovalId,
         req: ApprovalRequest,
+    },
+    /// AI 通过 `ask_user` 工具向用户提问：候选项 + 可自由编辑的回答。
+    /// 与审批分开：审批是「要不要放行一次操作」，问答是「请用户给一个决策」，
+    /// 两者的审计语义不同，不能混成同一个事件。
+    QuestionAsked {
+        id: TaskId,
+        req: QuestionRequest,
+    },
+    /// 用户对一次问答的最终回答（含取消）。
+    QuestionAnswered {
+        id: TaskId,
+        question_id: QuestionId,
+        answer: QuestionAnswer,
     },
     /// 用户对审批请求的最终决定。
     ///
@@ -208,6 +222,12 @@ pub enum Command {
     Reject {
         approval_id: ApprovalId,
         reason: String,
+    },
+    /// 回答 AI 的提问。`None` 之外的答案会回填给模型；取消也是一条正式回答，
+    /// 让等待中的工具立刻结束而不是无声挂起。
+    AnswerQuestion {
+        question_id: QuestionId,
+        answer: QuestionAnswer,
     },
     Cancel(TaskId),
     /// 列出历史会话（TUI 会话面板）。由编排层读 store 后把结果回灌成
