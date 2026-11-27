@@ -70,10 +70,11 @@ fork bomb、`curl | sh`、写 `/etc`、`~/.ssh` 等。
 | `Ctrl+L` | 整屏重绘（屏幕被外部改动弄花时救回） |
 | `PageUp` / `PageDown` / 鼠标滚轮 | 对话区滚动 |
 | `Ctrl+A` / `Home`、`Ctrl+E` / `End` | 光标行首 / 行尾 |
-| `/` | 触发命令补全（`/clear` `/help` `/tier` `/sessions` `/resume` `/news` `/memory` `/improve` `/ctx`） |
+| `/` | 触发命令补全（`/clear` `/help` `/tier` `/sessions` `/resume` `/news` `/memory` `/improve` `/ctx` `/exit`） |
 | `/ctx` | 打开上下文调试弹窗（94%×90% 大窗）：列表滚轮/单击选消息，预览区滚轮滚全文 |
 | `/sessions` / `Ctrl+G` | 会话面板（同一个面板）：`↑/↓` 选、`Enter` 切到该会话、`Esc` 关闭 |
-| AI 提问时 | 问答弹层：`↑/↓` 或 `j/k` 选候选、`Enter` 提交、`Tab`/直接打字切自定义输入、`Esc` 取消 |
+| `/exit` / `/quit` | 退出（与 `Ctrl+C` 等价） |
+| AI 提问时 | 问答弹层：`↑/↓` 或 `j/k` 选候选、鼠标悬停即高亮、点击候选即提交、`Tab`/直接打字切自定义输入、`Esc` 取消 |
 | `@` | 文件路径补全：`↑/↓` 选、`Tab`/`Enter` 补全、`Esc` 关闭（输入即触发） |
 | `Tab` / `↑` `↓` / `Esc` | 补全菜单：补全选中 / 选候选 / 关闭 |
 | `Ctrl+C` | 退出（审批弹层期间也可退出） |

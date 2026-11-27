@@ -30,6 +30,8 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "/memory",
     "/improve",
     "/ctx",
+    "/exit",
+    "/quit",
 ];
 
 /// 内置的新闻收集模板：`templates/news.md` 不存在时的兜底。
@@ -577,6 +579,8 @@ pub struct PendingQuestion {
     pub req: QuestionRequest,
     /// 选中项：0..options.len()-1 是候选，等于 options.len() 表示「自己输入」。
     pub sel: usize,
+    /// 鼠标悬停项（仅影响高亮，不改 sel；离开列表时为 None）。
+    pub hover: Option<usize>,
     pub custom: InputState,
     pub editing: bool,
 }
@@ -586,6 +590,7 @@ impl PendingQuestion {
         Self {
             req,
             sel: 0,
+            hover: None,
             custom: InputState::default(),
             editing: false,
         }
@@ -1136,6 +1141,12 @@ impl App {
                 self.input.take();
                 return true;
             }
+            // 退出：与 Ctrl+C 等价，走统一的退出路径（编排层收到 Quit 后收尾）。
+            "/exit" | "/quit" => {
+                self.should_quit = true;
+                self.input.take();
+                return true;
+            }
             // `/improve <目标>`：记忆驱动的改进建议（编排层旁路生成 .patch）。
             _ if cmd == "/improve" || cmd.starts_with("/improve ") => {
                 let goal = cmd.trim_start_matches("/improve").trim();
@@ -1353,6 +1364,7 @@ impl App {
             "  /help   显示本帮助",
             "  /tier   切换权限档 L1→L2→L3",
             "  /sessions  打开会话面板（与 Ctrl+G 相同）",
+            "  /exit      退出（/quit 等价）",
             "  /resume <ID前几位>  切到某条历史任务继续",
             "  /news <主题>  填入新闻收集提示词（改完再发送）",
             "  Ctrl+G  打开会话面板（↑/↓ 选择，Enter 切换）",
@@ -1548,6 +1560,14 @@ impl App {
                 reason: "用户拒绝".into(),
             }
         })
+    }
+
+    /// 问答弹层：鼠标悬停的候选（列表滚动偏移已折算成内容索引）。
+    pub fn question_hover(&mut self, idx: Option<usize>) {
+        if let Some(p) = &mut self.pending_question {
+            p.hover = idx.filter(|i| *i < p.option_count());
+            self.request_repaint();
+        }
     }
 
     /// 问答弹层：移动候选项（含末尾的「自己输入」）。

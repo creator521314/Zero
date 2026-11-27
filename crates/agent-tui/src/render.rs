@@ -1010,7 +1010,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
 /// 「空白 vs 新帧」，新帧留空的单元格不会被写——屏幕上那些位置仍是旧帧的字尾，
 /// 表现为 `list_dir e. 0msng the project…` 这种两帧文字叠在一起。
 fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
-    if app.take_repaint() {
+    // 整屏重绘：显式请求（Ctrl+L / 弹层状态切换）之外，弹窗打开期间每帧都做。
+    // 根因：主界面紧邻弹窗边框列的 CJK 宽字符在物理终端上占两列，会侵入
+    // 边框那格，而 ratatui 的 diff 看到「边框 cell 没变」就不重画——残字
+    // 永远留在边框上。整屏重绘从物理层面兜底。
+    if app.take_repaint() || app.ctx_debug.is_some() || app.pending_question.is_some() {
         terminal.clear()?;
     }
     terminal.draw(|f| draw(f, app))?;
@@ -1730,26 +1734,37 @@ fn question_key(app: &mut App, key: KeyEvent) -> UiAction {
 }
 
 /// 问答弹层期间的鼠标：候选行点一下即提交；自定义行进入编辑；按钮提交/取消。
+/// 候选列表滚动偏移：渲染与鼠标命中共用，点击行 + 偏移才是真正的内容索引。
+fn question_opt_offset(sel: usize, list_h: u16) -> usize {
+    sel.saturating_sub(list_h.saturating_sub(1) as usize)
+}
+
 fn question_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
+    let l = question_layout(area);
+    let (n_options, allow_custom, sel) = app
+        .pending_question
+        .as_ref()
+        .map(|p| (p.req.options.len(), p.req.allow_custom, p.sel))
+        .unwrap_or((0, false, 0));
+    let offset = question_opt_offset(sel, l.options.height);
+    // 可视行号 → 内容索引（列表按选中号滚动，可视第 0 行未必是第 0 项）。
+    let row_index = |row: u16| -> Option<usize> {
+        if row < l.options.y || row >= l.options.y + l.options.height {
+            return None;
+        }
+        let vis = (row - l.options.y) as usize + offset;
+        (vis < n_options).then_some(vis)
+    };
+
+    // 悬停即高亮：只改 hover，不碰 sel（移动鼠标不应破坏键盘选择）。
+    if matches!(m.kind, MouseEventKind::Moved) {
+        app.question_hover(row_index(m.row));
+        return None;
+    }
     if !matches!(m.kind, MouseEventKind::Down(button) if button == MouseButton::Left) {
         return None;
     }
-    let l = question_layout(area);
-    let (n_options, allow_custom, editing) = app
-        .pending_question
-        .as_ref()
-        .map(|p| (p.req.options.len(), p.req.allow_custom, p.editing))
-        .unwrap_or((0, false, false));
-
-    let mut hit_row = None;
-    for i in 0..n_options {
-        let r = Rect::new(l.options.x, l.options.y + i as u16, l.options.width, 1);
-        if point_in(r, m.row, m.column) {
-            hit_row = Some(i);
-            break;
-        }
-    }
-    if let Some(i) = hit_row {
+    if let Some(i) = row_index(m.row) {
         return app
             .take_question(QuestionAnswer::Selected {
                 index: i,
@@ -1779,6 +1794,7 @@ fn question_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> 
             .map(UiAction::Command);
     }
     if point_in(submit, m.row, m.column) {
+        let editing = app.pending_question.as_ref().is_some_and(|p| p.editing);
         let answer = if editing {
             let text = app
                 .pending_question
@@ -1853,7 +1869,8 @@ fn draw_question(f: &mut Frame, app: &App, area: Rect) {
     // 候选列表：一条一行，选中行用 SELECTED 底色；末尾项允许自己输入。
     let mut opts: Vec<RtLine<'static>> = Vec::with_capacity(p.option_count().max(1));
     for (i, label) in p.req.options.iter().enumerate() {
-        let selected = i == p.sel && !p.editing;
+        // 键盘选中与鼠标悬停都可高亮；悬停优先，离开列表后回落到 sel。
+        let selected = (Some(i) == p.hover) || (i == p.sel && p.hover.is_none() && !p.editing);
         let base = bg.bg(if selected { surface::SELECTED } else { BG });
         opts.push(RtLine::from(vec![
             Span::styled(
@@ -1873,9 +1890,7 @@ fn draw_question(f: &mut Frame, app: &App, area: Rect) {
     }
     // 候选最多 9 项，小终端只放得下几行：按选中号滚动，保证选中的那条
     // 永远可见（与 /ctx 列表同一个思路）。
-    let opt_offset = p
-        .sel
-        .saturating_sub(l.options.height.saturating_sub(1) as usize);
+    let opt_offset = question_opt_offset(p.sel, l.options.height);
     f.render_widget(Clear, l.options);
     f.render_widget(
         Paragraph::new(opts)
@@ -3777,6 +3792,8 @@ mod tests {
                 "/memory",
                 "/improve",
                 "/ctx",
+                "/exit",
+                "/quit",
             ]
         );
 
@@ -3791,6 +3808,11 @@ mod tests {
 
         app.input.buffer = "/n".into();
         assert_eq!(app.slash_candidates(), vec!["/news"]);
+
+        app.input.buffer = "/e".into();
+        assert_eq!(app.slash_candidates(), vec!["/exit"]);
+        app.input.buffer = "/q".into();
+        assert_eq!(app.slash_candidates(), vec!["/quit"]);
 
         app.input.buffer = "abc".into();
         assert!(app.slash_candidates().is_empty(), "非 / 开头无候选");
@@ -3844,7 +3866,7 @@ mod tests {
         let mut app = App::default();
         let _ = handle_key(&mut app, key(KeyCode::Char('/')));
         assert!(app.completion_active);
-        assert_eq!(app.slash_candidates().len(), 10);
+        assert_eq!(app.slash_candidates().len(), 12);
 
         let _ = handle_key(&mut app, key(KeyCode::Char('c')));
         assert_eq!(app.slash_candidates(), vec!["/clear", "/ctx"]);
@@ -3928,13 +3950,17 @@ mod tests {
         let _ = handle_key(&mut app, key(KeyCode::Down));
         assert_eq!(app.completion_sel, 8);
         let _ = handle_key(&mut app, key(KeyCode::Down));
-        assert_eq!(app.completion_sel, 9, "到底后 clamp");
-        let _ = handle_key(&mut app, key(KeyCode::Down));
         assert_eq!(app.completion_sel, 9);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 10);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 11, "到底后 clamp");
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 11);
         let _ = handle_key(&mut app, key(KeyCode::Up));
-        assert_eq!(app.completion_sel, 8);
+        assert_eq!(app.completion_sel, 10);
         let _ = handle_key(&mut app, key(KeyCode::Up));
-        assert_eq!(app.completion_sel, 7);
+        assert_eq!(app.completion_sel, 9);
 
         let _ = handle_key(&mut app, key(KeyCode::Esc));
         assert!(!app.completion_active, "Esc 关闭补全");
@@ -5560,6 +5586,78 @@ mod tests {
             answer_of(action.unwrap()),
             agent_core::question::QuestionAnswer::Cancelled
         );
+    }
+
+    #[test]
+    fn question_hover_highlights_without_changing_selection() {
+        let mut app = question_app();
+        app.question_move(1); // sel=1（Postgres）
+        let l = question_layout(Rect::new(0, 0, 120, 40));
+        // 悬停第 0 项：高亮跟随鼠标，但 Enter 仍提交键盘选中的那一项。
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Moved, l.options.x + 3, l.options.y),
+            Rect::new(0, 0, 120, 40),
+        );
+        assert_eq!(app.pending_question.as_ref().unwrap().hover, Some(0));
+        assert_eq!(app.pending_question.as_ref().unwrap().sel, 1);
+        // 移出列表：hover 清空，但仍不碰 sel。
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Moved, l.options.x, l.question.y),
+            Rect::new(0, 0, 120, 40),
+        );
+        assert_eq!(app.pending_question.as_ref().unwrap().hover, None);
+        // Enter 仍提交键盘选中的那一项。
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            answer_of(action),
+            agent_core::question::QuestionAnswer::Selected {
+                index: 1,
+                label: "Postgres".into()
+            }
+        );
+    }
+
+    #[test]
+    fn question_click_maps_visible_row_through_scroll_offset() {
+        // 8 个候选 + 自定义：小列表高度下点击第 0 可视行必须命中滚动后的真实项。
+        let mut app = App::default();
+        app.apply_event(Event::QuestionAsked {
+            id: TaskId::from_raw("t-ask"),
+            req: agent_core::question::QuestionRequest {
+                id: agent_core::ids::QuestionId::from_raw("q-scroll"),
+                task_id: TaskId::from_raw("t-ask"),
+                question: "选一个".into(),
+                header: None,
+                options: (0..8).map(|i| format!("选项{i}")).collect(),
+                allow_custom: true,
+            },
+        });
+        // 移到最后一项：列表滚动，第 0 可视行不再是第 0 项。
+        app.question_move(8);
+        assert_eq!(app.pending_question.as_ref().unwrap().sel, 8);
+        let area = Rect::new(0, 0, 120, 40);
+        let l = question_layout(area);
+        let offset = question_opt_offset(8, l.options.height);
+        if offset == 0 {
+            return; // 列表足够高时不会滚动，此用例只对滚动路径有意义
+        }
+        let action = handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                l.options.x + 3,
+                l.options.y,
+            ),
+            area,
+        );
+        match answer_of(action.expect("点击候选应产生回答")) {
+            agent_core::question::QuestionAnswer::Selected { index, .. } => {
+                assert_eq!(index, offset, "点击第 0 可视行应命中滚动偏移对应项");
+            }
+            other => panic!("应是选中回答：{other:?}"),
+        }
     }
 
     #[test]
