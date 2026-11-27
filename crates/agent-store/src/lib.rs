@@ -280,6 +280,7 @@ impl JsonlStore {
                     e,
                     Event::TaskStarted { .. }
                         | Event::UserPrompt { .. }
+                        | Event::ContextSnapshot { .. }
                         | Event::TextDelta { .. }
                         | Event::ReasoningDelta { .. }
                         | Event::AssistantTurn { .. }
@@ -605,10 +606,12 @@ mod tests {
             "恢复后模型要记得自己刚说过什么"
         );
 
-        // 转写给界面用：快照排除在外（每轮重复整份历史，体积大且界面用不上）。
+        // 转写给界面用：保留 ContextSnapshot（/ctx 调试页据此重建历史会话的
+        // 真实上下文），仍然排除纯审计事件。
         let events = store.task_events(&tid).await;
-        assert_eq!(events.len(), 1, "只留 AssistantTurn：{events:?}");
-        assert!(matches!(events[0], Event::AssistantTurn { .. }));
+        assert_eq!(events.len(), 2, "快照 + AssistantTurn：{events:?}");
+        assert!(matches!(events[0], Event::ContextSnapshot { .. }));
+        assert!(matches!(events[1], Event::AssistantTurn { .. }));
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }

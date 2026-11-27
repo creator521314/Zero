@@ -83,7 +83,7 @@ fn title_is_substantive(title: &str) -> bool {
     !GREETINGS.iter().any(|g| t.eq_ignore_ascii_case(g))
 }
 
-/// 按 id 或唯一前缀找任务（`/resume` 与任务面板共用）。
+/// 按 id 或唯一前缀找任务（`/resume` 与会话面板共用）。
 ///
 /// 规则：先精确匹配完整 id；否则按前缀匹配。0 个 / 多个都算失败——多个时
 /// 报出「匹配到几个」，让用户多打几位，而不是随便挑一个切过去。
@@ -93,7 +93,7 @@ fn resolve_task(
 ) -> Result<agent_core::TaskSummary, String> {
     let needle = prefix.trim().to_ascii_lowercase();
     if needle.is_empty() {
-        return Err("用法：/resume <任务ID前几位>（用 /tasks 查看）".into());
+        return Err("用法：/resume <任务ID前几位>（用 /sessions 查看）".into());
     }
     if let Some(t) = tasks
         .iter()
@@ -107,11 +107,11 @@ fn resolve_task(
         .collect();
     match hits.len() {
         0 => Err(format!(
-            "找不到 id 以「{prefix}」开头的任务；用 /tasks 查看历史任务"
+            "找不到 id 以「{prefix}」开头的任务；用 /sessions 查看历史会话"
         )),
         1 => Ok(hits[0].clone()),
         n => Err(format!(
-            "前缀「{prefix}」匹配到 {n} 个任务，请多输入几位；用 /tasks 查看"
+            "前缀「{prefix}」匹配到 {n} 个任务，请多输入几位；用 /sessions 查看"
         )),
     }
 }
@@ -632,7 +632,7 @@ async fn main() -> anyhow::Result<()> {
                             t.cancel();
                         }
                     }
-                    // `/tasks` 与任务面板：读 store 回灌事件。
+                    // 会话面板：读 store 回灌事件（/sessions 与 Ctrl+G 共用）。
                     // 这两个命令只是「看一眼」，不启动任务，因此不受串行限制。
                     Command::ListTasks => {
                         let tasks = store.recent_tasks(50).await;
@@ -807,7 +807,7 @@ mod tests {
         let tasks = vec![summary("abc1-0000", "一"), summary("abc2-0000", "二")];
         let err = resolve_task("abc", &tasks).unwrap_err();
         assert!(err.contains("匹配到 2 个"), "应报出歧义：{err}");
-        assert!(err.contains("/tasks"), "应指路怎么查：{err}");
+        assert!(err.contains("/sessions"), "应指路怎么查：{err}");
     }
 
     #[test]

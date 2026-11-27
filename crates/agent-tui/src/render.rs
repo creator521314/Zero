@@ -251,7 +251,7 @@ async fn dispatch(
         }
         UiAction::None => false,
     };
-    // 统一出口：`/tasks`、`/resume`、Ctrl+G 请求列表这类动作由 UI 先攒在
+    // 统一出口：`/resume`、会话面板刷新请求这类动作由 UI 先攒在
     // `pending_command` 里（UI 够不着 store），这里一并送出去。
     if let Some(cmd) = app.take_pending_command() {
         if cmd_tx.send(cmd).await.is_err() {
@@ -423,7 +423,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
     None
 }
 
-/// 任务面板期间的鼠标：点某一行即切过去，点面板外关闭。
+/// 会话面板期间的鼠标：点某一行即切过去，点面板外关闭。
 ///
 /// 面板是模态的——期间不把点击漏给背后的对话区/滚动条，避免「关面板时
 /// 顺手把对话滚没了」。
@@ -452,7 +452,7 @@ fn panel_offset(app: &App, inner: Rect) -> usize {
         .saturating_sub(inner.height.saturating_sub(1) as usize)
 }
 
-/// 任务面板的外框与列表区（渲染与鼠标命中**共用**，坐标不会走散）。
+/// 会话面板的外框与列表区（渲染与鼠标命中**共用**，坐标不会走散）。
 fn panel_rect(area: Rect, count: usize) -> (Rect, Rect) {
     let w = area.width.saturating_sub(6).clamp(28, 78).min(area.width);
     let rows = (count.max(1) as u16).min(12);
@@ -668,7 +668,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
         return memory_panel_key(app, key);
     }
 
-    // 任务面板：打开时独占键盘（↑/↓ 选、Enter 切换、Esc 或 Ctrl+G 关）。
+    // 会话面板：打开时独占键盘（↑/↓ 选、Enter 切换、Esc 或 Ctrl+G 关）。
     // 放在补全菜单之前——面板是模态的，期间不该让 `/` 补全抢按键。
     if app.panel_open {
         return match key.code {
@@ -799,7 +799,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
         return UiAction::None;
     }
 
-    // Ctrl+G：打开任务面板（顺带向编排层要一份最新列表）。
+    // Ctrl+G：打开会话面板（顺带向编排层要一份最新列表）。
     if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.toggle_panel();
         return UiAction::None;
@@ -1431,10 +1431,15 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .map(|ui| ui.preview_scroll)
         .unwrap_or(0);
-    let full =
-        ctx.messages.get(sel).map(ctx_msg_full).unwrap_or_else(|| {
+    let full = ctx.messages.get(sel).map(ctx_msg_full).unwrap_or_else(|| {
+        if ctx.legacy {
+            "这条历史会话记录于快照协议之前（v1.2 前），没有保存实际上下文消息；\
+             从这条会话继续发送一次任务后即可看到新的上下文。"
+                .into()
+        } else {
             "（尚无上下文：提交一个任务后，这里会显示实际发送给模型的内容）".into()
-        });
+        }
+    });
     let body = Text::styled(full, Style::default().fg(ink::FG));
     let preview = Paragraph::new(body)
         .wrap(Wrap { trim: false })
@@ -2481,7 +2486,7 @@ fn draw_approval(f: &mut Frame, _app: &App, p: &crate::app::PendingApproval, are
     );
 }
 
-/// 任务面板（`Ctrl+G`）：居中卡片列出历史任务，↑/↓ 选择、Enter 切换。
+/// 会话面板（`/sessions` / `Ctrl+G`）：居中卡片列出历史会话，↑/↓ 选择、Enter 切换。
 ///
 /// 面板只做「挑一条」这件事——选中后由编排层回灌该任务的转写事件，
 /// 对话区随之还原成当时的样子（见 `App::apply_event` 的 `TaskOpened` 分支）。
@@ -3077,7 +3082,7 @@ mod tests {
                 "/clear",
                 "/help",
                 "/tier",
-                "/tasks",
+                "/sessions",
                 "/resume",
                 "/news",
                 "/remember",
@@ -3091,7 +3096,7 @@ mod tests {
         assert_eq!(app.slash_candidates(), vec!["/clear", "/ctx"]);
 
         app.input.buffer = "/t".into();
-        assert_eq!(app.slash_candidates(), vec!["/tier", "/tasks"]);
+        assert_eq!(app.slash_candidates(), vec!["/tier"]);
 
         app.input.buffer = "/r".into();
         assert_eq!(app.slash_candidates(), vec!["/resume", "/remember"]);

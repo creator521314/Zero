@@ -14,7 +14,7 @@ use crate::theme::{glyph, tier_label};
 /// 一期可执行的 `/` 命令（顺序即补全菜单的展示顺序）。
 ///
 /// 只列**真正能落地**的命令：`/clear` 清空对话、`/help` 显示帮助、`/tier`
-/// 切换权限档、`/tasks` 列历史任务、`/resume` 切到某个历史任务继续、`/news`
+/// 切换权限档、`/sessions` 打开会话面板、`/resume` 切到某个历史任务继续、`/news`
 /// 填入新闻收集提示词，都只改本地状态或读 store 后回灌界面。设计稿里的
 /// `/model`（切模型）、`/compact`（手动压缩上下文）依赖后端能力，尚未落地，
 /// 故不列入——遵循「只提示已实现功能」的原则，避免补出执行不了的入口。
@@ -22,7 +22,7 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "/clear",
     "/help",
     "/tier",
-    "/tasks",
+    "/sessions",
     "/resume",
     "/news",
     "/remember",
@@ -214,7 +214,7 @@ pub struct App {
     pub conv_width: usize,
     pub pending: Option<PendingApproval>,
     pub active_task: Option<TaskId>,
-    /// 待转交编排层的 `/` 命令（`/tasks`、`/resume` 需要 store，UI 够不着）。
+    /// 待转交编排层的 `/` 命令（`/resume`、面板刷新需要 store，UI 够不着）。
     pub pending_command: Option<Command>,
     pub tier: String,
     pub provider: String,
@@ -258,7 +258,7 @@ pub struct App {
     pub footer_visible: bool,
     /// 右上角瞬态通知；None 表示当前没有。
     pub toast: Option<Toast>,
-    /// 最近一次从 store 取回的历史任务（`/tasks` 与任务面板共用）。
+    /// 最近一次从 store 取回的历史会话（会话面板唯一数据源）。
     pub tasks: Vec<TaskSummary>,
     /// 任务面板是否打开（`Ctrl+G`）。
     pub panel_open: bool,
@@ -338,6 +338,9 @@ pub struct CtxView {
     pub tools: Vec<String>,
     pub iteration: u32,
     pub last_reset: bool,
+    /// 载入的是没有上下文快照的旧日志（v1.2 之前）：调试页应说明原因，
+    /// 而不是含糊地显示「尚无上下文」。
+    pub legacy: bool,
 }
 
 impl CtxView {
@@ -360,12 +363,15 @@ impl CtxView {
         self.iteration = iteration;
         self.tools = tools.to_vec();
         self.last_reset = reset;
+        self.legacy = false;
     }
 
-    /// 切到历史任务时清空：历史回放不含快照事件，旧任务的序列已不代表
-    /// 当前会话；续跑后新的快照会重新累积。
-    pub fn reset(&mut self) {
-        *self = Self::default();
+    /// 切到历史任务时清空：只在没有快照可回放时标 legacy。
+    pub fn reset(&mut self, legacy: bool) {
+        *self = Self {
+            legacy,
+            ..Self::default()
+        };
     }
 
     /// 当前估算 token（与 runtime 压缩判据同一实现，见 agent-core）。
@@ -575,7 +581,7 @@ pub enum UiAction {
         remember: bool,
     },
     Reject,
-    /// 需要编排层执行的动作（`/tasks`、`/resume`、面板选中某条任务）。
+    /// 需要编排层执行的动作（`/resume`、面板刷新/选中某条任务）。
     Command(Command),
     Quit,
 }
@@ -789,10 +795,7 @@ impl App {
             Event::TaskList { tasks } => {
                 self.tasks = tasks;
                 self.panel_sel = self.panel_sel.min(self.tasks.len().saturating_sub(1));
-                // 面板开着就只刷新面板（用户正在里面挑）；否则是 `/tasks`，打到对话区。
-                if !self.panel_open {
-                    self.print_task_list();
-                }
+                // 会话面板是唯一展示方式：列表只刷新面板，不往对话区灌一遍。
                 self.wake_cursor();
             }
             // 系统通知（如 /improve 产物路径）：进对话区，不落盘。
@@ -803,9 +806,28 @@ impl App {
             }
             Event::TaskOpened { id, title, events } => {
                 self.panel_open = false;
-                // 历史回放不含 ContextSnapshot，旧任务的上下文序列已不代表
-                // 当前会话，调试页随之清空，等续跑后的新快照重新累积。
-                self.ctx.reset();
+                // 历史回放现在带 ContextSnapshot（store::task_events 保留），
+                // 按与实时/续跑相同的增量协议重建调试视图；没有快照的旧日志
+                // 标记为 legacy，界面给出明确说明而不是空白。
+                self.ctx.reset(
+                    !events
+                        .iter()
+                        .any(|e| matches!(e, Event::ContextSnapshot { .. })),
+                );
+                for ev in &events {
+                    if let Event::ContextSnapshot {
+                        model,
+                        iteration,
+                        added,
+                        reset,
+                        tools,
+                        ..
+                    } = ev
+                    {
+                        self.ctx
+                            .apply_snapshot(model, *iteration, added, *reset, tools);
+                    }
+                }
                 self.ctx_debug = None;
                 if events.is_empty() {
                     self.lines.push(Line::Error(format!(
@@ -1019,9 +1041,9 @@ impl App {
             "/help" => self.show_help(),
             "/tier" => self.cycle_tier(),
             // 这两个不直接改 UI，而是转成 Command 交给编排层（它才够得着 store）。
-            "/tasks" => {
-                self.panel_open = false;
-                self.pending_command = Some(Command::ListTasks);
+            // `/sessions` 与 Ctrl+G 同一入口、同一面板，不保留第二套列表展示。
+            "/sessions" => {
+                self.toggle_panel();
                 self.input.take();
                 return true;
             }
@@ -1264,6 +1286,9 @@ impl App {
         self.lines.clear();
         self.viewing = None;
         self.panel_open = false;
+        // 新话题：旧的上下文快照序列不再适用，调试页一并回到空状态。
+        self.ctx.reset(false);
+        self.ctx_debug = None;
         self.lines.push(Line::System(
             "对话已清空（下一条指令将作为新任务开始）。".into(),
         ));
@@ -1277,10 +1302,10 @@ impl App {
             "  /clear  清空对话（开新任务）",
             "  /help   显示本帮助",
             "  /tier   切换权限档 L1→L2→L3",
-            "  /tasks  列出历史任务",
+            "  /sessions  打开会话面板（与 Ctrl+G 相同）",
             "  /resume <ID前几位>  切到某条历史任务继续",
             "  /news <主题>  填入新闻收集提示词（改完再发送）",
-            "  Ctrl+G  打开任务面板（↑/↓ 选择，Enter 切换）",
+            "  Ctrl+G  打开会话面板（↑/↓ 选择，Enter 切换）",
         ] {
             self.lines.push(Line::System(l.into()));
         }
@@ -1295,7 +1320,7 @@ impl App {
         self.panel_sel = 0;
         if self.panel_open {
             self.pending_command = Some(Command::ListTasks);
-            self.toast("任务面板：↑/↓ 选择，Enter 切换，Esc 关闭");
+            self.toast("会话面板：↑/↓ 选择，Enter 切换，Esc 关闭");
         }
         self.wake_cursor();
     }
@@ -1322,29 +1347,6 @@ impl App {
     pub fn close_panel(&mut self) {
         self.panel_open = false;
         self.wake_cursor();
-    }
-
-    /// 把历史任务打印进对话区（`/tasks`；面板打开时不打印）。
-    pub fn print_task_list(&mut self) {
-        if self.tasks.is_empty() {
-            self.lines.push(Line::System(
-                "还没有历史任务（完成一个任务后就会出现在这里）。".into(),
-            ));
-            self.scroll_to_bottom();
-            return;
-        }
-        self.lines
-            .push(Line::System(format!("历史任务（{}）：", self.tasks.len())));
-        for t in &self.tasks {
-            self.lines.push(Line::System(format!(
-                "  {}",
-                task_row(t, self.viewing.as_ref().map(|(id, _)| id))
-            )));
-        }
-        self.lines.push(Line::System(
-            "用 /resume <ID前几位> 或 Ctrl+G 切到某条任务继续。".into(),
-        ));
-        self.scroll_to_bottom();
     }
 
     /// 提交当前输入；空输入返回 None。
@@ -1503,7 +1505,7 @@ impl App {
         self.active_task.clone().map(Command::Cancel)
     }
 
-    /// 取走待编排层处理的 `/` 命令（`/tasks`、`/resume`）。
+    /// 取走待编排层处理的命令（面板刷新、`/resume`）。
     ///
     /// 与 `take_approval` 同一套路：UI 只负责产生意图，真正要碰 store 的动作
     /// 交给编排层，TUI 因此不需要依赖 agent-store。
@@ -1604,7 +1606,7 @@ fn fmt_time(ms: i64) -> String {
     }
 }
 
-/// 一条历史任务的单行描述（`/tasks` 与任务面板共用）。
+/// 一条历史任务的单行描述（会话面板专用）。
 ///
 /// 当前正在看的那条用 `▸` 标出来，避免「我到底在哪条任务里」的困惑。
 pub(crate) fn task_row(t: &TaskSummary, current: Option<&TaskId>) -> String {
@@ -2637,25 +2639,26 @@ mod tests {
     }
 
     #[test]
-    fn task_list_prints_into_conversation_when_panel_closed() {
+    fn task_list_never_prints_into_conversation() {
         let mut app = App::default();
+        let before = app.lines.len();
         app.apply_event(Event::TaskList {
             tasks: vec![task("aaaaaaaa-1111", "写脚本", TaskState::Done)],
         });
         assert_eq!(app.tasks.len(), 1);
-        let text = app
-            .lines
-            .iter()
-            .filter_map(|l| match l {
-                Line::System(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("历史任务"), "{text}");
-        assert!(text.contains("写脚本"), "列表要带标题：{text}");
-        assert!(text.contains("aaaaaaaa"), "列表要带 id 前 8 位：{text}");
-        assert!(text.contains("完成"), "列表要带状态：{text}");
+        assert_eq!(app.lines.len(), before, "会话列表只进面板，不刷对话区");
+    }
+
+    #[test]
+    fn sessions_slash_command_opens_same_panel_as_ctrl_g() {
+        let mut app = App::default();
+        assert!(app.run_slash_command("/sessions"));
+        assert!(app.panel_open);
+        assert!(matches!(
+            app.take_pending_command(),
+            Some(Command::ListTasks)
+        ));
+        assert!(!app.run_slash_command("/tasks"), "旧命令已移除");
     }
 
     #[test]
@@ -2967,20 +2970,45 @@ mod tests {
         assert!(!app.ctx_debug_move(-1), "已到顶不再移动");
     }
 
-    /// 切到历史任务时调试视图清空（回放不含快照，旧数据不再代表当前会话）。
+    /// 切到历史会话：回放里的快照序列重建调试视图（增量 + reset 语义一致）。
     #[test]
-    fn task_opened_clears_ctx_view() {
+    fn task_opened_replays_context_snapshots() {
         let mut app = App::default();
         let id = TaskId::from_raw("ctx-4");
-        app.apply_event(snapshot(&id, 0, vec![Message::system("S")], false));
-        assert!(!app.ctx.messages.is_empty());
+        app.apply_event(snapshot(&id, 0, vec![Message::system("旧会话")], false));
         app.apply_event(Event::TaskOpened {
-            id,
+            id: id.clone(),
             title: "旧任务".into(),
-            events: vec![],
+            events: vec![
+                snapshot(
+                    &id,
+                    0,
+                    vec![Message::system("S"), Message::user("U")],
+                    false,
+                ),
+                snapshot(&id, 3, vec![Message::assistant("A")], false),
+            ],
+        });
+        assert_eq!(app.ctx.messages.len(), 3, "历史快照按增量重建");
+        assert_eq!(app.ctx.messages[0].text(), "S");
+        assert_eq!(app.ctx.messages[2].text(), "A");
+        assert!(!app.ctx.legacy);
+    }
+
+    /// 没有快照的旧日志：标记 legacy，调试页给出明确说明。
+    #[test]
+    fn task_opened_without_snapshots_marks_legacy() {
+        let mut app = App::default();
+        app.apply_event(Event::TaskOpened {
+            id: TaskId::from_raw("ctx-5"),
+            title: "旧任务".into(),
+            events: vec![Event::UserPrompt {
+                id: TaskId::from_raw("ctx-5"),
+                text: "老日志".into(),
+            }],
         });
         assert!(app.ctx.messages.is_empty());
-        assert!(app.ctx_debug.is_none(), "调试页一并关闭");
+        assert!(app.ctx.legacy, "老日志要标注无快照，而不是空白");
     }
 
     /// token 估算与 runtime 共用同一实现：中文按 1/字符、ASCII 按 1/3。

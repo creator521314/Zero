@@ -118,7 +118,7 @@ pub enum Event {
         id: TaskId,
         err: ErrorInfo,
     },
-    /// 历史任务列表（TUI `/tasks` 与任务面板的数据源）。
+    /// 历史会话列表（TUI 会话面板 `/sessions` / Ctrl+G 的数据源）。
     ///
     /// 由编排层读 store 后回灌：TUI 不依赖 `agent-store`，只负责显示。
     TaskList {
@@ -210,7 +210,7 @@ pub enum Command {
         reason: String,
     },
     Cancel(TaskId),
-    /// 列出历史任务（TUI `/tasks` 与任务面板）。由编排层读 store 后把结果回灌成
+    /// 列出历史会话（TUI 会话面板）。由编排层读 store 后把结果回灌成
     /// [`Event::TaskList`]。
     ListTasks,
     /// 切到某个历史任务：参数为任务 id（或唯一前缀）。

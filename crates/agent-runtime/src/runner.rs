@@ -190,6 +190,43 @@ impl AgentRuntime {
         ContextAssembler::fixed_system(&ws)
     }
 
+    /// 纯寒暄识别：只做**整句精确匹配**，避免把「你好，帮我改个文件」误判成问好。
+    ///
+    /// 新会话里「你好」曾被当成任务：固定 system 强调「通过工具完成真实任务」
+    /// 与「探查操作批量并行」，模型Sampling时偶尔就会先扫一遍项目再答。这里在
+    /// 首轮请求尾部追加一条不落盘的提醒（与预算提醒同机制，不污染固定前缀），
+    /// 让寒暄稳定走直接回应路径。
+    fn is_plain_greeting(s: &str) -> bool {
+        let t = s.trim().to_ascii_lowercase();
+        let t = t.trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(c, '。' | '！' | '？' | '～' | '…' | '.' | '!' | '?' | '~')
+        });
+        matches!(
+            t,
+            "你好"
+                | "你好呀"
+                | "你好啊"
+                | "您好"
+                | "嗨"
+                | "哈喽"
+                | "在吗"
+                | "在么"
+                | "早上好"
+                | "中午好"
+                | "下午好"
+                | "晚上好"
+                | "谢谢"
+                | "谢谢你"
+                | "hi"
+                | "hello"
+                | "hey"
+                | "yo"
+                | "thanks"
+                | "thank you"
+        )
+    }
+
     /// 单次模型调用 + 流式聚合。
     ///
     /// `extra` 是**只 appended 到本次请求、不写进历史**的临时消息
@@ -545,9 +582,27 @@ impl AgentRuntime {
             } else {
                 Vec::new()
             };
+            // 寒暄只在「新任务的首轮」加提醒：续跑里的「你好」是真实追问，
+            // 不能强行改写成寒暄模式。追加在尾部，不进历史、不破坏前缀缓存。
+            let greeting_extra: Vec<Message> = if iteration == 0
+                && task.resume_messages.is_none()
+                && Self::is_plain_greeting(&task.prompt)
+            {
+                vec![Message::user(
+                    "[系统提示] 用户只是问好或寒暄：直接用一句话回应，不要调用任何工具、\
+                     不要探查项目、也不要调用 finish。",
+                )]
+            } else {
+                Vec::new()
+            };
+            let extra = if greeting_extra.is_empty() {
+                budget_extra
+            } else {
+                greeting_extra
+            };
 
             let out = match self
-                .stream_once(&bus, &mut cm, &cancel, &task, &budget_extra, true)
+                .stream_once(&bus, &mut cm, &cancel, &task, &extra, true)
                 .await
             {
                 Ok(o) => o,
@@ -1212,6 +1267,16 @@ mod tests {
     use agent_core::event::event_bus;
     use agent_core::ids::SessionId;
     use agent_core::perm::{Decision, PermissionEngine, Risk};
+
+    #[test]
+    fn plain_greeting_is_exact_not_substring() {
+        for s in ["你好", "你好呀！", "HI", "hello~", "在吗", "谢谢"] {
+            assert!(AgentRuntime::is_plain_greeting(s), "应识别为寒暄：{s}");
+        }
+        for s in ["你好，帮我改下 README", "hello world", "在吗？把文件发我"] {
+            assert!(!AgentRuntime::is_plain_greeting(s), "不能误判为寒暄：{s}");
+        }
+    }
     use agent_core::provider::{
         BoxStream, Capabilities, ChatResponse, FinishReason, LlmError, ModelPrice, StreamEvent,
         ToolDef,
