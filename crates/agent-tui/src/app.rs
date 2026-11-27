@@ -1863,6 +1863,21 @@ impl App {
         }
     }
 
+    /// 直接选中某条消息（鼠标点击列表）；选中后预览回到顶部。
+    pub fn ctx_debug_select(&mut self, idx: usize) -> bool {
+        if idx >= self.ctx.messages.len() {
+            return false;
+        }
+        if let Some(ui) = &mut self.ctx_debug {
+            if ui.sel == idx {
+                return false;
+            }
+            ui.sel = idx;
+            ui.preview_scroll = 0;
+        }
+        true
+    }
+
     /// 执行一个暂存的记忆动作。只允许在异步上下文（TUI 事件循环）里调用。
     pub async fn handle_memory(&mut self, act: MemoryPending) {
         use agent_core::memory::MemoryPort;

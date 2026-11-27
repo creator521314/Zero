@@ -289,6 +289,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
     if app.panel_open {
         return handle_panel_mouse(app, m, area);
     }
+    // `/ctx` 弹窗也是模态的：滚轮只滚弹窗内的列表/预览，不漏给背后的对话区。
+    if app.ctx_debug.is_some() {
+        handle_ctx_mouse(app, m, area);
+        return None;
+    }
 
     // 选区右键菜单也是模态的：点菜单项执行，点外面关闭。
     // 只认左键 Down——右键的 Up / 移动 / 滚轮不能关菜单，否则 Down(Right)
@@ -1295,11 +1300,15 @@ fn ctx_msg_full(m: &Message) -> String {
     s
 }
 
-/// `/ctx` 弹窗的居中矩形：宽度最多 110 / 屏幕宽 - 6，高度最多屏幕高 - 4，
-/// 小窗口下退化为「几乎铺满但留边」，避免弹窗比终端还大。
+/// `/ctx` 弹窗几何：占屏幕 **94% × 90%**，四周留边但不设死上限——
+/// 大终端上能真正铺开，小终端按百分比退化，永远不越界。
 fn ctx_popup_rect(area: Rect) -> Rect {
-    let w = area.width.saturating_sub(6).clamp(48, 110).min(area.width);
-    let h = area.height.saturating_sub(4).clamp(16, 34).min(area.height);
+    let w = (area.width as usize * 94 / 100)
+        .max(1)
+        .min(area.width as usize) as u16;
+    let h = (area.height as usize * 90 / 100)
+        .max(1)
+        .min(area.height as usize) as u16;
     Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 2,
@@ -1308,13 +1317,103 @@ fn ctx_popup_rect(area: Rect) -> Rect {
     }
 }
 
-/// `/ctx` 居中浮层弹窗：头部统计 + 消息序列列表 + 选中消息全文预览。
-///
-/// 展示的是「实际发给模型的消息序列」（由 ContextSnapshot 增量累积而来），
-/// 不是对话区的展示序列——两者的差异正是这个页面要暴露的东西。
-fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
-    // 先擦掉弹窗范围内的底层内容；与任务面板 / 记忆面板同一套浮层风格。
+/// `/ctx` 弹窗内部三块区域的几何——**渲染与鼠标命中共用同一份计算结果**，
+/// 避免「看到的列表」和「点到的行」因为各自算一遍而错位。
+struct CtxLayout {
+    header: Rect,
+    list: Rect,
+    preview: Rect,
+}
+
+fn ctx_layout(area: Rect) -> CtxLayout {
     let popup = ctx_popup_rect(area);
+    // 圆角边框占 1 列/行；Layout 只在 inner 里切分。
+    let outer = Rect::new(
+        popup.x + 1,
+        popup.y + 1,
+        popup.width.saturating_sub(2),
+        popup.height.saturating_sub(2),
+    );
+    let header_h = 3u16.min(outer.height);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_h),
+            Constraint::Percentage(40),
+            Constraint::Min(4),
+        ])
+        .split(outer);
+    CtxLayout {
+        header: rows[0],
+        list: rows[1],
+        preview: rows[2],
+    }
+}
+
+/// 列表滚动起点：一条消息恰好占一行（不换行），所以偏移可直接由选号算出。
+fn ctx_list_offset(app: &App, list_h: u16) -> usize {
+    let sel = app.ctx_debug.as_ref().map(|u| u.sel).unwrap_or(0);
+    sel.saturating_sub(list_h.saturating_sub(1) as usize)
+}
+
+/// 按**显示列**截断（CJK 占 2 列），保证一行摘要不会折行去吃预览区的行。
+fn ctx_truncate(s: String, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(s.as_str()) <= max_cols {
+        return s;
+    }
+    let budget = max_cols.saturating_sub(1);
+    let mut out = String::new();
+    let mut cols = 0usize;
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if cols + w > budget {
+            break;
+        }
+        cols += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// 估算 `Paragraph` 折行后的可视行数：滚轮滚动按可视行计，
+/// 夹住上界才不会翻过文末留一大片空白（看起来像内容被挡住）。
+fn ctx_wrapped_lines(text: &str, width: u16) -> usize {
+    let width = width.max(1) as usize;
+    let mut rows = 0usize;
+    for line in text.lines() {
+        let mut col = 0usize;
+        let mut n = 1usize;
+        for word in line.split_inclusive(char::is_whitespace) {
+            let w = UnicodeWidthStr::width(word);
+            if col > 0 && col + w > width {
+                n += 1;
+                col = 0;
+            }
+            if w > width {
+                // 超长词按字符折行（ratatui 的行为），留 1 列余量。
+                n += w.saturating_sub(1) / width;
+                col = w % width;
+            } else {
+                col += w;
+            }
+        }
+        rows += n;
+    }
+    rows.max(1)
+}
+
+/// `/ctx` 居中弹窗：头部统计 + 消息列表 + 选中消息全文预览。
+///
+/// 渲染规则：每帧先 Clear 整块弹窗，再逐块 Clear + 重绘，切换消息不留残影；
+/// 列表禁用折行并按显示列截断，保证「一条消息一行」与滚动偏移一一对应。
+fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
+    let popup = ctx_popup_rect(area);
+    let l = ctx_layout(area);
+    // 每帧从空白开始：上一帧的高亮底色 / 预览长文本不会残留。
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1328,16 +1427,13 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ))
         .title(Span::styled(
-            " Esc 关闭 · ↑↓ 选择 · ←→ 滚动 ",
+            " Esc 关闭 · ↑↓ 选择 · 滚轮 / ←→ 滚动 ",
             Style::default().fg(ink::FG_MUTED),
         ));
-    let outer = block.inner(popup);
     f.render_widget(block, popup);
 
     let ctx = &app.ctx;
     let est = ctx.est_tokens();
-
-    // 头部统计（两行）。
     let reset_note = if ctx.last_reset {
         "已压缩（最近一份为全量基线）"
     } else {
@@ -1380,29 +1476,22 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
     ];
-    let header_h = header.len() as u16 + 1;
+    f.render_widget(Clear, l.header);
+    f.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), l.header);
 
-    // 列表 + 预览上下分屏。
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(header_h),
-            Constraint::Percentage(38),
-            Constraint::Min(6),
-        ])
-        .split(outer);
-    f.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), rows[0]);
-
-    // 消息序列列表。
-    let list_h = rows[1].height as usize;
+    // 消息序列：一条消息一行，摘要按列表可用宽度截断（不折行）。
+    let list_h = l.list.height as usize;
     let sel = app
         .ctx_debug
         .as_ref()
         .map(|ui| ui.sel)
         .unwrap_or(0)
         .min(ctx.messages.len().saturating_sub(1));
-    let offset = sel.saturating_sub(list_h.saturating_sub(1));
-    let mut list_lines = Vec::with_capacity(ctx.messages.len());
+    let offset = ctx_list_offset(app, l.list.height);
+    // 序号(6) + 角色(9) + token(7) + 空格 ≈ 23 列固定前缀。
+    let fixed = 23usize;
+    let summary_budget = (l.list.width as usize).saturating_sub(fixed);
+    let mut list_lines: Vec<RtLine<'static>> = Vec::with_capacity(ctx.messages.len().max(list_h));
     for (idx, m) in ctx.messages.iter().enumerate() {
         let selected = idx == sel;
         let marker = if selected { "▸" } else { " " };
@@ -1417,15 +1506,23 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
                 format!("≈{:<6}", estimate_messages_tokens(std::slice::from_ref(m))),
                 base.fg(ink::FG_MUTED),
             ),
-            Span::styled(ctx_msg_summary(m), base.fg(ink::FG)),
+            Span::styled(
+                ctx_truncate(ctx_msg_summary(m), summary_budget),
+                base.fg(ink::FG),
+            ),
         ]));
     }
-    let list = Paragraph::new(list_lines)
-        .wrap(Wrap { trim: false })
-        .scroll((offset as u16, 0));
-    f.render_widget(list, rows[1]);
+    // 行数不足时用空行填满，避免上一帧底部内容穿透（双保险）。
+    while list_lines.len() < list_h {
+        list_lines.push(RtLine::from(""));
+    }
+    f.render_widget(Clear, l.list);
+    f.render_widget(
+        Paragraph::new(list_lines).scroll((offset as u16, 0)),
+        l.list,
+    );
 
-    // 预览窗格。
+    // 预览：按折行后的总行数夹住滚动位置，避免翻过文末。
     let preview_scroll = app
         .ctx_debug
         .as_ref()
@@ -1440,20 +1537,50 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
             "（尚无上下文：提交一个任务后，这里会显示实际发送给模型的内容）".into()
         }
     });
-    let body = Text::styled(full, Style::default().fg(ink::FG));
-    let preview = Paragraph::new(body)
-        .wrap(Wrap { trim: false })
-        .scroll((preview_scroll as u16, 0))
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(surface::LINE))
-                .title(Span::styled(
-                    format!(" 消息 #{sel} 全文（←→ 滚动） "),
-                    Style::default().fg(ink::FG_MUTED),
-                )),
-        );
-    f.render_widget(preview, rows[2]);
+    let inner_h = l.preview.height.saturating_sub(1).max(1) as usize;
+    let max_scroll = ctx_wrapped_lines(&full, l.preview.width)
+        .saturating_add(1)
+        .saturating_sub(inner_h);
+    let scroll = preview_scroll.min(max_scroll);
+    f.render_widget(Clear, l.preview);
+    f.render_widget(
+        Paragraph::new(Text::styled(full, Style::default().fg(ink::FG)))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll as u16, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(surface::LINE))
+                    .title(Span::styled(
+                        format!(" 消息 #{sel} 全文（滚轮 / ←→ 滚动） "),
+                        Style::default().fg(ink::FG_MUTED),
+                    )),
+            ),
+        l.preview,
+    );
+}
+
+/// `/ctx` 弹窗期间的鼠标：列表上滚轮换消息 / 单击选中，预览上滚轮滚动全文。
+/// 与渲染共用 `ctx_layout`，所以命中区域就是肉眼看到的区域。
+fn handle_ctx_mouse(app: &mut App, m: MouseEvent, area: Rect) {
+    let l = ctx_layout(area);
+    match m.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let down = matches!(m.kind, MouseEventKind::ScrollDown);
+            if point_in(l.list, m.row, m.column) {
+                app.ctx_debug_move(if down { 1 } else { -1 });
+            } else if point_in(l.preview, m.row, m.column) {
+                app.ctx_debug_scroll(if down { 3 } else { -3 });
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if point_in(l.list, m.row, m.column) {
+                let idx = ctx_list_offset(app, l.list.height) + (m.row - l.list.y) as usize;
+                app.ctx_debug_select(idx);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 顶部信息栏：左「品牌 + 任务模式」，中「provider · 状态」，右「权限徽章」。
@@ -2565,22 +2692,144 @@ fn truncate_json(v: &serde_json::Value, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::TaskId;
     use ratatui::buffer::Buffer;
 
     // ---- `/ctx` 弹窗几何 ----
 
     #[test]
-    fn ctx_popup_is_centered_and_bounded() {
+    fn ctx_popup_is_large_centered_and_bounded() {
         let area = Rect::new(0, 0, 120, 40);
         let p = ctx_popup_rect(area);
-        assert_eq!(p.width, 110);
-        assert_eq!(p.height, 34);
-        assert_eq!(p.x, (120 - 110) / 2);
-        assert_eq!(p.y, (40 - 34) / 2);
-        // 小终端：留边退化，但绝不越界。
+        // 94% x 90%：比上一版 110x34 更大，且不设死上限。
+        assert_eq!(p.width, 112);
+        assert_eq!(p.height, 36);
+        assert_eq!(p.x, (120 - 112) / 2);
+        assert_eq!(p.y, (40 - 36) / 2);
+        // 大终端要跟着变大（不再卡在 110 列 / 34 行）。
+        let big = ctx_popup_rect(Rect::new(0, 0, 240, 80));
+        assert!(big.width >= 220 && big.height >= 70, "{big:?}");
+        // 小终端按比例退化，绝不越界。
         let small = ctx_popup_rect(Rect::new(0, 0, 30, 12));
         assert!(small.width <= 30 && small.height <= 12);
         assert!(small.x + small.width <= 30 && small.y + small.height <= 12);
+    }
+
+    #[test]
+    fn ctx_layout_regions_are_ordered_and_inside_popup() {
+        let area = Rect::new(0, 0, 120, 40);
+        let l = ctx_layout(area);
+        let p = ctx_popup_rect(area);
+        assert!(l.header.y < l.list.y && l.list.y < l.preview.y);
+        assert!(l.header.bottom() <= l.list.y);
+        assert!(l.list.bottom() <= l.preview.y);
+        assert!(l.preview.bottom() <= p.bottom());
+        assert!(l.list.height >= 4 && l.preview.height >= 4);
+    }
+
+    #[test]
+    fn ctx_truncate_counts_cjk_as_two_columns() {
+        let out = ctx_truncate("你好世界abcdef".into(), 6);
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 6, "{out}");
+        assert!(out.starts_with("你好"), "{out}");
+        assert_eq!(ctx_truncate("abc".into(), 6), "abc");
+    }
+
+    #[test]
+    fn ctx_mouse_wheel_and_click_act_inside_popup_only() {
+        let mut app = App::default();
+        let id = TaskId::from_raw("ctx-mouse");
+        let mk = |i: usize, text: &str| Event::ContextSnapshot {
+            id: id.clone(),
+            iteration: i as u32,
+            model: "m".into(),
+            added: vec![Message::user(text)],
+            reset: false,
+            tools: vec![],
+        };
+        app.apply_event(mk(0, "第一条"));
+        app.apply_event(mk(1, "第二条"));
+        app.apply_event(mk(2, "第三条"));
+        app.open_ctx_debug();
+        app.ctx_debug_select(0);
+        let l = ctx_layout(Rect::new(0, 0, 120, 40));
+
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::ScrollDown, l.list.x + 2, l.list.y),
+            Rect::new(0, 0, 120, 40),
+        );
+        assert_eq!(app.ctx_debug.as_ref().unwrap().sel, 1, "列表滚轮换消息");
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::ScrollUp, l.list.x + 2, l.list.y),
+            Rect::new(0, 0, 120, 40),
+        );
+        assert_eq!(app.ctx_debug.as_ref().unwrap().sel, 0);
+
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::ScrollDown, l.preview.x + 2, l.preview.y + 1),
+            Rect::new(0, 0, 120, 40),
+        );
+        assert_eq!(
+            app.ctx_debug.as_ref().unwrap().preview_scroll,
+            3,
+            "预览滚轮滚全文"
+        );
+        assert_eq!(app.scroll_from_bottom, 0, "滚轮不得漏给背后的对话区");
+
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                l.list.x + 2,
+                l.list.y + 2,
+            ),
+            Rect::new(0, 0, 120, 40),
+        );
+        assert_eq!(app.ctx_debug.as_ref().unwrap().sel, 2, "单击列表选中该消息");
+        assert_eq!(
+            app.ctx_debug.as_ref().unwrap().preview_scroll,
+            0,
+            "换消息后预览回顶"
+        );
+    }
+
+    #[test]
+    fn ctx_switching_messages_leaves_no_preview_residue() {
+        let mut app = App::default();
+        let id = TaskId::from_raw("ctx-repaint");
+        for (i, text) in ["AAAAAAAA", "BBBBBBBB"].iter().enumerate() {
+            app.apply_event(Event::ContextSnapshot {
+                id: id.clone(),
+                iteration: i as u32,
+                model: "m".into(),
+                added: vec![Message::user(*text)],
+                reset: false,
+                tools: vec![],
+            });
+        }
+        app.open_ctx_debug();
+        app.ctx_debug_select(0);
+        let first = render_to_string(&app, 120, 40);
+        assert!(first.contains("AAAAAAAA"), "{first}");
+        app.ctx_debug_select(1);
+        let second = render_to_string(&app, 120, 40);
+        assert!(second.contains("BBBBBBBB"), "{second}");
+        // 列表里第 0 行本来就还显示 AAAAAAAA；只检查预览区是否残留旧正文。
+        let l = ctx_layout(Rect::new(0, 0, 120, 40));
+        let preview = second
+            .lines()
+            .skip(l.preview.y as usize)
+            .take(l.preview.height as usize)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(preview.contains("BBBBBBBB"), "{preview}");
+        assert!(
+            !preview.contains("AAAAAAAA"),
+            "旧消息正文不能残留：{preview}"
+        );
     }
 
     fn key_with_kind(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
