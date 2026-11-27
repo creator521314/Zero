@@ -1010,11 +1010,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
 /// 「空白 vs 新帧」，新帧留空的单元格不会被写——屏幕上那些位置仍是旧帧的字尾，
 /// 表现为 `list_dir e. 0msng the project…` 这种两帧文字叠在一起。
 fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
-    // 整屏重绘：显式请求（Ctrl+L / 弹层状态切换）之外，弹窗打开期间每帧都做。
-    // 根因：主界面紧邻弹窗边框列的 CJK 宽字符在物理终端上占两列，会侵入
-    // 边框那格，而 ratatui 的 diff 看到「边框 cell 没变」就不重画——残字
-    // 永远留在边框上。整屏重绘从物理层面兜底。
-    if app.take_repaint() || app.ctx_debug.is_some() || app.pending_question.is_some() {
+    // 整屏重绘只在显式请求时做（Ctrl+L / 终端缩放 / 弹层状态切换）：
+    // 边框透字已由「弹窗外圈保护环带」（见 draw_popup_guard）根治，
+    // 不再需要每帧 clear——那只会带来肉眼可见的频闪。
+    if app.take_repaint() {
         terminal.clear()?;
     }
     terminal.draw(|f| draw(f, app))?;
@@ -1321,6 +1320,24 @@ fn ctx_msg_full(m: &Message) -> String {
     s
 }
 
+/// 弹窗外的保护环带（1 格）：清成空白。
+///
+/// 根因（ratatui 源码级）：`Buffer::diff` 不输出宽字符的续行 cell，而
+/// `CrosstermBackend::draw` 用「x == 上一格 + 1」判断连续性来省略 MoveTo。
+/// 弹窗外紧邻列的 CJK lead 与边框格相邻输出时，物理光标实际推进 2 列，
+/// 边框字符被打印到错误位置、或被宽字符右半覆盖且永不修复——整屏重绘
+/// 也一样错位。把弹窗外一圈清成单宽空格后，边框永远紧跟一个单宽 cell，
+/// 光标推进与 ratatui 的假设一致，问题从源头消失。
+fn draw_popup_guard(f: &mut Frame, popup: Rect, area: Rect) {
+    let x = popup.x.saturating_sub(1).max(area.x);
+    let y = popup.y.saturating_sub(1).max(area.y);
+    let w = (popup.width + 2).min(area.right().saturating_sub(x));
+    let h = (popup.height + 2).min(area.bottom().saturating_sub(y));
+    let guard = Rect::new(x, y, w, h);
+    f.render_widget(Clear, guard);
+    f.render_widget(Block::default().style(Style::default().bg(BG)), guard);
+}
+
 /// `/ctx` 弹窗几何：占屏幕 **94% × 90%**，四周留边但不设死上限——
 /// 大终端上能真正铺开，小终端按百分比退化，永远不越界。
 fn ctx_popup_rect(area: Rect) -> Rect {
@@ -1433,6 +1450,8 @@ fn ctx_wrapped_lines(text: &str, width: u16) -> usize {
 /// 列表禁用折行并按显示列截断，保证「一条消息一行」与滚动偏移一一对应。
 fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
     let popup = ctx_popup_rect(area);
+    // 先清外圈再画弹窗：保证边框格的左邻 cell 是单宽空格（见 draw_popup_guard）。
+    draw_popup_guard(f, popup, area);
     let l = ctx_layout(area);
     // 每帧从空白开始：上一帧的高亮底色 / 预览长文本不会残留。
     f.render_widget(Clear, popup);
@@ -1825,6 +1844,7 @@ fn draw_question(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let l = question_layout(area);
+    draw_popup_guard(f, l.popup, area);
     let bg = Style::default().bg(BG);
     f.render_widget(Clear, l.popup);
     f.render_widget(
@@ -3246,6 +3266,54 @@ mod tests {
         for y in l.preview.y.saturating_add(2)..l.preview.bottom() {
             for x in l.preview.x..l.preview.right() {
                 assert_eq!(buf[(x, y)].symbol(), " ", "旧正文残留: ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn popup_guard_keeps_border_adjacent_cells_single_width() {
+        // 复现条件：主界面在弹窗边框左邻列写 CJK。绘制后那一列必须是单宽
+        // cell（空格），否则 CrosstermBackend 的「连续性省略 MoveTo」会把
+        // 边框打印到错误位置、或被宽字符右半覆盖且永不修复。
+        let area = Rect::new(0, 0, 120, 40);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+
+        // /ctx：主界面铺满中文。
+        let mut app = App::default();
+        app.lines.push(Line::Assistant(
+            "这是一段很长的中文内容，专门用来在每一列都放上宽字符。".repeat(10),
+        ));
+        let id = TaskId::from_raw("ctx-guard");
+        app.apply_event(Event::ContextSnapshot {
+            id: id.clone(),
+            iteration: 0,
+            model: "m".into(),
+            added: vec![Message::user("测试上下文")],
+            reset: false,
+            tools: vec![],
+        });
+        app.open_ctx_debug();
+        let frame = terminal.draw(|f| draw(f, &app)).expect("draw");
+        let p = ctx_popup_rect(area);
+        assert!(p.x > 0, "测试假设弹窗不在最左列");
+        for y in p.y..p.bottom() {
+            let cell = &frame.buffer[(p.x - 1, y)];
+            assert_eq!(
+                cell.symbol().width(),
+                1,
+                "边框左邻列存在宽字符: y={y} sym={:?}",
+                cell.symbol()
+            );
+        }
+
+        // 问答弹层：同样断言。
+        let mut qapp = question_app();
+        qapp.lines.push(Line::Assistant("宽字符占位。".repeat(30)));
+        let frame = terminal.draw(|f| draw(f, &qapp)).expect("draw");
+        let pq = question_rect(area);
+        if pq.x > 0 {
+            for y in pq.y..pq.bottom() {
+                assert_eq!(frame.buffer[(pq.x - 1, y)].symbol().width(), 1, "y={y}");
             }
         }
     }
