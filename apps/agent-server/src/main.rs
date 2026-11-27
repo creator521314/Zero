@@ -5,16 +5,16 @@
 
 use std::sync::Arc;
 
-use agent_core::event::{event_bus, Event};
+use agent_core::AgentRunner;
+use agent_core::event::{Event, event_bus};
 use agent_core::perm::{PermissionEngine, PermissionTier};
 use agent_core::task::{RunControl, TaskSpec};
-use agent_core::AgentRunner;
 use agent_perm::rules::StaticRules;
 use agent_perm::{PermConfig, PermissionEngineImpl};
-use agent_providers::router::budget_line;
-use agent_providers::wizard;
 use agent_providers::ProviderRouter;
 use agent_providers::ProvidersFile;
+use agent_providers::router::budget_line;
+use agent_providers::wizard;
 use agent_store::JsonlStore;
 use tokio::sync::mpsc;
 

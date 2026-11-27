@@ -169,12 +169,12 @@ impl ProviderConfig {
     /// 优先级：`api_key_env` 指向的环境变量 > 配置文件里的 `api_key` 明文。
     /// 环境变量存在但为空白串时视为未设置（继续走 fallback）。
     pub fn resolve_api_key(&self) -> Option<String> {
-        if let Some(env) = &self.api_key_env {
-            if let Ok(v) = std::env::var(env) {
-                let v = v.trim();
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
+        if let Some(env) = &self.api_key_env
+            && let Ok(v) = std::env::var(env)
+        {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
             }
         }
         if let Some(k) = &self.api_key {
@@ -348,25 +348,25 @@ pub fn expand_home(path: &str) -> PathBuf {
         if let Some(h) = home_dir() {
             return h;
         }
-    } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-        if let Some(h) = home_dir() {
-            return h.join(rest);
-        }
+    } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"))
+        && let Some(h) = home_dir()
+    {
+        return h.join(rest);
     }
     PathBuf::from(path)
 }
 
 /// 取 home 目录：Windows 用 `USERPROFILE`，其余用 `HOME`，最后回退 `directories`。
 pub fn home_dir() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("USERPROFILE") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
+    if let Ok(p) = std::env::var("USERPROFILE")
+        && !p.is_empty()
+    {
+        return Some(PathBuf::from(p));
     }
-    if let Ok(p) = std::env::var("HOME") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
+    if let Ok(p) = std::env::var("HOME")
+        && !p.is_empty()
+    {
+        return Some(PathBuf::from(p));
     }
     directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf())
 }
@@ -695,19 +695,21 @@ mod tests {
     #[test]
     fn env_key_wins_over_inline() {
         let env_name = "AGENT_TEST_PRIORITY_ENV";
-        std::env::set_var(env_name, "sk-from-env");
+        // SAFETY: 测试专用唯一变量名，单线程写读后即删，无并发读写。
+        unsafe { std::env::set_var(env_name, "sk-from-env") };
         let pc = provider_with(Some(env_name), Some("sk-inline-should-lose"));
         assert_eq!(pc.resolve_api_key().as_deref(), Some("sk-from-env"));
-        std::env::remove_var(env_name);
+        unsafe { std::env::remove_var(env_name) };
     }
 
     #[test]
     fn blank_env_falls_back_to_inline() {
         let env_name = "AGENT_TEST_BLANK_ENV";
-        std::env::set_var(env_name, "   ");
+        // SAFETY: 测试专用唯一变量名，单线程写读后即删，无并发读写。
+        unsafe { std::env::set_var(env_name, "   ") };
         let pc = provider_with(Some(env_name), Some("sk-inline-456"));
         assert_eq!(pc.resolve_api_key().as_deref(), Some("sk-inline-456"));
-        std::env::remove_var(env_name);
+        unsafe { std::env::remove_var(env_name) };
     }
 
     #[test]

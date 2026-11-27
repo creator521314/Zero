@@ -41,10 +41,10 @@ impl Clipboard {
     pub fn copy(&mut self, text: &str) -> bool {
         write_osc52(text);
         self.warm();
-        if let Some(native) = &mut self.native {
-            if native.set_text(text).is_ok() {
-                return true;
-            }
+        if let Some(native) = &mut self.native
+            && native.set_text(text).is_ok()
+        {
+            return true;
         }
 
         // arboard 不可用（无桌面库 / 无显示 / SSH 远端）时，再试命令行工具。
@@ -105,11 +105,11 @@ fn pipe(cmd: &str, args: &[&str], text: &str) -> bool {
         Err(_) => return false,
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(text.as_bytes()).is_err() {
-            let _ = child.kill();
-            return false;
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && stdin.write_all(text.as_bytes()).is_err()
+    {
+        let _ = child.kill();
+        return false;
     }
 
     // xclip / wl-copy 会驻留以持有选区，不能同步 wait；后台回收。

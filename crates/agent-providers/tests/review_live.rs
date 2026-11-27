@@ -29,10 +29,11 @@ use std::time::Duration;
 /// 在那儿不存在，于是会静默拿到一份默认配置——provider 只剩本地 ollama，
 /// 实测就变成「连不上 localhost」的假失败。这里从 CWD 逐级往上找。
 fn find_config() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("AGENT_CONFIG") {
-        if !p.trim().is_empty() && PathBuf::from(&p).exists() {
-            return Some(PathBuf::from(p));
-        }
+    if let Ok(p) = std::env::var("AGENT_CONFIG")
+        && !p.trim().is_empty()
+        && PathBuf::from(&p).exists()
+    {
+        return Some(PathBuf::from(p));
     }
     let mut dir = std::env::current_dir().ok()?;
     loop {

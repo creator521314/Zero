@@ -12,12 +12,12 @@
 
 use std::sync::Arc;
 
+use agent_core::AgentRunner;
 use agent_core::event::event_bus;
 use agent_core::perm::PermissionEngine;
 use agent_core::task::{RunControl, TaskSpec};
-use agent_core::AgentRunner;
-use agent_runtime::runner::ApprovalMsg;
 use agent_runtime::AgentRuntime;
+use agent_runtime::runner::ApprovalMsg;
 use agent_store::JsonlStore;
 use agent_tools::SearchBackend;
 use tokio::sync::mpsc;

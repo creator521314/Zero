@@ -12,7 +12,7 @@ use agent_core::event::{Event, EventBus};
 use agent_core::ids::QuestionId;
 use agent_core::question::{QuestionAnswer, QuestionRequest, UserQuestionPort};
 use async_trait::async_trait;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// 问答消息：(问题 ID, 回答)。

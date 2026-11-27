@@ -6,8 +6,8 @@
 //! - 父子共享 project_root 与 workspace（一行 clone 就是「共享同一片空间」）。
 //! - 一期串行：父 Runner 阻塞等待，审批单槽 / CLI 串行闸门完全不感知子任务。
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agent_core::error::AgentError;
@@ -182,11 +182,11 @@ impl RuntimeSubagent {
         // 刻意不设 resume_from / resume_messages：子任务永远是全新上下文。
 
         // 下行上下文：只给明确给出的背景与交付物提示，绝不复制父的历史消息。
-        if let Some(extra) = spec.context.as_deref() {
-            if !extra.trim().is_empty() {
-                let clipped: String = extra.chars().take(4000).collect();
-                child.prompt = format!("{goal}\n\n【背景材料（由父任务提供）】\n{clipped}");
-            }
+        if let Some(extra) = spec.context.as_deref()
+            && !extra.trim().is_empty()
+        {
+            let clipped: String = extra.chars().take(4000).collect();
+            child.prompt = format!("{goal}\n\n【背景材料（由父任务提供）】\n{clipped}");
         }
         if let Some(hint) = spec.expected_output.as_deref() {
             let clipped: String = hint.chars().take(500).collect();
@@ -211,10 +211,10 @@ impl RuntimeSubagent {
                 .filter(|n| n != "delegate" && !agent_core::memory::is_memory_tool(n))
                 .collect(),
         );
-        if let Some(cap) = child.budget_usd {
-            if cap > 0.0 {
-                child_deps.per_task_budget = cap;
-            }
+        if let Some(cap) = child.budget_usd
+            && cap > 0.0
+        {
+            child_deps.per_task_budget = cap;
         }
         // 共享（Clone 自动带来）：provider / perm / store / approvals /
         // log_cfg / context_cfg / cost_sink / redact。安全能力零重复实现。

@@ -15,5 +15,5 @@ pub mod web;
 
 pub use delegate::DelegateTool;
 pub use memory_search::{InjectedRegistry, MemorySearchTool};
-pub use registry::{default_tools, ToolRegistry};
+pub use registry::{ToolRegistry, default_tools};
 pub use web::SearchBackend;

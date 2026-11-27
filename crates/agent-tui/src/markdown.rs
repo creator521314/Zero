@@ -230,11 +230,11 @@ impl Renderer {
             return;
         }
         // 单元格里的文字先攒着：表格要等整张表收完才能算列宽。
-        if let Some(t) = &mut self.table {
-            if t.in_cell {
-                t.cell.push_str(content);
-                return;
-            }
+        if let Some(t) = &mut self.table
+            && t.in_cell
+        {
+            t.cell.push_str(content);
+            return;
         }
         // 代码块的内容是**单个含换行的 Text 事件**——pulldown-cmark 不为它发
         // SoftBreak。直接整段塞进一个 span 会被 ratatui 当成同一行的单元格，

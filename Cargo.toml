@@ -17,7 +17,7 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 authors = ["personal-agent"]
 
@@ -41,28 +41,30 @@ futures = "0.3"
 # serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
-toml_edit = "0.22"
+toml = "1"
+toml_edit = "0.25"
 
 # http / sse
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 eventsource-stream = "0.2"
 
 # tui
+# ratatui/crossterm 锁在 0.29/0.28：tui-textarea 0.7（已最新）编译于 crossterm 0.28 + ratatui 0.29，
+# 事件/缓冲类型跨版本不兼容，升 ratatui 0.30 需等 tui-textarea 跟进。
 ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.2"
 tui-textarea = { version = "0.7", features = ["crossterm"] }
 # 选区复制：OSC 52 走终端，arboard 写本机剪贴板（见 crates/agent-tui/src/clipboard.rs）
 arboard = "3"
-base64 = "0.22"
+base64 = "0.23"
 
 # markdown
-pulldown-cmark = "0.12"
+pulldown-cmark = "0.13"
 syntect = "5"
 
 # storage
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 # errors / logging
 thiserror = "2"
@@ -76,7 +78,7 @@ dashmap = "6"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 backoff = { version = "0.4", features = ["tokio"] }
-secrecy = "0.8"
-tiktoken-rs = "0.6"
-directories = "5"
-dialoguer = { version = "0.11", default-features = false }
+secrecy = "0.10"
+tiktoken-rs = "0.12"
+directories = "6"
+dialoguer = { version = "0.12", default-features = false }

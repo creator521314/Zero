@@ -136,20 +136,20 @@ impl StaticRules {
         }
 
         // 1) shell 命令模式匹配
-        if call.name == "shell_exec" {
-            if let Some(cmd) = call.arguments.get("cmd").and_then(|v| v.as_str()) {
-                let hits: Vec<usize> = self.shell.matches(cmd).iter().collect();
-                if let Some(&i) = hits.first() {
-                    return RuleMatch::Hit {
-                        risk: Risk::High,
-                        rule: self
-                            .shell_labels
-                            .get(i)
-                            .copied()
-                            .unwrap_or("高危命令")
-                            .to_string(),
-                    };
-                }
+        if call.name == "shell_exec"
+            && let Some(cmd) = call.arguments.get("cmd").and_then(|v| v.as_str())
+        {
+            let hits: Vec<usize> = self.shell.matches(cmd).iter().collect();
+            if let Some(&i) = hits.first() {
+                return RuleMatch::Hit {
+                    risk: Risk::High,
+                    rule: self
+                        .shell_labels
+                        .get(i)
+                        .copied()
+                        .unwrap_or("高危命令")
+                        .to_string(),
+                };
             }
         }
 
@@ -157,15 +157,13 @@ impl StaticRules {
         if matches!(
             call.name.as_str(),
             "file_write" | "file_edit" | "file_restore"
-        ) {
-            if let Some(p) = call.arguments.get("path").and_then(|v| v.as_str()) {
-                if self.is_protected(p) {
-                    return RuleMatch::Hit {
-                        risk: Risk::High,
-                        rule: format!("写入受保护系统路径: {p}"),
-                    };
-                }
-            }
+        ) && let Some(p) = call.arguments.get("path").and_then(|v| v.as_str())
+            && self.is_protected(p)
+        {
+            return RuleMatch::Hit {
+                risk: Risk::High,
+                rule: format!("写入受保护系统路径: {p}"),
+            };
         }
 
         RuleMatch::Miss
@@ -184,10 +182,10 @@ impl StaticRules {
 }
 
 fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}/{rest}", home.to_string_lossy());
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return format!("{}/{rest}", home.to_string_lossy());
     }
     path.to_string()
 }

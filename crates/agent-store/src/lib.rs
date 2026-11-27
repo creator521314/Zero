@@ -146,10 +146,10 @@ impl JsonlStore {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(text) = tokio::fs::read_to_string(&path).await {
-                if let Ok(summary) = serde_json::from_str::<TaskSummary>(&text) {
-                    out.push(summary);
-                }
+            if let Ok(text) = tokio::fs::read_to_string(&path).await
+                && let Ok(summary) = serde_json::from_str::<TaskSummary>(&text)
+            {
+                out.push(summary);
             }
         }
         out.sort_by_key(|s| std::cmp::Reverse(s.updated_at));

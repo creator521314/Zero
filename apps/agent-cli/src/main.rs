@@ -5,18 +5,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_core::event::{event_bus, Command, Event};
+use agent_core::AgentRunner;
+use agent_core::event::{Command, Event, event_bus};
 use agent_core::perm::PermissionEngine;
 use agent_core::task::{RunControl, TaskSpec};
-use agent_core::AgentRunner;
 use agent_perm::rules::StaticRules;
 use agent_perm::{PermConfig, PermissionEngineImpl};
-use agent_providers::router::budget_line;
-use agent_providers::wizard;
 use agent_providers::ProviderRouter;
 use agent_providers::ProvidersFile;
+use agent_providers::router::budget_line;
+use agent_providers::wizard;
 use agent_store::JsonlStore;
-use agent_tui::{run_tui, App};
+use agent_tui::{App, run_tui};
 use tokio::sync::mpsc;
 
 /// 把「从哪个历史任务接上」落成实际上下文。
@@ -432,12 +432,11 @@ async fn main() -> anyhow::Result<()> {
                 tracing::debug!(?cmd, "command received");
 
                 // 先收割已结束的任务：否则陈旧句柄会把后续提交一直挡在门外。
-                if current.as_ref().is_some_and(|(_, h)| h.is_finished()) {
-                    if let Some((_, h)) = current.take() {
-                        if let Err(e) = h.await {
-                            tracing::error!(error = %e, "task join failed");
-                        }
-                    }
+                if current.as_ref().is_some_and(|(_, h)| h.is_finished())
+                    && let Some((_, h)) = current.take()
+                    && let Err(e) = h.await
+                {
+                    tracing::error!(error = %e, "task join failed");
                 }
 
                 match cmd {

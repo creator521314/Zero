@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use agent_core::error::AgentError;
 use agent_core::event::{ApprovalDecision, Event, EventBus, Outcome, ToolOutcome};
 use agent_core::ids::{ApprovalId, ToolCallId};
-use agent_core::perm::{class_key, ApprovalRequest, Decision, PermissionEngine};
+use agent_core::perm::{ApprovalRequest, Decision, PermissionEngine, class_key};
 use agent_core::provider::{
     ChatRequest, ContentPart, LlmProvider, Message, RequestMeta, Role, StreamEvent, ToolCall, Usage,
 };
@@ -24,7 +24,7 @@ use agent_core::task::{AgentRunner, RunControl, TaskSpec, TaskState};
 use agent_core::tool::{MalformedArgs, Tool, ToolCtx, ToolErrorCode};
 use agent_store::JsonlStore;
 use async_trait::async_trait;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::context::{ContextAssembler, ContextConfig, ContextManager};
 
@@ -1209,7 +1209,7 @@ impl AgentRuntime {
                     is_error: true,
                     artifacts: vec![],
                     error_code: Some(ToolErrorCode::Timeout),
-                })
+                });
             }
         };
 
@@ -2371,10 +2371,9 @@ mod tests {
             if let Event::ToolCallEnd {
                 output: Some(o), ..
             } = ev
+                && o.contains("from-script")
             {
-                if o.contains("from-script") {
-                    saw_output = true;
-                }
+                saw_output = true;
             }
         }
         assert!(saw_output, "shell_exec 应读到脚本输出");
@@ -3325,9 +3324,11 @@ mod tests {
             }
         }
         assert!(!leaked, "子任务内部 summary 泄漏进了父上下文");
-        assert!(tokio::fs::read_to_string(proj.join("artifacts/child.md"))
-            .await
-            .is_ok());
+        assert!(
+            tokio::fs::read_to_string(proj.join("artifacts/child.md"))
+                .await
+                .is_ok()
+        );
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 

@@ -16,7 +16,7 @@ use agent_core::provider::{
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::ProviderConfig;
 
@@ -292,9 +292,8 @@ impl LlmProvider for OpenAiCompatProvider {
                                         entry.0 = Some(ToolCallId(id.to_string()));
                                     }
                                     if let Some(f) = tc.get("function") {
-                                        if let Some(n) = f.get("name").and_then(|n| n.as_str()) {
-                                            if entry.1.is_none() { entry.1 = Some(n.to_string()); }
-                                        }
+                                        if let Some(n) = f.get("name").and_then(|n| n.as_str())
+                                            && entry.1.is_none() { entry.1 = Some(n.to_string()); }
                                         if let Some(a) = f.get("arguments").and_then(|a| a.as_str()) {
                                             entry.2.push_str(a);
                                         }

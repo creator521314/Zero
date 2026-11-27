@@ -393,7 +393,8 @@ mod tests {
     #[tokio::test]
     async fn secret_env_is_not_inherited_by_child() {
         const NAME: &str = "AGENT_TEST_SECRET_API_KEY";
-        std::env::set_var(NAME, "sk-should-not-leak");
+        // SAFETY: 测试专用唯一变量名，写读后即删，无并发读写。
+        unsafe { std::env::set_var(NAME, "sk-should-not-leak") };
         assert!(
             sensitive_env_names().iter().any(|n| n == NAME),
             "名字以 _API_KEY 结尾应被识别为敏感变量"
@@ -406,7 +407,7 @@ mod tests {
             .execute(json!({ "cmd": cmd }), &ctx(&dir))
             .await
             .unwrap();
-        std::env::remove_var(NAME);
+        unsafe { std::env::remove_var(NAME) };
 
         assert!(
             !out.content.contains("sk-should-not-leak"),

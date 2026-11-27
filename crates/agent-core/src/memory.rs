@@ -247,10 +247,11 @@ pub fn scan_secret(text: &str) -> bool {
     // http(s)://user:pass@host 形态
     if lower.contains("://") {
         for seg in lower.split("://").skip(1) {
-            if let Some((creds, _)) = seg.split_once('@') {
-                if creds.contains(':') && !creds.contains('/') {
-                    return true;
-                }
+            if let Some((creds, _)) = seg.split_once('@')
+                && creds.contains(':')
+                && !creds.contains('/')
+            {
+                return true;
             }
         }
     }

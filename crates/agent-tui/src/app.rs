@@ -954,10 +954,10 @@ impl App {
             self.cursor_visible = !self.cursor_visible;
             self.cursor_last_blink = Instant::now();
         }
-        if let Some(t) = &self.toast {
-            if t.until <= Instant::now() {
-                self.toast = None;
-            }
+        if let Some(t) = &self.toast
+            && t.until <= Instant::now()
+        {
+            self.toast = None;
         }
     }
 
@@ -1494,10 +1494,10 @@ impl App {
     /// 不自动复制（sh0 的取舍：松手即复制会让「只是想看看」的操作污染剪贴板）。
     pub fn finish_drag(&mut self) {
         self.drag_select = false;
-        if let Some(sel) = self.selection {
-            if sel.is_empty_click() {
-                self.selection = None;
-            }
+        if let Some(sel) = self.selection
+            && sel.is_empty_click()
+        {
+            self.selection = None;
         }
     }
 
@@ -1587,14 +1587,12 @@ impl App {
             .pending_question
             .as_ref()
             .is_some_and(|p| p.req.allow_custom);
-        if allowed {
-            if let Some(p) = &mut self.pending_question {
-                p.editing = !p.editing;
-                if p.editing {
-                    p.sel = p.req.options.len();
-                }
-                self.request_repaint();
+        if allowed && let Some(p) = &mut self.pending_question {
+            p.editing = !p.editing;
+            if p.editing {
+                p.sel = p.req.options.len();
             }
+            self.request_repaint();
         }
     }
 
@@ -3022,10 +3020,11 @@ mod tests {
             title: "旧任务".into(),
             events: vec![],
         });
-        assert!(app
-            .lines
-            .iter()
-            .any(|l| matches!(l, Line::Error(s) if s.contains("没有可回放"))));
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, Line::Error(s) if s.contains("没有可回放")))
+        );
         assert_eq!(app.viewing.as_ref().map(|(i, _)| i.0.clone()), Some(id.0));
     }
 

@@ -9,8 +9,10 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::Frame;
+use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Alignment;
@@ -18,21 +20,19 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as RtLine, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
-use ratatui::Terminal;
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use agent_core::event::{Command, Event};
-use agent_core::provider::{estimate_messages_tokens, Message, Role};
+use agent_core::provider::{Message, Role, estimate_messages_tokens};
 use agent_core::question::QuestionAnswer;
 
 use crate::app::{
-    App, ContextAction, ContextMenu, Line, MemoryPending, Selection, ToolStatus, UiAction,
-    SLASH_COMMANDS,
+    App, ContextAction, ContextMenu, Line, MemoryPending, SLASH_COMMANDS, Selection, ToolStatus,
+    UiAction,
 };
 use crate::markdown;
-use crate::theme::{glyph, ink, surface, tier_badge_color, tier_label, BG};
+use crate::theme::{BG, glyph, ink, surface, tier_badge_color, tier_label};
 
 /// 启动 TUI 主循环。
 ///
@@ -182,10 +182,10 @@ async fn event_loop(
                         && execute!(terminal.backend_mut(), DisableMouseCapture).is_ok()
                     {
                         app.mouse_captured = false;
-                    } else if let Some(action) = handle_mouse(app, m, area) {
-                        if dispatch(app, action, cmd_tx).await? {
-                            return Ok(());
-                        }
+                    } else if let Some(action) = handle_mouse(app, m, area)
+                        && dispatch(app, action, cmd_tx).await?
+                    {
+                        return Ok(());
                     }
                 }
                 _ => {}
@@ -222,26 +222,26 @@ async fn dispatch(
             false
         }
         UiAction::Cancel => {
-            if let Some(c) = app.cancel_command() {
-                if cmd_tx.send(c).await.is_err() {
-                    app.backend_disconnected();
-                }
+            if let Some(c) = app.cancel_command()
+                && cmd_tx.send(c).await.is_err()
+            {
+                app.backend_disconnected();
             }
             false
         }
         UiAction::Approve { remember } => {
-            if let Some(c) = app.take_approval(true, remember) {
-                if cmd_tx.send(c).await.is_err() {
-                    app.backend_disconnected();
-                }
+            if let Some(c) = app.take_approval(true, remember)
+                && cmd_tx.send(c).await.is_err()
+            {
+                app.backend_disconnected();
             }
             false
         }
         UiAction::Reject => {
-            if let Some(c) = app.take_approval(false, false) {
-                if cmd_tx.send(c).await.is_err() {
-                    app.backend_disconnected();
-                }
+            if let Some(c) = app.take_approval(false, false)
+                && cmd_tx.send(c).await.is_err()
+            {
+                app.backend_disconnected();
             }
             false
         }
@@ -255,10 +255,10 @@ async fn dispatch(
     };
     // 统一出口：`/resume`、会话面板刷新请求这类动作由 UI 先攒在
     // `pending_command` 里（UI 够不着 store），这里一并送出去。
-    if let Some(cmd) = app.take_pending_command() {
-        if cmd_tx.send(cmd).await.is_err() {
-            app.backend_disconnected();
-        }
+    if let Some(cmd) = app.take_pending_command()
+        && cmd_tx.send(cmd).await.is_err()
+    {
+        app.backend_disconnected();
     }
     Ok(quit)
 }
@@ -398,10 +398,12 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
                 if let Some((r, c)) = view_cell_at(app, m.column, m.row, conv) {
                     app.extend_selection(r, c);
                 }
-            } else if let Some((sx, sy, sh)) = scrollbar_track(conv) {
-                if m.column == sx && m.row >= sy && m.row < sy.saturating_add(sh) {
-                    scroll_to_position(app, m.row, conv);
-                }
+            } else if let Some((sx, sy, sh)) = scrollbar_track(conv)
+                && m.column == sx
+                && m.row >= sy
+                && m.row < sy.saturating_add(sh)
+            {
+                scroll_to_position(app, m.row, conv);
             }
         }
         // 松手收尾框选：有些终端不发 Drag 只在松手时给最终坐标，补一次；
@@ -419,14 +421,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
         }
         // 右键选区：弹出「复制 / 取消选择」菜单。
         MouseEventKind::Down(MouseButton::Right) => {
-            if let Some((r, c)) = view_cell_at(app, m.column, m.row, conv) {
-                if app.selection.is_some_and(|s| s.contains(r, c)) {
-                    app.context_menu = Some(ContextMenu {
-                        x: m.column,
-                        y: m.row,
-                        selected: 0,
-                    });
-                }
+            if let Some((r, c)) = view_cell_at(app, m.column, m.row, conv)
+                && app.selection.is_some_and(|s| s.contains(r, c))
+            {
+                app.context_menu = Some(ContextMenu {
+                    x: m.column,
+                    y: m.row,
+                    selected: 0,
+                });
             }
         }
         _ => {}
@@ -2230,10 +2232,10 @@ fn build_conversation_lines(items: &[Line], inner_w: usize) -> Vec<RtLine<'stati
                 lines.push(RtLine::from(spans));
 
                 // 编辑成功才展示 diff：失败 / 被拒时「改了什么」是假的，只会误导。
-                if matches!(status, ToolStatus::Ok { .. }) {
-                    if let Some(d) = diff {
-                        push_diff_lines(&mut lines, d);
-                    }
+                if matches!(status, ToolStatus::Ok { .. })
+                    && let Some(d) = diff
+                {
+                    push_diff_lines(&mut lines, d);
                 }
             }
             // 系统提示：灰显，首行带 · 标记。
@@ -2744,11 +2746,7 @@ fn selection_text(app: &App) -> Option<String> {
     while out.ends_with('\n') {
         out.pop();
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// 按显示列闭区间 `[c0, c1]` 取子串（宽度感知；宽字符与选区相交即取整字）。
@@ -2882,10 +2880,10 @@ pub(crate) fn wrap_line(line: RtLine<'static>, width: usize) -> Vec<RtLine<'stat
     let mut cur: Vec<(char, Style)> = Vec::new();
     for sp in &line.spans {
         for c in sp.content.chars() {
-            if let Some((last, _)) = cur.last() {
-                if (*last == ' ') != (c == ' ') {
-                    tokens.push(std::mem::take(&mut cur));
-                }
+            if let Some((last, _)) = cur.last()
+                && (*last == ' ') != (c == ' ')
+            {
+                tokens.push(std::mem::take(&mut cur));
             }
             cur.push((c, sp.style));
         }
@@ -3389,10 +3387,10 @@ mod tests {
         let mut app = App::default();
         for kind in [KeyEventKind::Press, KeyEventKind::Release] {
             let k = key_with_kind(KeyCode::Char('好'), kind);
-            if should_handle_key(&k) {
-                if let KeyCode::Char(c) = k.code {
-                    app.on_char(c);
-                }
+            if should_handle_key(&k)
+                && let KeyCode::Char(c) = k.code
+            {
+                app.on_char(c);
             }
         }
         assert_eq!(app.input.buffer, "好", "Press+Release 只应插入一个字符");
@@ -3403,10 +3401,10 @@ mod tests {
         let mut app = App::default();
         for c in "hello".chars() {
             let k = key_with_kind(KeyCode::Char(c), KeyEventKind::Press);
-            if should_handle_key(&k) {
-                if let KeyCode::Char(ch) = k.code {
-                    app.on_char(ch);
-                }
+            if should_handle_key(&k)
+                && let KeyCode::Char(ch) = k.code
+            {
+                app.on_char(ch);
             }
         }
         assert_eq!(app.input.buffer, "hello");
@@ -3638,7 +3636,7 @@ mod tests {
         app.input.buffer = "aaaaaaaaaa".to_string();
         app.input.set_char_index(10); // 光标在末尾 → 光标列 10
         let content = Rect::new(2, 0, 5, 3); // x=2、宽 5
-                                             // hscroll = (10+1)-5 = 6；点内容区最左列 2 → rel = 2-2+6 = 6
+        // hscroll = (10+1)-5 = 6；点内容区最左列 2 → rel = 2-2+6 = 6
         click_input_cursor(&mut app, 2, content);
         assert_eq!(app.input.cursor_char_index(), 6);
     }
@@ -3905,10 +3903,11 @@ mod tests {
         // /help：打印命令帮助
         let mut app = App::default();
         assert!(app.run_slash_command("/help"));
-        assert!(app
-            .lines
-            .iter()
-            .any(|l| matches!(l, Line::System(s) if s.contains("/clear"))));
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, Line::System(s) if s.contains("/clear")))
+        );
 
         // /tier：切换档位
         let mut app = App::default();
@@ -3974,10 +3973,11 @@ mod tests {
         let _ = handle_key(&mut app, key(KeyCode::Enter));
         assert!(app.input.buffer.is_empty());
         assert!(!app.completion_active);
-        assert!(app
-            .lines
-            .iter()
-            .any(|l| matches!(l, Line::System(s) if s.contains("清空"))));
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, Line::System(s) if s.contains("清空")))
+        );
 
         // 前缀匹配：先补全为 /clear，不执行
         let mut app = App::default();
@@ -4064,10 +4064,11 @@ mod tests {
         // 点第一行候选 → /clear
         assert!(click_completion(&mut app, inner.y, inner.x, input_area));
         assert!(app.input.buffer.is_empty());
-        assert!(app
-            .lines
-            .iter()
-            .any(|l| matches!(l, Line::System(s) if s.contains("清空"))));
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, Line::System(s) if s.contains("清空")))
+        );
     }
 
     #[test]
@@ -5422,7 +5423,7 @@ mod tests {
         app.lines
             .push(Line::Assistant("hello world from zero".into()));
         let area = rect(80, 30); // conv 区 y=1..27，内容 x 从 1 开始
-                                 // 对话区按下 → 拖拽 → 松手。
+        // 对话区按下 → 拖拽 → 松手。
         handle_mouse(
             &mut app,
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),

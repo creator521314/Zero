@@ -23,8 +23,8 @@ pub use event::{Command, Event, EventBus, Outcome};
 pub use frontend::Frontend;
 pub use ids::{ApprovalId, QuestionId, SessionId, TaskId, ToolCallId};
 pub use memory::{
-    scan_secret, MemoryConfig, MemoryContext, MemoryEntry, MemoryError, MemoryId, MemoryIndex,
-    MemoryPort, MemoryQuery, MemoryScope, MemorySource, MemoryState, MemoryStore,
+    MemoryConfig, MemoryContext, MemoryEntry, MemoryError, MemoryId, MemoryIndex, MemoryPort,
+    MemoryQuery, MemoryScope, MemorySource, MemoryState, MemoryStore, scan_secret,
 };
 pub use perm::{ApprovalRequest, ApprovalResult, Decision, PermissionEngine, Risk};
 pub use provider::{

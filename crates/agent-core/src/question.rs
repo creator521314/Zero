@@ -98,17 +98,21 @@ mod tests {
 
     #[test]
     fn model_text_distinguishes_selection_custom_and_cancel() {
-        assert!(QuestionAnswer::Selected {
-            index: 0,
-            label: "A".into()
-        }
-        .as_model_text()
-        .contains("A"));
-        assert!(QuestionAnswer::Custom {
-            text: "都不要".into()
-        }
-        .as_model_text()
-        .contains("都不要"));
+        assert!(
+            QuestionAnswer::Selected {
+                index: 0,
+                label: "A".into()
+            }
+            .as_model_text()
+            .contains("A")
+        );
+        assert!(
+            QuestionAnswer::Custom {
+                text: "都不要".into()
+            }
+            .as_model_text()
+            .contains("都不要")
+        );
         assert!(QuestionAnswer::Cancelled.as_model_text().contains("取消"));
     }
 }

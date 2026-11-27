@@ -159,7 +159,8 @@ mod tests {
     #[test]
     fn redacts_env_and_inline_secrets() {
         const ENV_NAME: &str = "AGENT_REDACT_TEST_API_KEY";
-        std::env::set_var(ENV_NAME, "sk-env-value-123456");
+        // SAFETY: 测试专用唯一变量名，写入后立即读取并删除，无并发读写。
+        unsafe { std::env::set_var(ENV_NAME, "sk-env-value-123456") };
 
         let mut cfg = ProvidersFile::default();
         let deepseek = cfg.providers.get_mut("deepseek").unwrap();
@@ -167,7 +168,7 @@ mod tests {
         deepseek.api_key = Some("sk-inline-value-abcdef".into());
 
         let r = SecretRedactor::from_config(&cfg);
-        std::env::remove_var(ENV_NAME);
+        unsafe { std::env::remove_var(ENV_NAME) };
 
         let out = r.redact("x sk-env-value-123456 y sk-inline-value-abcdef z");
         assert!(
@@ -185,14 +186,15 @@ mod tests {
     #[test]
     fn short_values_are_ignored() {
         const ENV_NAME: &str = "AGENT_REDACT_SHORT_API_KEY";
-        std::env::set_var(ENV_NAME, "sk-1");
+        // SAFETY: 测试专用唯一变量名，写入后立即读取并删除，无并发读写。
+        unsafe { std::env::set_var(ENV_NAME, "sk-1") };
 
         let mut cfg = ProvidersFile::default();
         cfg.providers.get_mut("deepseek").unwrap().api_key_env = None;
         cfg.providers.get_mut("deepseek").unwrap().api_key = None;
 
         let r = SecretRedactor::from_config(&cfg);
-        std::env::remove_var(ENV_NAME);
+        unsafe { std::env::remove_var(ENV_NAME) };
 
         assert_eq!(r.redact("sk-1"), "sk-1", "过短的值不该参与替换");
     }
@@ -230,7 +232,11 @@ mod tests {
                 "github_pat_11AAAAAAA0abcdefghij_0123456789ABCDEFG",
                 "github_pat_11AAAAAAA0abcdefghij_0123456789ABCDEFG",
             ),
-            ("aws", "AKIAIOSFODNN7EXAMPLE is the access key", "AKIAIOSFODNN7EXAMPLE"),
+            (
+                "aws",
+                "AKIAIOSFODNN7EXAMPLE is the access key",
+                "AKIAIOSFODNN7EXAMPLE",
+            ),
             // 注意：样例必须是 GitHub secret 扫描器不认定为真实 token 的假串，
             // 否则 push protection 会拒收整个提交。
             (

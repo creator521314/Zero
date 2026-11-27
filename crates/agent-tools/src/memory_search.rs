@@ -219,10 +219,10 @@ mod tests {
                     if e.state != MemoryState::Active {
                         return false;
                     }
-                    if let Some(scope) = &q.scope {
-                        if &e.scope != scope {
-                            return false;
-                        }
+                    if let Some(scope) = &q.scope
+                        && &e.scope != scope
+                    {
+                        return false;
                     }
                     match &q.keyword {
                         Some(kw) => e.content.to_lowercase().contains(&kw.to_lowercase()),

@@ -14,7 +14,7 @@ use agent_core::event::{Event, Outcome, ToolOutcome};
 use agent_core::ids::ToolCallId;
 use agent_core::provider::Role;
 use agent_core::store::{Durability, StoredEvent};
-use agent_providers::config::{expand_home, ProvidersFile};
+use agent_providers::config::{ProvidersFile, expand_home};
 
 /// 渲染选项。
 #[derive(Debug, Clone, Copy, Default)]
@@ -232,10 +232,10 @@ fn render_events(events: &[StoredEvent], opts: &ViewOpts) -> String {
                     s.push_str(&format!("        原因：{}\n", clip(d, limit)));
                 }
                 // 返回原文：失败时必看（含工具给出的错误文本），成功时按需。
-                if let Some(o) = output {
-                    if Some(o) != detail.as_ref() {
-                        s.push_str(&format!("        返回：{}\n", clip(o, limit)));
-                    }
+                if let Some(o) = output
+                    && Some(o) != detail.as_ref()
+                {
+                    s.push_str(&format!("        返回：{}\n", clip(o, limit)));
                 }
             }
             Event::QuestionAsked { req, .. } => {

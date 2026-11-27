@@ -170,10 +170,10 @@ fn matches_query(e: &MemoryEntry, q: &MemoryQuery) -> bool {
     } else if e.state != MemoryState::Active {
         return false;
     }
-    if let Some(scope) = &q.scope {
-        if &e.scope != scope {
-            return false;
-        }
+    if let Some(scope) = &q.scope
+        && &e.scope != scope
+    {
+        return false;
     }
     if let Some(kw) = &q.keyword {
         let kw = kw.to_lowercase();
@@ -200,10 +200,10 @@ impl MemoryService {
     /// 测试用临时目录）。构造时立即回放用户级文件；项目级文件按 scope 惰性加载。
     pub fn new(user_path: PathBuf, cfg: MemoryConfig) -> Self {
         // P1-4：启动即确保用户级目录存在（幂等；不创建/不覆盖文件本身）。
-        if let Some(parent) = user_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(error = %e, path = %parent.display(), "创建用户级记忆目录失败");
-            }
+        if let Some(parent) = user_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(error = %e, path = %parent.display(), "创建用户级记忆目录失败");
         }
         let mut inner = Inner {
             cfg,
@@ -257,11 +257,11 @@ impl MemoryStore for MemoryService {
                     at: now,
                 },
             )?;
-            if let Some(c) = inner.caches.get_mut(&path) {
-                if let Some(o) = c.entries.get_mut(&old.id) {
-                    o.state = MemoryState::Archived;
-                    o.updated_at = now;
-                }
+            if let Some(c) = inner.caches.get_mut(&path)
+                && let Some(o) = c.entries.get_mut(&old.id)
+            {
+                o.state = MemoryState::Archived;
+                o.updated_at = now;
             }
             inner.append(
                 &path,
@@ -307,11 +307,11 @@ impl MemoryStore for MemoryService {
                         at: now,
                     },
                 )?;
-                if let Some(c) = inner.caches.get_mut(&path) {
-                    if let Some(v) = c.entries.get_mut(&victim.id) {
-                        v.state = MemoryState::Archived;
-                        v.updated_at = now;
-                    }
+                if let Some(c) = inner.caches.get_mut(&path)
+                    && let Some(v) = c.entries.get_mut(&victim.id)
+                {
+                    v.state = MemoryState::Archived;
+                    v.updated_at = now;
                 }
             }
         }
@@ -373,11 +373,11 @@ impl MemoryStore for MemoryService {
                         at: now,
                     },
                 )?;
-                if let Some(c) = inner.caches.get_mut(path) {
-                    if let Some(e) = c.entries.get_mut(id) {
-                        e.state = MemoryState::Archived;
-                        e.updated_at = now;
-                    }
+                if let Some(c) = inner.caches.get_mut(path)
+                    && let Some(e) = c.entries.get_mut(id)
+                {
+                    e.state = MemoryState::Archived;
+                    e.updated_at = now;
                 }
             }
         }
@@ -397,10 +397,10 @@ impl MemoryStore for MemoryService {
             };
             for id in hit {
                 inner.append(path, &MemoryRecord::Touch { id: id.clone(), at })?;
-                if let Some(c) = inner.caches.get_mut(path) {
-                    if let Some(e) = c.entries.get_mut(&id) {
-                        e.last_used_at = e.last_used_at.max(at);
-                    }
+                if let Some(c) = inner.caches.get_mut(path)
+                    && let Some(e) = c.entries.get_mut(&id)
+                {
+                    e.last_used_at = e.last_used_at.max(at);
                 }
             }
         }
@@ -429,11 +429,11 @@ impl MemoryStore for MemoryService {
                         at: now,
                     },
                 )?;
-                if let Some(c) = inner.caches.get_mut(path) {
-                    if let Some(e) = c.entries.get_mut(&id) {
-                        e.state = state;
-                        e.updated_at = now;
-                    }
+                if let Some(c) = inner.caches.get_mut(path)
+                    && let Some(e) = c.entries.get_mut(&id)
+                {
+                    e.state = state;
+                    e.updated_at = now;
                 }
                 n += 1;
             }

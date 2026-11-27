@@ -9,7 +9,7 @@ pub mod rules;
 
 use std::time::Duration;
 
-use agent_core::perm::{class_key, ApprovalSource, Decision, PermissionTier, Risk, StaticVerdict};
+use agent_core::perm::{ApprovalSource, Decision, PermissionTier, Risk, StaticVerdict, class_key};
 use agent_core::provider::ToolCall;
 use agent_core::task::TaskSpec;
 use async_trait::async_trait;

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use agent_core::provider::{ChatRequest, LlmError, LlmProvider};
 
-use crate::budget::{spend_path, SpendStore};
+use crate::budget::{SpendStore, spend_path};
 use crate::config::{Budget, ProvidersFile};
 use crate::openai_compat::OpenAiCompatProvider;
 
@@ -87,21 +87,21 @@ impl ProviderRouter {
         model_override: Option<&str>,
     ) -> Vec<String> {
         // 显式指定 model/provider 时优先
-        if let Some(m) = model_override {
-            if self.providers.contains_key(m) {
-                return vec![m.to_string()];
-            }
+        if let Some(m) = model_override
+            && self.providers.contains_key(m)
+        {
+            return vec![m.to_string()];
         }
-        if let Some(hint) = route_hint {
-            if let Some(list) = self.by_task.get(hint) {
-                let filtered: Vec<String> = list
-                    .iter()
-                    .filter(|p| self.providers.contains_key(*p))
-                    .cloned()
-                    .collect();
-                if !filtered.is_empty() {
-                    return filtered;
-                }
+        if let Some(hint) = route_hint
+            && let Some(list) = self.by_task.get(hint)
+        {
+            let filtered: Vec<String> = list
+                .iter()
+                .filter(|p| self.providers.contains_key(*p))
+                .cloned()
+                .collect();
+            if !filtered.is_empty() {
+                return filtered;
             }
         }
         if self.providers.contains_key(&self.default) {
@@ -367,9 +367,10 @@ mod tests {
             },
         );
         // 没有 key 会被跳过 → 手动塞进去，保证候选非空。
-        std::env::set_var("AGENT_TEST_PAID_KEY", "sk-test");
+        // SAFETY: 测试专用唯一变量名，写入后立即删除，无并发读写。
+        unsafe { std::env::set_var("AGENT_TEST_PAID_KEY", "sk-test") };
         let r = ProviderRouter::with_spend_file(&cfg, reqwest::Client::new(), None);
-        std::env::remove_var("AGENT_TEST_PAID_KEY");
+        unsafe { std::env::remove_var("AGENT_TEST_PAID_KEY") };
         assert_eq!(
             r.available(),
             vec!["paid".to_string()],
