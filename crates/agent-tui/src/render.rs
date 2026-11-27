@@ -1,7 +1,7 @@
 //! 渲染 + 事件循环。
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEvent,
@@ -100,6 +100,7 @@ async fn event_loop(
     let tick = Duration::from_millis(120);
     // arboard 提前初始化：Wayland 下的 WARN 日志不能画进 TUI（sh0 的教训）。
     app.clipboard.warm();
+    let mut last_tick = Instant::now();
     loop {
         // 当前终端尺寸（鼠标事件需要靠它判断指针落在哪个区域）
         let size = terminal.size()?;
@@ -141,54 +142,73 @@ async fn event_loop(
             app.refresh_memory_candidates().await;
         }
 
-        // 驱动软光标闪烁（与终端原生光标行为无关，跨平台一致）。
-        app.on_tick();
+        // 驱动软光标闪烁 / 工作指示器 / Toast 到期。
+        //
+        // 按墙钟节拍调用，而不是每轮迭代调一次：on_tick 里的 `tick` 计数
+        // 驱动 spinner 转动，若跟随迭代次数，鼠标移动风暴会让 poll 立即返回、
+        // 迭代频率飙升，spinner 就跟着事件数加速旋转（实测肉眼可见）。
+        // 时间基归一后，动画速度恒定，与事件频率彻底解耦。
+        if last_tick.elapsed() >= tick {
+            app.on_tick();
+            last_tick = Instant::now();
+        }
 
         if event::poll(tick)? {
-            match event::read()? {
-                CtEvent::Key(key) => {
-                    // Windows 的 crossterm 会对每次输入同时上报 Press 与 Release；
-                    // 中文 IME 尤其明显（每个字符两条事件）。只处理 Press，
-                    // 否则字符会被插入两次（“你好” → “你你好好”）。
-                    //
-                    // 别写成 `if !… { continue; }`——那会落在外层主循环上：
-                    // 白画一帧不说，还跳过本轮末尾的退出检查。
-                    if should_handle_key(&key) {
-                        // Shift+鼠标挂起捕获后，任意键盘事件都负责恢复：
-                        // 挂起期间终端不会送鼠标事件进来，键盘是唯一入口。
-                        if !app.mouse_captured
-                            && execute!(terminal.backend_mut(), EnableMouseCapture).is_ok()
-                        {
-                            app.mouse_captured = true;
+            // 合批：把此刻队列里已就绪的输入事件全部取出，统一处理。
+            //
+            // 此前每轮只读一条，鼠标移动的密集 Moved 事件流会让每条事件
+            // 都触发一轮「画帧」，每秒上百次重绘（配合 hover 触发的整屏
+            // clear 就是频闪本体）。合批后一轮最多画一帧。
+            let mut batch = vec![event::read()?];
+            while event::poll(Duration::ZERO)? {
+                batch.push(event::read()?);
+            }
+            for ev in batch {
+                match ev {
+                    CtEvent::Key(key) => {
+                        // Windows 的 crossterm 会对每次输入同时上报 Press 与 Release；
+                        // 中文 IME 尤其明显（每个字符两条事件）。只处理 Press，
+                        // 否则字符会被插入两次（“你好” → “你你好好”）。
+                        //
+                        // 别写成 `if !… { continue; }`——那会落在外层主循环上：
+                        // 白画一帧不说，还跳过本轮末尾的退出检查。
+                        if should_handle_key(&key) {
+                            // Shift+鼠标挂起捕获后，任意键盘事件都负责恢复：
+                            // 挂起期间终端不会送鼠标事件进来，键盘是唯一入口。
+                            if !app.mouse_captured
+                                && execute!(terminal.backend_mut(), EnableMouseCapture).is_ok()
+                            {
+                                app.mouse_captured = true;
+                            }
+                            let action = handle_key(app, key);
+                            if dispatch(app, action, cmd_tx).await? {
+                                return Ok(());
+                            }
                         }
-                        let action = handle_key(app, key);
-                        if dispatch(app, action, cmd_tx).await? {
+                    }
+                    // 终端缩放：物理屏幕会被终端重排，而 ratatui 只在「尺寸确实
+                    // 变了」时才自己 clear（窗口动画 / DPI 变化可能查不到差异）。
+                    // 这里直接清屏 + 重置后台缓冲，保证下一帧是干净的整屏重画。
+                    CtEvent::Resize(_, _) => terminal.clear()?,
+                    // 鼠标：滚轮 / 点击分流——对话区滚动、输入框定位、滚动条拖拽、
+                    // header 徽章切档、审批弹层按钮、拖选复制（见 `handle_mouse`）。
+                    CtEvent::Mouse(m) => {
+                        // Shift + 鼠标 = 交回父终端（sh0 约定）：挂起鼠标捕获，
+                        // 用户就能用系统自带「按住左键拖选复制」；之后的任意
+                        // 键盘事件会把捕获恢复回来。
+                        if m.modifiers.contains(KeyModifiers::SHIFT)
+                            && app.mouse_captured
+                            && execute!(terminal.backend_mut(), DisableMouseCapture).is_ok()
+                        {
+                            app.mouse_captured = false;
+                        } else if let Some(action) = handle_mouse(app, m, area)
+                            && dispatch(app, action, cmd_tx).await?
+                        {
                             return Ok(());
                         }
                     }
+                    _ => {}
                 }
-                // 终端缩放：物理屏幕会被终端重排，而 ratatui 只在「尺寸确实
-                // 变了」时才自己 clear（窗口动画 / DPI 变化可能查不到差异）。
-                // 这里直接清屏 + 重置后台缓冲，保证下一帧是干净的整屏重画。
-                CtEvent::Resize(_, _) => terminal.clear()?,
-                // 鼠标：滚轮 / 点击分流——对话区滚动、输入框定位、滚动条拖拽、
-                // header 徽章切档、审批弹层按钮、拖选复制（见 `handle_mouse`）。
-                CtEvent::Mouse(m) => {
-                    // Shift + 鼠标 = 交回父终端（sh0 约定）：挂起鼠标捕获，
-                    // 用户就能用系统自带「按住左键拖选复制」；之后的任意
-                    // 键盘事件会把捕获恢复回来。
-                    if m.modifiers.contains(KeyModifiers::SHIFT)
-                        && app.mouse_captured
-                        && execute!(terminal.backend_mut(), DisableMouseCapture).is_ok()
-                    {
-                        app.mouse_captured = false;
-                    } else if let Some(action) = handle_mouse(app, m, area)
-                        && dispatch(app, action, cmd_tx).await?
-                    {
-                        return Ok(());
-                    }
-                }
-                _ => {}
             }
         }
 
@@ -5657,6 +5677,29 @@ mod tests {
             answer_of(action.unwrap()),
             agent_core::question::QuestionAnswer::Cancelled
         );
+    }
+
+    #[test]
+    fn question_hover_no_repaint_when_unchanged() {
+        // 鼠标移动的 Moved 事件流非常密集：hover 不变时不能再请求整屏重绘，
+        // 否则每次移动都是一次 clear + 全屏重画（频闪本体）。
+        let mut app = question_app();
+        let l = question_layout(Rect::new(0, 0, 120, 40));
+        // 弹出事件（QuestionAsked）本身带一次重绘请求，先消费掉再验证 hover。
+        assert!(app.take_repaint());
+        app.question_hover(None);
+        assert!(!app.take_repaint(), "hover 未变化（None→None）不应请求重绘");
+        // 移入第 0 可视行：变化 → 重绘请求。
+        let offset =
+            question_opt_offset(app.pending_question.as_ref().unwrap().sel, l.options.height);
+        app.question_hover(Some(offset));
+        assert!(app.take_repaint(), "hover 变化应请求重绘");
+        // 停在同一行继续滑动：不变 → 不重绘。
+        app.question_hover(Some(offset));
+        assert!(!app.take_repaint(), "hover 不变不应重复请求重绘");
+        // 移出列表（Some→None）也是变化：要重绘（高亮回落到键盘选中项）。
+        app.question_hover(None);
+        assert!(app.take_repaint(), "移出列表也应重绘（高亮回落）");
     }
 
     #[test]

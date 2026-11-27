@@ -1563,10 +1563,17 @@ impl App {
     }
 
     /// 问答弹层：鼠标悬停的候选（列表滚动偏移已折算成内容索引）。
+    ///
+    /// hover 没变就不请求重绘：鼠标移动会产生密集的 Moved 事件流，而
+    /// request_repaint 会让下一帧整屏擦除重画——hover 不变时重画纯属浪费，
+    /// 还会造成肉眼可见的频闪。
     pub fn question_hover(&mut self, idx: Option<usize>) {
         if let Some(p) = &mut self.pending_question {
-            p.hover = idx.filter(|i| *i < p.option_count());
-            self.request_repaint();
+            let next = idx.filter(|i| *i < p.option_count());
+            if p.hover != next {
+                p.hover = next;
+                self.request_repaint();
+            }
         }
     }
 
