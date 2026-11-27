@@ -49,12 +49,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 eventsource-stream = "0.2"
 
 # tui
-# ratatui/crossterm 锁在 0.29/0.28：tui-textarea 0.7（已最新）编译于 crossterm 0.28 + ratatui 0.29，
-# 事件/缓冲类型跨版本不兼容，升 ratatui 0.30 需等 tui-textarea 跟进。
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 unicode-width = "0.2"
-tui-textarea = { version = "0.7", features = ["crossterm"] }
 # 选区复制：OSC 52 走终端，arboard 写本机剪贴板（见 crates/agent-tui/src/clipboard.rs）
 arboard = "3"
 base64 = "0.23"

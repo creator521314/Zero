@@ -1011,7 +1011,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
 /// 同步。别用 `swap_buffers()`：它只重置缓冲、不擦屏，于是下一帧的差分变成
 /// 「空白 vs 新帧」，新帧留空的单元格不会被写——屏幕上那些位置仍是旧帧的字尾，
 /// 表现为 `list_dir e. 0msng the project…` 这种两帧文字叠在一起。
-fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
+/// ratatui 0.30 起 `Backend` 带关联错误类型：CrosstermBackend 的 Error 仍是
+/// io::Error，故 event_loop 处 `?` 可直接转换。
+fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(), B::Error> {
     // 整屏重绘只在显式请求时做（Ctrl+L / 终端缩放 / 弹层状态切换）：
     // 边框透字已由「弹窗外圈保护环带」（见 draw_popup_guard）根治，
     // 不再需要每帧 clear——那只会带来肉眼可见的频闪。
@@ -3250,7 +3252,7 @@ mod tests {
         for y in p.y..p.bottom() {
             for x in p.x..p.right() {
                 let cell = &buf[(x, y)];
-                if cell.skip {
+                if cell.diff_option == ratatui::buffer::CellDiffOption::Skip {
                     continue;
                 }
                 assert!(
@@ -5743,7 +5745,7 @@ mod tests {
         for y in l.popup.y..l.popup.bottom() {
             for x in l.popup.x..l.popup.right() {
                 let cell = &frame.buffer[(x, y)];
-                if cell.skip {
+                if cell.diff_option == ratatui::buffer::CellDiffOption::Skip {
                     continue;
                 }
                 assert!(
