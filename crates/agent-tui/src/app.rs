@@ -193,6 +193,24 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
 pub struct App {
     pub lines: Vec<Line>,
     pub input: InputState,
+    // ---- 文本选区与复制（移植自 sh0）----
+    /// 文本选区；坐标是**对话内容坐标**（wrap 后的绝对行号 + 显示列），
+    /// 滚动时高亮跟着内容走。None 表示没有选区。
+    pub selection: Option<Selection>,
+    /// 正在拖拽框选（Down 定锚点后置位，Up 收尾）。
+    pub drag_select: bool,
+    /// 键盘选择模式（Alt+V 进入）：方向键 / hjkl 扩选。
+    pub selection_keyboard: bool,
+    /// 选区右键菜单；Some 时独占鼠标与键盘。
+    pub context_menu: Option<ContextMenu>,
+    /// 最近一次复制的内容（剪贴板不可用时可用 `p` 粘回输入框）。
+    pub last_copy: String,
+    /// 剪贴板门面（OSC 52 + arboard + 命令行兜底），App 长期持有。
+    pub clipboard: crate::clipboard::Clipboard,
+    /// 鼠标捕获是否生效。Shift + 鼠标交回父终端时挂起，按键事件再恢复。
+    pub mouse_captured: bool,
+    /// 最近一次对话区内容宽度（wrap / 提取用），由渲染循环每帧更新。
+    pub conv_width: usize,
     pub pending: Option<PendingApproval>,
     pub active_task: Option<TaskId>,
     /// 待转交编排层的 `/` 命令（`/tasks`、`/resume` 需要 store，UI 够不着）。
@@ -347,6 +365,14 @@ impl Default for App {
                 "个人 Agent 已启动。输入任务并回车提交；Esc 中断；Ctrl+C 两次退出。".into(),
             )],
             input: InputState::default(),
+            selection: None,
+            drag_select: false,
+            selection_keyboard: false,
+            context_menu: None,
+            last_copy: String::new(),
+            clipboard: crate::clipboard::Clipboard::new(),
+            mouse_captured: true,
+            conv_width: 80,
             pending: None,
             active_task: None,
             pending_command: None,
@@ -381,6 +407,89 @@ impl Default for App {
             pending_memory: None,
         }
     }
+}
+
+/// 文本选区（移植自 sh0）。
+///
+/// 坐标是**对话内容坐标**：行 = 对话区软换行后的绝对行号，列 = 显示列
+/// （CJK 占 2 列）。滚动不改变选区——高亮跟着内容走，而不是钉在屏幕上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    /// 锚点（按下 / 进入选择模式时的位置）。
+    pub anchor: (usize, usize),
+    /// 活动端（拖动 / 方向键移动到的位置）。
+    pub head: (usize, usize),
+}
+
+impl Selection {
+    /// 规整后的行范围（闭区间）。
+    fn rows(&self) -> (usize, usize) {
+        (
+            self.anchor.0.min(self.head.0),
+            self.anchor.0.max(self.head.0),
+        )
+    }
+
+    /// 某一行被选中的列范围（闭区间）；不在选区内返回 None。
+    ///
+    /// 只有起止行按列裁剪，中间行整行选中（与 sh0 / 常见终端一致）。
+    pub fn cols_for(&self, row: usize) -> Option<(usize, usize)> {
+        let (r0, r1) = self.rows();
+        if row < r0 || row > r1 {
+            return None;
+        }
+        let (c0, c1) = (
+            self.anchor.1.min(self.head.1),
+            self.anchor.1.max(self.head.1),
+        );
+        if row == r0 && row == r1 {
+            Some((c0, c1))
+        } else if row == r0 {
+            Some((c0, usize::MAX))
+        } else if row == r1 {
+            Some((0, c1))
+        } else {
+            Some((0, usize::MAX))
+        }
+    }
+
+    /// 坐标是否落在选区内（右键弹菜单用）。
+    pub fn contains(&self, row: usize, col: usize) -> bool {
+        self.cols_for(row)
+            .is_some_and(|(c0, c1)| col >= c0 && col <= c1)
+    }
+
+    /// 选区是否一个字符都没选到（单击）：按下与松手位置相同。
+    pub fn is_empty_click(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
+/// 选区右键菜单里的动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextAction {
+    Copy,
+    Clear,
+}
+
+impl ContextAction {
+    pub const ALL: [ContextAction; 2] = [ContextAction::Copy, ContextAction::Clear];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ContextAction::Copy => "复制",
+            ContextAction::Clear => "取消选择",
+        }
+    }
+}
+
+/// 选区右键菜单（位置是按下右键时的屏幕坐标）。
+#[derive(Debug, Clone, Copy)]
+pub struct ContextMenu {
+    pub x: u16,
+    pub y: u16,
+    /// 当前高亮的菜单项索引（↑↓ 选择，Enter 执行）。
+    pub selected: usize,
 }
 
 /// 由按键解析出的动作。
@@ -1188,6 +1297,95 @@ impl App {
         if self.scroll_from_bottom == 0 {
             self.follow = true;
         }
+    }
+
+    // ---- 文本选区与复制（移植自 sh0）----
+
+    /// 在某处按下左键：以该点为锚点开一个空选区并进入拖拽框选。
+    pub fn begin_selection(&mut self, row: usize, col: usize) {
+        self.selection = Some(Selection {
+            anchor: (row, col),
+            head: (row, col),
+        });
+        self.drag_select = true;
+        self.selection_keyboard = false;
+    }
+
+    /// 拖拽更新选区活动端。
+    pub fn extend_selection(&mut self, row: usize, col: usize) {
+        if let Some(sel) = &mut self.selection {
+            sel.head = (row, col);
+        }
+    }
+
+    /// 键盘扩选：把活动端按 (drow, dcol) 移动，clamp 到对话内容范围内。
+    pub fn move_selection_head(
+        &mut self,
+        drow: isize,
+        dcol: isize,
+        max_row: usize,
+        max_col: usize,
+    ) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        let (r, c) = sel.head;
+        let nr = (r as isize + drow).clamp(0, max_row as isize) as usize;
+        let nc = (c as isize + dcol).clamp(0, max_col as isize) as usize;
+        sel.head = (nr, nc);
+    }
+
+    /// 拖拽收尾：单击（没拖动）视为取消选区；真的选到了就**保留高亮**，
+    /// 不自动复制（sh0 的取舍：松手即复制会让「只是想看看」的操作污染剪贴板）。
+    pub fn finish_drag(&mut self) {
+        self.drag_select = false;
+        if let Some(sel) = self.selection {
+            if sel.is_empty_click() {
+                self.selection = None;
+            }
+        }
+    }
+
+    /// 清掉选区（Esc / 点选区外 / 其它按键接管时）。
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selection_keyboard = false;
+        self.drag_select = false;
+    }
+
+    /// 收下要复制的内容：记录 last_copy、清选区、toast。返回内容行数。
+    ///
+    /// 剪贴板写入（`flush_clipboard`）与这里分开：提取文本在渲染层
+    /// （wrap 逻辑在那边），单测也可以只验证收下内容而不真的写剪贴板。
+    pub fn stage_copy(&mut self, text: String) -> usize {
+        let n = text.lines().count().max(1);
+        self.last_copy = text;
+        self.clear_selection();
+        self.toast(format!("已复制 {n} 行（若剪贴板为空，可按 p 粘回输入框）"));
+        n
+    }
+
+    /// 把 last_copy 写进剪贴板（OSC 52 + 本机 + 命令行兜底）。
+    /// 返回本机剪贴板是否成功。
+    pub fn flush_clipboard(&mut self) -> bool {
+        self.clipboard.copy(&self.last_copy)
+    }
+
+    /// 把最近复制的内容粘回输入框（剪贴板不可用时的兜底路径，sh0 的
+    /// `p` 在这里是粘回会话；Zero 的等价落点是输入框）。
+    pub fn paste_last_copy(&mut self) {
+        if self.last_copy.is_empty() {
+            return;
+        }
+        let text = self.last_copy.clone();
+        for c in text.chars() {
+            if c == '\n' {
+                self.input.insert_newline();
+            } else {
+                self.input.insert_char(c);
+            }
+        }
+        self.toast("已粘贴最近复制的内容到输入框");
     }
 
     /// 审批应答。

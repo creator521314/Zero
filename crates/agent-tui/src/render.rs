@@ -24,7 +24,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use agent_core::event::{Command, Event};
 
-use crate::app::{App, Line, MemoryPending, ToolStatus, UiAction, SLASH_COMMANDS};
+use crate::app::{
+    App, ContextAction, ContextMenu, Line, MemoryPending, Selection, ToolStatus, UiAction,
+    SLASH_COMMANDS,
+};
 use crate::markdown;
 use crate::theme::{glyph, ink, surface, tier_badge_color, tier_label, BG};
 
@@ -92,10 +95,17 @@ async fn event_loop(
     cmd_tx: &mpsc::Sender<Command>,
 ) -> anyhow::Result<()> {
     let tick = Duration::from_millis(120);
+    // arboard 提前初始化：Wayland 下的 WARN 日志不能画进 TUI（sh0 的教训）。
+    app.clipboard.warm();
     loop {
         // 当前终端尺寸（鼠标事件需要靠它判断指针落在哪个区域）
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
+        // 对话区内容宽度（wrap / 选区提取共用）：每帧同步一次，
+        // 键盘触发的复制不经过 draw 也能拿到正确宽度。
+        app.conv_width = layout_chunks(area, app.footer_visible)[1]
+            .width
+            .saturating_sub(2) as usize;
         draw_frame(terminal, app)?;
 
         // 非阻塞地抽干事件队列。
@@ -141,6 +151,13 @@ async fn event_loop(
                     // 别写成 `if !… { continue; }`——那会落在外层主循环上：
                     // 白画一帧不说，还跳过本轮末尾的退出检查。
                     if should_handle_key(&key) {
+                        // Shift+鼠标挂起捕获后，任意键盘事件都负责恢复：
+                        // 挂起期间终端不会送鼠标事件进来，键盘是唯一入口。
+                        if !app.mouse_captured
+                            && execute!(terminal.backend_mut(), EnableMouseCapture).is_ok()
+                        {
+                            app.mouse_captured = true;
+                        }
                         let action = handle_key(app, key);
                         if dispatch(app, action, cmd_tx).await? {
                             return Ok(());
@@ -152,9 +169,17 @@ async fn event_loop(
                 // 这里直接清屏 + 重置后台缓冲，保证下一帧是干净的整屏重画。
                 CtEvent::Resize(_, _) => terminal.clear()?,
                 // 鼠标：滚轮 / 点击分流——对话区滚动、输入框定位、滚动条拖拽、
-                // header 徽章切档、审批弹层按钮（见 `handle_mouse`）。
+                // header 徽章切档、审批弹层按钮、拖选复制（见 `handle_mouse`）。
                 CtEvent::Mouse(m) => {
-                    if let Some(action) = handle_mouse(app, m, area) {
+                    // Shift + 鼠标 = 交回父终端（sh0 约定）：挂起鼠标捕获，
+                    // 用户就能用系统自带「按住左键拖选复制」；之后的任意
+                    // 键盘事件会把捕获恢复回来。
+                    if m.modifiers.contains(KeyModifiers::SHIFT)
+                        && app.mouse_captured
+                        && execute!(terminal.backend_mut(), DisableMouseCapture).is_ok()
+                    {
+                        app.mouse_captured = false;
+                    } else if let Some(action) = handle_mouse(app, m, area) {
                         if dispatch(app, action, cmd_tx).await? {
                             return Ok(());
                         }
@@ -264,6 +289,27 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
         return handle_panel_mouse(app, m, area);
     }
 
+    // 选区右键菜单也是模态的：点菜单项执行，点外面关闭。
+    // 只认左键 Down——右键的 Up / 移动 / 滚轮不能关菜单，否则 Down(Right)
+    // 刚弹出、紧随其后的 Up(Right) 就把它关掉了。
+    if let Some(menu) = app.context_menu {
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            let (_outer, inner) = context_menu_rect(menu, area);
+            let idx = point_in(inner, m.row, m.column).then(|| (m.row - inner.y) as usize);
+            app.context_menu = None;
+            if let Some(i) = idx {
+                apply_context_action(
+                    app,
+                    ContextAction::ALL
+                        .get(i)
+                        .copied()
+                        .unwrap_or(ContextAction::Clear),
+                );
+            }
+        }
+        return None;
+    }
+
     let chunks = layout_chunks(area, app.footer_visible);
     let header = chunks[0];
     let conv = chunks[1];
@@ -320,19 +366,54 @@ fn handle_mouse(app: &mut App, m: MouseEvent, area: Rect) -> Option<UiAction> {
                 }
             } else if in_input {
                 click_input_cursor(app, m.column, input_content_rect(input));
+            } else {
+                // 滚动条轨道优先；其余对话区位置开始框选文本。
+                let on_track = scrollbar_track(conv).is_some_and(|(sx, sy, sh)| {
+                    m.column == sx && m.row >= sy && m.row < sy.saturating_add(sh)
+                });
+                if on_track {
+                    scroll_to_position(app, m.row, conv);
+                } else if let Some((r, c)) = view_cell_at(app, m.column, m.row, conv) {
+                    // 对话区按下：开始框选文本。Down 定锚点，拖到哪选到哪，
+                    // 松手**保留高亮**、不自动复制（复制走右键菜单 / Alt+C）。
+                    app.begin_selection(r, c);
+                }
+            }
+        }
+        // 拖动不是点击：框选中更新选区活动端；否则只允许在滚动条轨道上跟随定位。
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.drag_select {
+                if let Some((r, c)) = view_cell_at(app, m.column, m.row, conv) {
+                    app.extend_selection(r, c);
+                }
             } else if let Some((sx, sy, sh)) = scrollbar_track(conv) {
                 if m.column == sx && m.row >= sy && m.row < sy.saturating_add(sh) {
                     scroll_to_position(app, m.row, conv);
                 }
             }
         }
-        // 拖动不是点击：只允许一个用途——在滚动条轨道上跟随定位。
-        // 拖过 header / 输入区 / 弹层按钮一律无效果（弹层分支已在函数开头
-        // 只认 Down，天然不受影响）。
-        MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some((sx, sy, sh)) = scrollbar_track(conv) {
-                if m.column == sx && m.row >= sy && m.row < sy.saturating_add(sh) {
-                    scroll_to_position(app, m.row, conv);
+        // 松手收尾框选：有些终端不发 Drag 只在松手时给最终坐标，补一次；
+        // 单击（没拖动）在 finish_drag 里被当成取消选区。
+        MouseEventKind::Up(MouseButton::Left) => {
+            if app.drag_select {
+                if let Some((r, c)) = view_cell_at(app, m.column, m.row, conv) {
+                    app.extend_selection(r, c);
+                }
+                app.finish_drag();
+                if app.selection.is_some_and(|s| !s.is_empty_click()) {
+                    app.toast("已选中文本：右键复制 · Alt+C 复制 · Esc 取消");
+                }
+            }
+        }
+        // 右键选区：弹出「复制 / 取消选择」菜单。
+        MouseEventKind::Down(MouseButton::Right) => {
+            if let Some((r, c)) = view_cell_at(app, m.column, m.row, conv) {
+                if app.selection.is_some_and(|s| s.contains(r, c)) {
+                    app.context_menu = Some(ContextMenu {
+                        x: m.column,
+                        y: m.row,
+                        selected: 0,
+                    });
                 }
             }
         }
@@ -610,6 +691,110 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
             _ => UiAction::None,
         };
     }
+    // 选区右键菜单：模态键盘（↑/↓ 选、Enter 执行、Esc 关闭）。
+    if let Some(menu) = app.context_menu {
+        let last = ContextAction::ALL.len().saturating_sub(1);
+        return match key.code {
+            KeyCode::Up => {
+                app.context_menu = Some(ContextMenu {
+                    selected: menu.selected.saturating_sub(1),
+                    ..menu
+                });
+                UiAction::None
+            }
+            KeyCode::Down => {
+                app.context_menu = Some(ContextMenu {
+                    selected: (menu.selected + 1).min(last),
+                    ..menu
+                });
+                UiAction::None
+            }
+            KeyCode::Enter => {
+                app.context_menu = None;
+                let action = ContextAction::ALL
+                    .get(menu.selected)
+                    .copied()
+                    .unwrap_or(ContextAction::Clear);
+                apply_context_action(app, action);
+                UiAction::None
+            }
+            KeyCode::Esc => {
+                app.context_menu = None;
+                UiAction::None
+            }
+            _ => UiAction::None,
+        };
+    }
+
+    // ---- 文本选区模态（sh0 同款）----
+    // Alt+C / Enter / y 复制，Esc 取消；键盘选择模式（Alt+V 进入）下
+    // 方向键 / hjkl 扩选、p 把最近复制的内容粘回输入框。
+    // 其余按键清掉选区继续走原逻辑，不会把输入卡住。
+    let hard_quit = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+    if app.selection.is_some() {
+        if hard_quit {
+            // Ctrl+C 退出优先于选区，选区模态不能把用户卡死。
+        } else if key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            copy_selection_now(app);
+            return UiAction::None;
+        } else {
+            let keyboard = app.selection_keyboard;
+            let max_row = conversation_screen_texts(&app.lines, app.conv_width)
+                .len()
+                .saturating_sub(1);
+            let max_col = app.conv_width.saturating_sub(1);
+            match key.code {
+                KeyCode::Esc => {
+                    app.clear_selection();
+                    app.toast("已取消选择");
+                    return UiAction::None;
+                }
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    copy_selection_now(app);
+                    return UiAction::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') if keyboard => {
+                    app.move_selection_head(-1, 0, max_row, max_col);
+                    return UiAction::None;
+                }
+                KeyCode::Down | KeyCode::Char('j') if keyboard => {
+                    app.move_selection_head(1, 0, max_row, max_col);
+                    return UiAction::None;
+                }
+                KeyCode::Left | KeyCode::Char('h') if keyboard => {
+                    app.move_selection_head(0, -1, max_row, max_col);
+                    return UiAction::None;
+                }
+                KeyCode::Right | KeyCode::Char('l') if keyboard => {
+                    app.move_selection_head(0, 1, max_row, max_col);
+                    return UiAction::None;
+                }
+                KeyCode::Char('p') if keyboard => {
+                    app.paste_last_copy();
+                    return UiAction::None;
+                }
+                _ => app.clear_selection(),
+            }
+        }
+    } else if !hard_quit
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+    {
+        // Alt+V：键盘选择模式。锚点落在对话末尾（最近输出是最高频的复制对象）。
+        let last = conversation_screen_texts(&app.lines, app.conv_width)
+            .len()
+            .saturating_sub(1);
+        app.selection = Some(Selection {
+            anchor: (last, 0),
+            head: (last, 0),
+        });
+        app.selection_keyboard = true;
+        app.toast("选择模式：方向键/hjkl 扩选，Enter/y 复制，p 粘回，Esc 取消");
+        return UiAction::None;
+    }
+
     // Ctrl+G：打开任务面板（顺带向编排层要一份最新列表）。
     if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.toggle_panel();
@@ -837,6 +1022,9 @@ fn draw(f: &mut Frame, app: &App) {
         draw_approval(f, app, p, area);
     }
 
+    // 选区右键菜单：轻浮层，压在审批弹层之下、toast 之上。
+    draw_context_menu(f, app, area);
+
     // Toast 叠在最上层（含审批弹层之上），保证任何状态下反馈都可见。
     draw_toast(f, app, area);
 }
@@ -1051,7 +1239,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 /// 底部快捷键提示条（灰字，溢出时由 ratatui 自动裁剪）。
 fn draw_footer(f: &mut Frame, area: Rect) {
-    let text = " ⏎ 发送  ^⏎ 换行  Esc 中断  ^G 任务  PgUp/Dn 滚动  Ctrl+C 退出 ";
+    let text = " ⏎ 发送  ^⏎ 换行  Esc 中断  ^G 任务  PgUp/Dn 滚动  Ctrl+C 退出  Alt+V 选字 ";
     f.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(ink::FG_MUTED))),
         area,
@@ -1278,6 +1466,15 @@ fn draw_conversation(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<RtLine<'static>> = Vec::new();
     for l in build_conversation_lines(&app.lines, inner_w) {
         lines.extend(wrap_line(l, inner_w));
+    }
+    // 选区高亮：wrap 后每行与 Selection 的内容坐标直接对齐（行号即索引），
+    // 只给选中的列区间反显，起止行以外的中间行整行反显。
+    if let Some(sel) = app.selection {
+        for (i, line) in lines.iter_mut().enumerate() {
+            if let Some((c0, c1)) = sel.cols_for(i) {
+                apply_selection_style(line, c0, c1);
+            }
+        }
     }
     let total: u16 = lines.len().min(u16::MAX as usize) as u16;
     let height = area.height.saturating_sub(2);
@@ -1650,6 +1847,180 @@ fn placeholder_spans() -> Vec<Span<'static>> {
         Span::styled(" @ ", pill),
         Span::styled("引用文件 ", hint),
     ]
+}
+
+// ---- 文本选区与复制（移植自 sh0）-------------------------------------
+
+/// 对话内容按当前宽度软换行后的每屏行纯文本。
+///
+/// 选区命中换算（`view_cell_at`）与文本提取（`selection_text`）共用这一份，
+/// 保证「高亮在哪里」与「复制到什么」永远一致。
+fn conversation_screen_texts(items: &[Line], inner_w: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for l in build_conversation_lines(items, inner_w) {
+        for row in wrap_line(l, inner_w) {
+            out.push(line_as_str(&row));
+        }
+    }
+    out
+}
+
+/// 屏幕坐标 → 对话内容坐标（wrap 后的绝对行号 + 显示列）。
+///
+/// 不在对话内容区（边框内、且对应到实际存在的行）返回 None。
+fn view_cell_at(app: &App, col: u16, row: u16, conv: Rect) -> Option<(usize, usize)> {
+    let inner_w = conv.width.saturating_sub(2) as usize;
+    if inner_w == 0 || conv.height < 3 {
+        return None;
+    }
+    let inner = Rect {
+        x: conv.x + 1,
+        y: conv.y + 1,
+        width: conv.width - 2,
+        height: conv.height - 2,
+    };
+    if !point_in(inner, row, col) {
+        return None;
+    }
+    let texts = conversation_screen_texts(&app.lines, inner_w);
+    let total = texts.len().min(u16::MAX as usize) as u16;
+    let max_scroll = total.saturating_sub(inner.height);
+    let scroll = max_scroll.saturating_sub(app.scroll_from_bottom);
+    let r = (row - inner.y) as usize + scroll as usize;
+    if r >= texts.len() {
+        return None;
+    }
+    Some((r, (col - inner.x) as usize))
+}
+
+/// 按选区提取对话文本（列按显示宽度裁剪；每行一条，行间 `\n`）。
+fn selection_text(app: &App) -> Option<String> {
+    let sel = app.selection?;
+    let texts = conversation_screen_texts(&app.lines, app.conv_width);
+    let (r0, r1) = (sel.anchor.0.min(sel.head.0), sel.anchor.0.max(sel.head.0));
+    let mut out = String::new();
+    for row in r0..=r1 {
+        let Some(line) = texts.get(row) else {
+            break;
+        };
+        if let Some((c0, c1)) = sel.cols_for(row) {
+            out.push_str(&substring_by_width(line, c0, c1));
+        }
+        out.push('\n');
+    }
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 按显示列闭区间 `[c0, c1]` 取子串（宽度感知；宽字符与选区相交即取整字）。
+fn substring_by_width(s: &str, c0: usize, c1: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > c0 && w <= c1 {
+            out.push(ch);
+        }
+        w += cw;
+    }
+    out
+}
+
+/// 给选中列区间加反显样式：把 spans 按显示宽度切开，只反显选中部分。
+///
+/// 用 `Modifier::REVERSED` 交换前景/背景，保留原色相——不引入新配色，
+/// 也与 theme 无耦合。
+fn apply_selection_style(line: &mut RtLine<'static>, c0: usize, c1: usize) {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut w = 0usize;
+    for sp in &line.spans {
+        let mut plain = String::new();
+        let mut marked = String::new();
+        for ch in sp.content.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > c0 && w <= c1 {
+                marked.push(ch);
+            } else {
+                plain.push(ch);
+            }
+            w += cw;
+        }
+        if !plain.is_empty() {
+            out.push(Span::styled(plain, sp.style));
+        }
+        if !marked.is_empty() {
+            out.push(Span::styled(
+                marked,
+                sp.style.add_modifier(Modifier::REVERSED),
+            ));
+        }
+    }
+    line.spans = out;
+}
+
+/// 执行右键菜单动作。
+fn apply_context_action(app: &mut App, action: ContextAction) {
+    match action {
+        ContextAction::Copy => copy_selection_now(app),
+        ContextAction::Clear => {
+            app.clear_selection();
+            app.toast("已取消选择");
+        }
+    }
+}
+
+/// 把当前选区送进剪贴板（OSC 52 + 本机剪贴板 + 命令行兜底，双通道都走）。
+fn copy_selection_now(app: &mut App) {
+    let Some(text) = selection_text(app) else {
+        app.toast("选区是空的");
+        return;
+    };
+    app.stage_copy(text);
+    app.flush_clipboard();
+}
+
+/// 选区右键菜单的矩形（渲染与鼠标命中共用，坐标不会走散）。
+fn context_menu_rect(menu: ContextMenu, area: Rect) -> (Rect, Rect) {
+    let w = 14u16;
+    let h = ContextAction::ALL.len() as u16 + 2;
+    let x = (menu.x + 1).min(area.width.saturating_sub(w));
+    let y = (menu.y + 1).min(area.height.saturating_sub(h));
+    let outer = Rect::new(x, y, w, h);
+    let inner = Rect::new(x + 1, y + 1, w - 2, h - 2);
+    (outer, inner)
+}
+
+fn draw_context_menu(f: &mut Frame, app: &App, area: Rect) {
+    let Some(menu) = app.context_menu else {
+        return;
+    };
+    let (outer, inner) = context_menu_rect(menu, area);
+    f.render_widget(Clear, outer);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ink::PRIMARY)),
+        outer,
+    );
+    for (i, action) in ContextAction::ALL.iter().enumerate() {
+        if i as u16 >= inner.height {
+            break;
+        }
+        let style = if i == menu.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        let row = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+        f.render_widget(Paragraph::new(Span::styled(action.label(), style)), row);
+    }
 }
 
 /// [wrap_line][crate::markdown] 也要用（软换行 + 悬挂缩进），故为 crate 内可见。
@@ -3902,5 +4273,205 @@ mod tests {
         );
         assert_eq!(app.input.buffer, "l");
         assert!(!app.take_repaint());
+    }
+
+    // ---- 文本选区与复制（sh0 移植）------------------------------------
+
+    fn mouse_event(kind: MouseEventKind, row: u16, col: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            row,
+            column: col,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn selection_cols_for_cuts_end_rows_and_keeps_middle_full() {
+        let sel = Selection {
+            anchor: (1, 3),
+            head: (4, 6),
+        };
+        assert_eq!(sel.cols_for(0), None);
+        assert_eq!(sel.cols_for(1), Some((3, usize::MAX)));
+        assert_eq!(sel.cols_for(2), Some((0, usize::MAX)));
+        assert_eq!(sel.cols_for(4), Some((0, 6)));
+        assert_eq!(sel.cols_for(5), None);
+        // 反向选（head 在 anchor 之前）也能归一化。
+        let rev = Selection {
+            anchor: (2, 2),
+            head: (2, 0),
+        };
+        assert_eq!(rev.cols_for(2), Some((0, 2)));
+        assert!(rev.contains(2, 1));
+        assert!(!rev.contains(2, 3));
+    }
+
+    #[test]
+    fn selection_text_respects_display_columns_for_cjk() {
+        let mut app = App::default();
+        // Assistant 文本经 markdown 渲染会带两列缩进前缀，提取结果应与
+        // 屏幕上可见的内容一致（所见即所得，前缀一并复制）。
+        app.lines = vec![Line::Assistant("你好世界".into())];
+        app.conv_width = 78;
+        let full = conversation_screen_texts(&app.lines, app.conv_width)[0].clone();
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (0, 100),
+        });
+        assert_eq!(selection_text(&app).as_deref(), Some(full.as_str()));
+        // 「你」「好」「世」「界」分别占列 2-3 / 4-5 / 6-7 / 8-9（前 2 列是缩进）。
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (0, 5),
+        });
+        assert_eq!(selection_text(&app).as_deref(), Some("  你好"));
+        app.selection = Some(Selection {
+            anchor: (0, 7),
+            head: (0, 7),
+        });
+        assert_eq!(selection_text(&app).as_deref(), Some("世"));
+        app.selection = None;
+        assert_eq!(selection_text(&app), None);
+    }
+
+    #[test]
+    fn drag_select_keeps_highlight_and_right_menu_copies() {
+        let mut app = App::default();
+        app.lines
+            .push(Line::Assistant("hello world from zero".into()));
+        let area = rect(80, 30); // conv 区 y=1..27，内容 x 从 1 开始
+                                 // 对话区按下 → 拖拽 → 松手。
+        handle_mouse(
+            &mut app,
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
+            area,
+        );
+        assert!(app.selection.is_some(), "对话区按下应开始框选");
+        assert!(app.drag_select);
+        handle_mouse(
+            &mut app,
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 3, 12),
+            area,
+        );
+        handle_mouse(
+            &mut app,
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 3, 12),
+            area,
+        );
+        assert!(!app.drag_select);
+        let sel = app.selection.expect("拖拽应产生非空选区");
+        assert_ne!(sel.anchor, sel.head);
+        assert!(
+            sel.head.0 == 1 && sel.head.1 == 11,
+            "松手坐标应成为选区终点"
+        );
+
+        // 右键选区内 → 弹菜单；Enter 执行第一项「复制」。
+        handle_mouse(
+            &mut app,
+            mouse_event(MouseEventKind::Down(MouseButton::Right), 3, 5),
+            area,
+        );
+        assert!(app.context_menu.is_some(), "右键选区应弹菜单");
+        let action = handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, UiAction::None));
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.last_copy.lines().count(), 2, "应复制两行");
+        // 第二行只选到列 11：'hello world f' 之后不应出现在复制内容里。
+        let second = app.last_copy.lines().nth(1).unwrap();
+        assert!(
+            second.contains("hello worl"),
+            "第二行选到列 11 为止: {second:?}"
+        );
+        assert!(!app.last_copy.contains("from zero"));
+        assert!(app.selection.is_none(), "复制后选区清掉");
+    }
+
+    #[test]
+    fn single_click_after_drag_clears_selection() {
+        let mut app = App::default();
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (0, 5),
+        });
+        let area = rect(80, 30);
+        handle_mouse(
+            &mut app,
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            area,
+        );
+        handle_mouse(
+            &mut app,
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 2, 3),
+            area,
+        );
+        assert!(
+            app.selection.is_none(),
+            "单击（按下与松手同一点）应取消选区"
+        );
+    }
+
+    #[test]
+    fn alt_v_keyboard_mode_extends_and_esc_clears() {
+        let mut app = App::default();
+        app.lines.push(Line::Assistant("第一行".into()));
+        app.conv_width = 78;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT),
+        );
+        let sel = app.selection.expect("Alt+V 应进入键盘选择模式");
+        assert!(app.selection_keyboard);
+        assert_eq!(sel.head.0, 1, "锚点落在对话末尾");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selection.unwrap().head.0, 0, "方向键应扩选到上一行");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selection.is_none(), "Esc 应取消选择");
+    }
+
+    #[test]
+    fn p_pastes_last_copy_into_input_while_selecting() {
+        let mut app = App::default();
+        app.last_copy = "粘贴内容".into();
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (0, 1),
+        });
+        app.selection_keyboard = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.input.buffer, "粘贴内容");
+        // sh0 同款：p 粘回后保留选区，用户可以继续键盘扩选。
+    }
+
+    #[test]
+    fn unhandled_key_while_selecting_clears_and_continues() {
+        let mut app = App::default();
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (0, 3),
+        });
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert!(app.selection.is_none(), "选区模式按其它键应清选区");
+        assert_eq!(app.input.buffer, "x", "按键继续走普通输入，不能卡住");
+    }
+
+    #[test]
+    fn context_menu_esc_closes_without_copying() {
+        let mut app = App::default();
+        app.context_menu = Some(ContextMenu {
+            x: 5,
+            y: 5,
+            selected: 0,
+        });
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.last_copy, "", "关闭菜单不应触发复制");
     }
 }

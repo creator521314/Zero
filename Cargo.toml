@@ -53,6 +53,9 @@ ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.2"
 tui-textarea = { version = "0.7", features = ["crossterm"] }
+# 选区复制：OSC 52 走终端，arboard 写本机剪贴板（见 crates/agent-tui/src/clipboard.rs）
+arboard = "3"
+base64 = "0.22"
 
 # markdown
 pulldown-cmark = "0.12"
