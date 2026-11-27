@@ -128,24 +128,7 @@ impl ContextManager {
     /// 旧实现只算 `m.text().len()/3`，把工具参数（往往是最大的一块）和
     /// 中文一并漏掉，压缩阈值形同虚设。
     pub fn estimate_tokens(&self) -> usize {
-        let mut est = 0.0f64;
-        let mut count = |s: &str| {
-            for c in s.chars() {
-                est += if c.is_ascii() { 0.34 } else { 1.0 };
-            }
-        };
-        for m in &self.messages {
-            let text = m.text();
-            count(&text);
-            if let Some(r) = &m.reasoning {
-                count(r);
-            }
-            for c in &m.tool_calls {
-                count(&c.name);
-                count(&serde_json::to_string(&c.arguments).unwrap_or_default());
-            }
-        }
-        est.ceil() as usize
+        agent_core::provider::estimate_messages_tokens(&self.messages)
     }
 
     pub fn should_compress(&self) -> bool {

@@ -70,7 +70,8 @@ fork bomb、`curl | sh`、写 `/etc`、`~/.ssh` 等。
 | `Ctrl+L` | 整屏重绘（屏幕被外部改动弄花时救回） |
 | `PageUp` / `PageDown` / 鼠标滚轮 | 对话区滚动 |
 | `Ctrl+A` / `Home`、`Ctrl+E` / `End` | 光标行首 / 行尾 |
-| `/` | 触发命令补全（`/clear` `/help` `/tier` `/tasks` `/resume` `/news`） |
+| `/` | 触发命令补全（`/clear` `/help` `/tier` `/tasks` `/resume` `/news` `/memory` `/improve` `/ctx`） |
+| `/ctx` | 上下文调试页：查看实际发送给模型的消息序列、估算 token 与可用工具 |
 | `Ctrl+G` | 任务面板：`↑/↓` 选、`Enter` 切到该任务、`Esc` 关闭 |
 | `@` | 文件路径补全：`↑/↓` 选、`Tab`/`Enter` 补全、`Esc` 关闭（输入即触发） |
 | `Tab` / `↑` `↓` / `Esc` | 补全菜单：补全选中 / 选候选 / 关闭 |

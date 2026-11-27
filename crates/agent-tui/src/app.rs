@@ -28,6 +28,7 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "/remember",
     "/memory",
     "/improve",
+    "/ctx",
 ];
 
 /// 内置的新闻收集模板：`templates/news.md` 不存在时的兜底。
@@ -277,6 +278,11 @@ pub struct App {
     pub memory: Option<std::sync::Arc<dyn agent_core::memory::MemoryPort>>,
     /// `/memory` 面板状态；None = 面板关闭。
     pub memory_panel: Option<MemoryPanel>,
+    /// 上下文调试视图：随 [`Event::ContextSnapshot`] 增量累积的
+    /// 「实际发给模型的消息序列」，与对话区显示互相独立、常驻累积。
+    pub ctx: CtxView,
+    /// `/ctx` 全屏调试页的 UI 状态；None = 页面关闭。
+    pub ctx_debug: Option<CtxDebugUi>,
     /// 待确认候选条数（header 角标）。
     pub memory_candidates: usize,
     /// 异步记忆动作暂存（run_slash_command 同步，真正执行在事件循环里 await）。
@@ -313,6 +319,68 @@ pub enum MemoryPending {
     Delete,
     /// 清空当前页可见条目（生效页全部 Active / 候选页全部 Candidate）。
     Clear,
+}
+
+/// 上下文调试视图（`/ctx` 的数据源）。
+///
+/// **设计**：真实上下文由 runtime 的 `ContextManager` 持有，TUI 够不着；
+/// 但 v1.2 增量协议下，[`Event::ContextSnapshot`] 已经携带了还原完整序列
+/// 所需的全部信息（`added` 增量 + `reset` 全量基线标记）——与 store 的
+/// `resume_context` 是同一套重建逻辑。所以调试视图直接在 TUI 侧按增量
+/// 累积，runtime/store 零改动、分层不被破坏，界面看到的和模型吃到的
+/// 天然同源。
+#[derive(Debug, Default)]
+pub struct CtxView {
+    /// 实际发给模型的消息序列（含固定 system）。
+    pub messages: Vec<agent_core::provider::Message>,
+    /// 最近一份快照的模型名 / 可用工具 / 轮次 / 是否压缩重置。
+    pub model: String,
+    pub tools: Vec<String>,
+    pub iteration: u32,
+    pub last_reset: bool,
+}
+
+impl CtxView {
+    /// 应用一份增量快照（与 store 的 `resume_context` 同一语义）。
+    pub fn apply_snapshot(
+        &mut self,
+        model: &str,
+        iteration: u32,
+        added: &[agent_core::provider::Message],
+        reset: bool,
+        tools: &[String],
+    ) {
+        if reset {
+            // 压缩重写了历史：整份替换为压缩后的基线。
+            self.messages = added.to_vec();
+        } else {
+            self.messages.extend(added.iter().cloned());
+        }
+        self.model = model.to_string();
+        self.iteration = iteration;
+        self.tools = tools.to_vec();
+        self.last_reset = reset;
+    }
+
+    /// 切到历史任务时清空：历史回放不含快照事件，旧任务的序列已不代表
+    /// 当前会话；续跑后新的快照会重新累积。
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// 当前估算 token（与 runtime 压缩判据同一实现，见 agent-core）。
+    pub fn est_tokens(&self) -> usize {
+        agent_core::provider::estimate_messages_tokens(&self.messages)
+    }
+}
+
+/// `/ctx` 全屏调试页的 UI 状态（数据在 [`App::ctx`]）。
+#[derive(Debug, Default)]
+pub struct CtxDebugUi {
+    /// 消息列表高亮行。
+    pub sel: usize,
+    /// 底部预览窗格的滚动偏移（行）。
+    pub preview_scroll: usize,
 }
 
 /// `@` 文件补全状态。
@@ -403,6 +471,8 @@ impl Default for App {
             at: AtCompletion::default(),
             memory: None,
             memory_panel: None,
+            ctx: CtxView::default(),
+            ctx_debug: None,
             memory_candidates: 0,
             pending_memory: None,
         }
@@ -623,8 +693,19 @@ impl App {
                 // 屏幕万一还是脏了，Ctrl+L 手动救。
                 self.auto_scroll();
             }
-            // 上下文快照只服务审计复盘，不进对话流。
-            Event::ContextSnapshot { .. } => {}
+            // 上下文快照：按增量协议累积调试视图（`/ctx` 数据源）；
+            // 依旧不进对话流。
+            Event::ContextSnapshot {
+                model,
+                iteration,
+                added,
+                reset,
+                tools,
+                ..
+            } => {
+                self.ctx
+                    .apply_snapshot(&model, iteration, &added, reset, &tools);
+            }
             // 整轮回复：实时路径下它与逐字增量重合（增量已经拼好了），但
             // **历史转写**里通常只有它——`TextDelta` 默认不落盘。所以：内容
             // 与最后一行正文相同就跳过，不同才补，两条路径都不重复。
@@ -722,6 +803,10 @@ impl App {
             }
             Event::TaskOpened { id, title, events } => {
                 self.panel_open = false;
+                // 历史回放不含 ContextSnapshot，旧任务的上下文序列已不代表
+                // 当前会话，调试页随之清空，等续跑后的新快照重新累积。
+                self.ctx.reset();
+                self.ctx_debug = None;
                 if events.is_empty() {
                     self.lines.push(Line::Error(format!(
                         "任务「{title}」没有可回放的历史（日志可能已被清理），仍可继续输入。"
@@ -971,6 +1056,12 @@ impl App {
             // `/memory`：打开管理面板（生效页 / 候选页，Tab 切换）。
             "/memory" => {
                 self.pending_memory = Some(MemoryPending::Open);
+                self.input.take();
+                return true;
+            }
+            // `/ctx`：打开上下文调试页（本地纯展示，不碰后端）。
+            "/ctx" => {
+                self.open_ctx_debug();
                 self.input.take();
                 return true;
             }
@@ -1732,6 +1823,44 @@ impl App {
         self.memory_panel = None;
     }
 
+    // ---- `/ctx` 上下文调试页 ----
+
+    /// 打开 `/ctx`：高亮默认落在最后一条消息（模型最新吃到的内容）。
+    pub fn open_ctx_debug(&mut self) {
+        let sel = self.ctx.messages.len().saturating_sub(1);
+        self.ctx_debug = Some(CtxDebugUi {
+            sel,
+            preview_scroll: 0,
+        });
+    }
+
+    pub fn close_ctx_debug(&mut self) {
+        self.ctx_debug = None;
+    }
+
+    /// 列表上下移动（夹取范围）；移动后预览回到顶部。
+    pub fn ctx_debug_move(&mut self, delta: i32) -> bool {
+        let Some(ui) = &mut self.ctx_debug else {
+            return false;
+        };
+        let max = self.ctx.messages.len().saturating_sub(1) as i64;
+        let next = (ui.sel as i64 + delta as i64).clamp(0, max);
+        if next as usize == ui.sel {
+            return false;
+        }
+        ui.sel = next as usize;
+        ui.preview_scroll = 0;
+        true
+    }
+
+    /// 预览窗格滚动（行）：正数向下翻，负数向上翻。
+    pub fn ctx_debug_scroll(&mut self, delta: i32) {
+        if let Some(ui) = &mut self.ctx_debug {
+            let next = ui.preview_scroll as i64 + delta as i64;
+            ui.preview_scroll = next.max(0) as usize;
+        }
+    }
+
     /// 执行一个暂存的记忆动作。只允许在异步上下文（TUI 事件循环）里调用。
     pub async fn handle_memory(&mut self, act: MemoryPending) {
         use agent_core::memory::MemoryPort;
@@ -1897,6 +2026,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::provider::Message;
 
     #[test]
     fn input_editing_handles_multibyte() {
@@ -2740,6 +2870,132 @@ mod tests {
         assert!(app.viewing.is_none(), "/clear 之后是新话题");
         app.input.buffer = "换个话题".into();
         assert!(app.submit().unwrap().resume_from.is_none());
+    }
+
+    // ---- `/ctx` 上下文调试页 ----
+
+    fn snapshot(
+        id: &TaskId,
+        iteration: u32,
+        added: Vec<agent_core::provider::Message>,
+        reset: bool,
+    ) -> Event {
+        Event::ContextSnapshot {
+            id: id.clone(),
+            iteration,
+            model: "deepseek-chat".into(),
+            added,
+            reset,
+            tools: vec!["list_dir".into(), "file_read".into()],
+        }
+    }
+
+    /// 增量累积：首轮（system+user）之后每轮只追加新增量。
+    #[test]
+    fn ctx_view_accumulates_incremental_snapshots() {
+        let mut app = App::default();
+        let id = TaskId::from_raw("ctx-1");
+        app.apply_event(snapshot(
+            &id,
+            0,
+            vec![
+                agent_core::provider::Message::system("固定区"),
+                agent_core::provider::Message::user("任务"),
+            ],
+            false,
+        ));
+        app.apply_event(snapshot(
+            &id,
+            1,
+            vec![agent_core::provider::Message::assistant("答")],
+            false,
+        ));
+        assert_eq!(app.ctx.messages.len(), 3);
+        assert_eq!(app.ctx.messages[0].text(), "固定区");
+        assert_eq!(app.ctx.model, "deepseek-chat");
+        assert_eq!(app.ctx.tools.len(), 2);
+        assert!(!app.ctx.last_reset);
+    }
+
+    /// 压缩重置：整份替换为全量基线，而不是继续追加。
+    #[test]
+    fn ctx_view_reset_replaces_baseline() {
+        let mut app = App::default();
+        let id = TaskId::from_raw("ctx-2");
+        app.apply_event(snapshot(
+            &id,
+            0,
+            vec![Message::system("旧"), Message::user("旧任务")],
+            false,
+        ));
+        app.apply_event(snapshot(
+            &id,
+            5,
+            vec![Message::system("固定区"), Message::user("[历史摘要]")],
+            true,
+        ));
+        assert_eq!(app.ctx.messages.len(), 2, "reset 必须整份替换");
+        assert_eq!(app.ctx.messages[0].text(), "固定区");
+        assert!(app.ctx.last_reset);
+    }
+
+    /// `/ctx` 打开调试页：默认选中最后一条，↑↓ 移动并复位预览滚动。
+    #[test]
+    fn ctx_debug_opens_and_navigates() {
+        let mut app = App::default();
+        let id = TaskId::from_raw("ctx-3");
+        app.apply_event(snapshot(
+            &id,
+            0,
+            vec![
+                Message::system("S"),
+                Message::user("U"),
+                Message::assistant("A"),
+            ],
+            false,
+        ));
+        assert!(app.run_slash_command("/ctx"));
+        let ui = app.ctx_debug.as_ref().expect("页面应已打开");
+        assert_eq!(ui.sel, 2, "默认高亮最后一条");
+        app.ctx_debug_move(-1);
+        assert_eq!(app.ctx_debug.as_ref().unwrap().sel, 1);
+        app.ctx_debug_scroll(5);
+        app.ctx_debug_move(-1);
+        let ui = app.ctx_debug.as_ref().unwrap();
+        assert_eq!(ui.sel, 0);
+        assert_eq!(ui.preview_scroll, 0, "换消息后预览回到顶部");
+        assert!(!app.ctx_debug_move(-1), "已到顶不再移动");
+    }
+
+    /// 切到历史任务时调试视图清空（回放不含快照，旧数据不再代表当前会话）。
+    #[test]
+    fn task_opened_clears_ctx_view() {
+        let mut app = App::default();
+        let id = TaskId::from_raw("ctx-4");
+        app.apply_event(snapshot(&id, 0, vec![Message::system("S")], false));
+        assert!(!app.ctx.messages.is_empty());
+        app.apply_event(Event::TaskOpened {
+            id,
+            title: "旧任务".into(),
+            events: vec![],
+        });
+        assert!(app.ctx.messages.is_empty());
+        assert!(app.ctx_debug.is_none(), "调试页一并关闭");
+    }
+
+    /// token 估算与 runtime 共用同一实现：中文按 1/字符、ASCII 按 1/3。
+    #[test]
+    fn ctx_est_tokens_matches_core_estimator() {
+        let msgs = vec![Message::user("你好世界")];
+        assert_eq!(
+            agent_core::provider::estimate_messages_tokens(&msgs),
+            4,
+            "4 个中文字符 ≈ 4 token"
+        );
+        assert_eq!(
+            agent_core::provider::estimate_messages_tokens(&[Message::user("abcdef")]),
+            3
+        );
     }
 
     // ---- `/news`：新闻收集模板 ----

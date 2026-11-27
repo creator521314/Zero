@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use agent_core::event::{Command, Event};
+use agent_core::provider::{estimate_messages_tokens, Message, Role};
 
 use crate::app::{
     App, ContextAction, ContextMenu, Line, MemoryPending, Selection, ToolStatus, UiAction,
@@ -660,6 +661,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> UiAction {
 
     // 记忆面板：打开时独占键盘（Tab 切页、Enter 确认候选、Del 删除、
     // 直接打字即搜索、Esc 关闭）。
+    if app.ctx_debug.is_some() {
+        return ctx_debug_key(app, key);
+    }
     if app.memory_panel.is_some() {
         return memory_panel_key(app, key);
     }
@@ -1018,6 +1022,10 @@ fn draw(f: &mut Frame, app: &App) {
         draw_memory_panel(f, app, area);
     }
 
+    if app.ctx_debug.is_some() {
+        draw_ctx_debug(f, app, area);
+    }
+
     if let Some(p) = &app.pending {
         draw_approval(f, app, p, area);
     }
@@ -1176,6 +1184,255 @@ fn draw_memory_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
+}
+
+// ---- `/ctx` 上下文调试页 ----
+
+/// `/ctx` 按键（模态，全屏覆盖）：↑/↓ 换消息、←/→（h/l）滚动预览、Esc 关闭。
+fn ctx_debug_key(app: &mut App, key: KeyEvent) -> UiAction {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => UiAction::Quit,
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.close_ctx_debug();
+            UiAction::None
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.ctx_debug_move(-1);
+            UiAction::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.ctx_debug_move(1);
+            UiAction::None
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            app.ctx_debug_scroll(-3);
+            UiAction::None
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            app.ctx_debug_scroll(3);
+            UiAction::None
+        }
+        _ => UiAction::None,
+    }
+}
+
+/// 消息的角色标签（调试页里以中文短标签区分）。
+fn ctx_role_label(m: &Message) -> &'static str {
+    match m.role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
+
+/// 消息的角色色（与对话区语义一致：用户粉、助手绿、系统橙、工具紫）。
+fn ctx_role_color(m: &Message) -> ratatui::style::Color {
+    match m.role {
+        Role::System => ink::WARNING,
+        Role::User => ink::ACCENT,
+        Role::Assistant => ink::SUCCESS,
+        Role::Tool => ink::PRIMARY,
+    }
+}
+
+/// 列表行摘要：工具调用与工具结果各给一行可读形态，其余取正文首段。
+fn ctx_msg_summary(m: &Message) -> String {
+    match m.role {
+        Role::Tool => {
+            let text = m.text();
+            let first: String = text.lines().next().unwrap_or("").chars().take(48).collect();
+            format!("[工具结果] {first}")
+        }
+        _ if !m.tool_calls.is_empty() => {
+            let names: Vec<String> = m
+                .tool_calls
+                .iter()
+                .map(|c| {
+                    let args = serde_json::to_string(&c.arguments).unwrap_or_default();
+                    let short: String = args.chars().take(32).collect();
+                    format!("{}({})", c.name, short)
+                })
+                .collect();
+            format!("→ {}", names.join(", "))
+        }
+        _ => {
+            let text = m.text();
+            let one = text.replace('\n', " ");
+            let short: String = one.chars().take(56).collect();
+            if one.chars().count() > 56 {
+                format!("{short}…")
+            } else {
+                short
+            }
+        }
+    }
+}
+
+/// 预览窗格全文：角色 + 工具调用明细 + 完整正文 + 思考链。
+fn ctx_msg_full(m: &Message) -> String {
+    let mut s = String::new();
+    if !m.tool_calls.is_empty() {
+        for c in &m.tool_calls {
+            let args = serde_json::to_string_pretty(&c.arguments).unwrap_or_default();
+            s.push_str(&format!("⚙ {} {}\n", c.name, args));
+        }
+    }
+    if let Some(id) = &m.tool_call_id {
+        s.push_str(&format!("（对应工具调用 {}）\n", id.0));
+    }
+    let text = m.text();
+    if !text.is_empty() {
+        s.push_str(&text);
+        s.push('\n');
+    }
+    if let Some(r) = &m.reasoning {
+        s.push_str(&format!("\n[思考链]\n{r}\n"));
+    }
+    if s.is_empty() {
+        s.push_str("（无文本内容）");
+    }
+    s
+}
+
+/// `/ctx` 全屏调试页：头部统计 + 消息序列列表 + 选中消息全文预览。
+///
+/// 展示的是「实际发给模型的消息序列」（由 ContextSnapshot 增量累积而来），
+/// 不是对话区的展示序列——两者的差异正是这个页面要暴露的东西。
+fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ink::SECONDARY))
+        .style(Style::default().bg(BG))
+        .title(Span::styled(
+            " 上下文调试 · 实际发送给模型的消息 ",
+            Style::default()
+                .fg(ink::PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title(Span::styled(
+            " Esc 关闭 · ↑↓ 选择 · ←→ 滚动 ",
+            Style::default().fg(ink::FG_MUTED),
+        ));
+    let outer = block.inner(area);
+    f.render_widget(block, area);
+
+    let ctx = &app.ctx;
+    let est = ctx.est_tokens();
+
+    // 头部统计（两行）。
+    let reset_note = if ctx.last_reset {
+        "已压缩（最近一份为全量基线）"
+    } else {
+        "未压缩"
+    };
+    let header = vec![
+        RtLine::from(vec![
+            Span::styled("模型 ", Style::default().fg(ink::FG_MUTED)),
+            Span::styled(
+                if ctx.model.is_empty() {
+                    "-".to_string()
+                } else {
+                    ctx.model.clone()
+                },
+                Style::default().fg(ink::FG),
+            ),
+            Span::styled("  轮次 ", Style::default().fg(ink::FG_MUTED)),
+            Span::styled(ctx.iteration.to_string(), Style::default().fg(ink::FG)),
+            Span::styled("  消息 ", Style::default().fg(ink::FG_MUTED)),
+            Span::styled(ctx.messages.len().to_string(), Style::default().fg(ink::FG)),
+            Span::styled("  估算 ", Style::default().fg(ink::FG_MUTED)),
+            Span::styled(
+                format!("≈{est} tok"),
+                Style::default()
+                    .fg(ink::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(reset_note, Style::default().fg(ink::FG_MUTED)),
+        ]),
+        RtLine::from(vec![
+            Span::styled("工具 ", Style::default().fg(ink::FG_MUTED)),
+            Span::styled(
+                if ctx.tools.is_empty() {
+                    "-".to_string()
+                } else {
+                    ctx.tools.join(", ")
+                },
+                Style::default().fg(ink::FG),
+            ),
+        ]),
+    ];
+    let header_h = header.len() as u16 + 1;
+
+    // 列表 + 预览上下分屏。
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_h),
+            Constraint::Percentage(38),
+            Constraint::Min(6),
+        ])
+        .split(outer);
+    f.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), rows[0]);
+
+    // 消息序列列表。
+    let list_h = rows[1].height as usize;
+    let sel = app
+        .ctx_debug
+        .as_ref()
+        .map(|ui| ui.sel)
+        .unwrap_or(0)
+        .min(ctx.messages.len().saturating_sub(1));
+    let offset = sel.saturating_sub(list_h.saturating_sub(1));
+    let mut list_lines = Vec::with_capacity(ctx.messages.len());
+    for (idx, m) in ctx.messages.iter().enumerate() {
+        let selected = idx == sel;
+        let marker = if selected { "▸" } else { " " };
+        let base = Style::default().bg(if selected { surface::SELECTED } else { BG });
+        list_lines.push(RtLine::from(vec![
+            Span::styled(format!("{marker} {:>3} ", idx), base.fg(ink::FG_MUTED)),
+            Span::styled(
+                format!("{:<9}", ctx_role_label(m)),
+                base.fg(ctx_role_color(m)).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("≈{:<6}", estimate_messages_tokens(std::slice::from_ref(m))),
+                base.fg(ink::FG_MUTED),
+            ),
+            Span::styled(ctx_msg_summary(m), base.fg(ink::FG)),
+        ]));
+    }
+    let list = Paragraph::new(list_lines)
+        .wrap(Wrap { trim: false })
+        .scroll((offset as u16, 0));
+    f.render_widget(list, rows[1]);
+
+    // 预览窗格。
+    let preview_scroll = app
+        .ctx_debug
+        .as_ref()
+        .map(|ui| ui.preview_scroll)
+        .unwrap_or(0);
+    let full =
+        ctx.messages.get(sel).map(ctx_msg_full).unwrap_or_else(|| {
+            "（尚无上下文：提交一个任务后，这里会显示实际发送给模型的内容）".into()
+        });
+    let body = Text::styled(full, Style::default().fg(ink::FG));
+    let preview = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .scroll((preview_scroll as u16, 0))
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(surface::LINE))
+                .title(Span::styled(
+                    format!(" 消息 #{sel} 全文（←→ 滚动） "),
+                    Style::default().fg(ink::FG_MUTED),
+                )),
+        );
+    f.render_widget(preview, rows[2]);
 }
 
 /// 顶部信息栏：左「品牌 + 任务模式」，中「provider · 状态」，右「权限徽章」。
@@ -2794,11 +3051,12 @@ mod tests {
                 "/remember",
                 "/memory",
                 "/improve",
+                "/ctx",
             ]
         );
 
         app.input.buffer = "/c".into();
-        assert_eq!(app.slash_candidates(), vec!["/clear"]);
+        assert_eq!(app.slash_candidates(), vec!["/clear", "/ctx"]);
 
         app.input.buffer = "/t".into();
         assert_eq!(app.slash_candidates(), vec!["/tier", "/tasks"]);
@@ -2861,10 +3119,10 @@ mod tests {
         let mut app = App::default();
         let _ = handle_key(&mut app, key(KeyCode::Char('/')));
         assert!(app.completion_active);
-        assert_eq!(app.slash_candidates().len(), 9);
+        assert_eq!(app.slash_candidates().len(), 10);
 
         let _ = handle_key(&mut app, key(KeyCode::Char('c')));
-        assert_eq!(app.slash_candidates(), vec!["/clear"]);
+        assert_eq!(app.slash_candidates(), vec!["/clear", "/ctx"]);
         assert!(app.completion_active);
 
         // 输入到无匹配时自动收起
@@ -2945,7 +3203,11 @@ mod tests {
         let _ = handle_key(&mut app, key(KeyCode::Down));
         assert_eq!(app.completion_sel, 8);
         let _ = handle_key(&mut app, key(KeyCode::Down));
-        assert_eq!(app.completion_sel, 8, "到底后 clamp");
+        assert_eq!(app.completion_sel, 9, "到底后 clamp");
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.completion_sel, 9);
+        let _ = handle_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.completion_sel, 8);
         let _ = handle_key(&mut app, key(KeyCode::Up));
         assert_eq!(app.completion_sel, 7);
 

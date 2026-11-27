@@ -110,6 +110,38 @@ impl Message {
     }
 }
 
+/// 粗估一串消息的 token 数（中文 ≈1 token/字符，ASCII ≈1/3）。
+///
+/// 估算逻辑原本只在 runtime 的 `ContextManager` 里，TUI 调试页要展示
+/// 「当前上下文大约多少 token」时如果自己再写一份，两处迟早漂移；
+/// 收敛到 core 作为唯一实现，runtime 与 TUI 共用。
+///
+/// 计入 `tool_calls.arguments` 的 JSON 与 reasoning 文本——工具参数往往是
+/// 上下文里最大的一块，漏掉它压缩阈值与调试页都会明显偏小。
+pub fn estimate_messages_tokens(messages: &[Message]) -> usize {
+    let mut est = 0.0f64;
+    fn count_str(est: &mut f64, s: &str) {
+        for c in s.chars() {
+            *est += if c.is_ascii() { 0.34 } else { 1.0 };
+        }
+    }
+    for m in messages {
+        let text = m.text();
+        count_str(&mut est, &text);
+        if let Some(r) = &m.reasoning {
+            count_str(&mut est, r);
+        }
+        for c in &m.tool_calls {
+            count_str(&mut est, &c.name);
+            count_str(
+                &mut est,
+                &serde_json::to_string(&c.arguments).unwrap_or_default(),
+            );
+        }
+    }
+    est.ceil() as usize
+}
+
 /// 请求元信息：用于路由与计量。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestMeta {
