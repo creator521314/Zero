@@ -12,9 +12,10 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::buffer::Buffer;
 use ratatui::layout::Alignment;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as RtLine, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -1418,17 +1419,18 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ink::SECONDARY))
+        .border_style(Style::default().fg(ink::SECONDARY).bg(BG))
         .style(Style::default().bg(BG))
         .title(Span::styled(
             " 上下文调试 · 实际发送给模型的消息 ",
             Style::default()
                 .fg(ink::PRIMARY)
+                .bg(BG)
                 .add_modifier(Modifier::BOLD),
         ))
         .title(Span::styled(
             " Esc 关闭 · ↑↓ 选择 · 滚轮 / ←→ 滚动 ",
-            Style::default().fg(ink::FG_MUTED),
+            Style::default().fg(ink::FG_MUTED).bg(BG),
         ));
     f.render_widget(block, popup);
 
@@ -1448,7 +1450,7 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     ctx.model.clone()
                 },
-                Style::default().fg(ink::FG),
+                Style::default().fg(ink::FG).bg(BG),
             ),
             Span::styled("  轮次 ", Style::default().fg(ink::FG_MUTED)),
             Span::styled(ctx.iteration.to_string(), Style::default().fg(ink::FG)),
@@ -1459,6 +1461,7 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
                 format!("≈{est} tok"),
                 Style::default()
                     .fg(ink::WARNING)
+                    .bg(BG)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
@@ -1472,12 +1475,19 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     ctx.tools.join(", ")
                 },
-                Style::default().fg(ink::FG),
+                Style::default().fg(ink::FG).bg(BG),
             ),
         ]),
     ];
     f.render_widget(Clear, l.header);
-    f.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), l.header);
+    f.render_widget(
+        // 显式 BG：Paragraph 的默认 style 会成为透明，空白行在部分终端上
+        // 会露出上一帧内容（Clear 只重置 cell，不负责持续涂底色）。
+        Paragraph::new(header)
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false }),
+        l.header,
+    );
 
     // 消息序列：一条消息一行，摘要按列表可用宽度截断（不折行）。
     let list_h = l.list.height as usize;
@@ -1518,7 +1528,9 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
     }
     f.render_widget(Clear, l.list);
     f.render_widget(
-        Paragraph::new(list_lines).scroll((offset as u16, 0)),
+        Paragraph::new(list_lines)
+            .style(Style::default().bg(BG))
+            .scroll((offset as u16, 0)),
         l.list,
     );
 
@@ -1544,20 +1556,46 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
     let scroll = preview_scroll.min(max_scroll);
     f.render_widget(Clear, l.preview);
     f.render_widget(
-        Paragraph::new(Text::styled(full, Style::default().fg(ink::FG)))
+        Paragraph::new(Text::styled(full, Style::default().fg(ink::FG).bg(BG)))
+            .style(Style::default().bg(BG))
             .wrap(Wrap { trim: false })
             .scroll((scroll as u16, 0))
             .block(
                 Block::default()
+                    .style(Style::default().bg(BG))
                     .borders(Borders::TOP)
                     .border_style(Style::default().fg(surface::LINE))
                     .title(Span::styled(
                         format!(" 消息 #{sel} 全文（滚轮 / ←→ 滚动） "),
-                        Style::default().fg(ink::FG_MUTED),
+                        Style::default().fg(ink::FG_MUTED).bg(BG),
                     )),
             ),
         l.preview,
     );
+
+    // 最后统一修补宽字符续行 cell 的透明背景（见 OpaqueBg）。
+    f.render_widget(OpaqueBg(BG), popup);
+}
+
+/// 弹窗最终的不透明修补层。
+///
+/// ratatui 写 CJK 等宽字符时会把「续行 cell」`reset()`，背景随之变成
+/// `Color::Reset`（透明）——真彩终端上就表现为弹窗文字/边框旁边透出主界面
+/// 内容、空白行留下上一帧。这里只把**透明背景**的 cell 补成 BG，不动选中行
+/// 的 `surface::SELECTED` 等已着色 cell。
+struct OpaqueBg(Color);
+
+impl ratatui::widgets::Widget for OpaqueBg {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let cell = &mut buf[(x, y)];
+                if cell.bg == Color::Reset {
+                    cell.bg = self.0;
+                }
+            }
+        }
+    }
 }
 
 /// `/ctx` 弹窗期间的鼠标：列表上滚轮换消息 / 单击选中，预览上滚轮滚动全文。
@@ -2794,6 +2832,51 @@ mod tests {
             0,
             "换消息后预览回顶"
         );
+    }
+
+    #[test]
+    fn ctx_popup_paints_opaque_bg_and_clears_blank_rows() {
+        use ratatui::backend::TestBackend;
+        let mut app = App::default();
+        let id = TaskId::from_raw("ctx-bg");
+        app.apply_event(Event::ContextSnapshot {
+            id: id.clone(),
+            iteration: 0,
+            model: "m".into(),
+            added: vec![Message::user("很长的内容".repeat(200))],
+            reset: false,
+            tools: vec![],
+        });
+        app.open_ctx_debug();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal.draw(|f| draw(f, &app)).expect("draw");
+        // 换成很短的消息：原先被长文本占满的行必须真正清成空白。
+        app.ctx.messages[0] = Message::user("短");
+        let frame = terminal.draw(|f| draw(f, &app)).expect("draw");
+        let buf = frame.buffer;
+        let p = ctx_popup_rect(area);
+        // 弹窗内每个 cell（含边框、空白行）都必须有显式背景，不透明。
+        // CJK 的续行 cell 由 ratatui 标记 skip、diff 不单独下发，跳过检查。
+        for y in p.y..p.bottom() {
+            for x in p.x..p.right() {
+                let cell = &buf[(x, y)];
+                if cell.skip {
+                    continue;
+                }
+                assert!(
+                    cell.bg == BG || cell.bg == surface::SELECTED,
+                    "弹窗背景漏出: ({x},{y}) bg={:?}",
+                    cell.bg
+                );
+            }
+        }
+        let l = ctx_layout(area);
+        for y in l.preview.y.saturating_add(2)..l.preview.bottom() {
+            for x in l.preview.x..l.preview.right() {
+                assert_eq!(buf[(x, y)].symbol(), " ", "旧正文残留: ({x},{y})");
+            }
+        }
     }
 
     #[test]

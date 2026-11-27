@@ -1834,6 +1834,9 @@ impl App {
             sel,
             preview_scroll: 0,
         });
+        // 弹层叠在对话区之上：整屏清一次，避免旧帧宽字符续行 cell
+        // 被 ratatui 的 diff 跳过而留在物理屏幕上。
+        self.request_repaint();
     }
 
     pub fn close_ctx_debug(&mut self) {
@@ -1852,6 +1855,7 @@ impl App {
         }
         ui.sel = next as usize;
         ui.preview_scroll = 0;
+        self.request_repaint();
         true
     }
 
@@ -1859,7 +1863,11 @@ impl App {
     pub fn ctx_debug_scroll(&mut self, delta: i32) {
         if let Some(ui) = &mut self.ctx_debug {
             let next = ui.preview_scroll as i64 + delta as i64;
-            ui.preview_scroll = next.max(0) as usize;
+            let next = next.max(0) as usize;
+            if next != ui.preview_scroll {
+                ui.preview_scroll = next;
+                self.request_repaint();
+            }
         }
     }
 
@@ -1874,6 +1882,7 @@ impl App {
             }
             ui.sel = idx;
             ui.preview_scroll = 0;
+            self.request_repaint();
         }
         true
     }
