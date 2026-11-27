@@ -1295,11 +1295,27 @@ fn ctx_msg_full(m: &Message) -> String {
     s
 }
 
-/// `/ctx` 全屏调试页：头部统计 + 消息序列列表 + 选中消息全文预览。
+/// `/ctx` 弹窗的居中矩形：宽度最多 110 / 屏幕宽 - 6，高度最多屏幕高 - 4，
+/// 小窗口下退化为「几乎铺满但留边」，避免弹窗比终端还大。
+fn ctx_popup_rect(area: Rect) -> Rect {
+    let w = area.width.saturating_sub(6).clamp(48, 110).min(area.width);
+    let h = area.height.saturating_sub(4).clamp(16, 34).min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// `/ctx` 居中浮层弹窗：头部统计 + 消息序列列表 + 选中消息全文预览。
 ///
 /// 展示的是「实际发给模型的消息序列」（由 ContextSnapshot 增量累积而来），
 /// 不是对话区的展示序列——两者的差异正是这个页面要暴露的东西。
 fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
+    // 先擦掉弹窗范围内的底层内容；与任务面板 / 记忆面板同一套浮层风格。
+    let popup = ctx_popup_rect(area);
+    f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1315,8 +1331,8 @@ fn draw_ctx_debug(f: &mut Frame, app: &App, area: Rect) {
             " Esc 关闭 · ↑↓ 选择 · ←→ 滚动 ",
             Style::default().fg(ink::FG_MUTED),
         ));
-    let outer = block.inner(area);
-    f.render_widget(block, area);
+    let outer = block.inner(popup);
+    f.render_widget(block, popup);
 
     let ctx = &app.ctx;
     let est = ctx.est_tokens();
@@ -2545,6 +2561,22 @@ fn truncate_json(v: &serde_json::Value, max: usize) -> String {
 mod tests {
     use super::*;
     use ratatui::buffer::Buffer;
+
+    // ---- `/ctx` 弹窗几何 ----
+
+    #[test]
+    fn ctx_popup_is_centered_and_bounded() {
+        let area = Rect::new(0, 0, 120, 40);
+        let p = ctx_popup_rect(area);
+        assert_eq!(p.width, 110);
+        assert_eq!(p.height, 34);
+        assert_eq!(p.x, (120 - 110) / 2);
+        assert_eq!(p.y, (40 - 34) / 2);
+        // 小终端：留边退化，但绝不越界。
+        let small = ctx_popup_rect(Rect::new(0, 0, 30, 12));
+        assert!(small.width <= 30 && small.height <= 12);
+        assert!(small.x + small.width <= 30 && small.y + small.height <= 12);
+    }
 
     fn key_with_kind(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
         KeyEvent {
